@@ -27,6 +27,25 @@
 cd aporisa_code && PATH="$PWD/.tools/node/bin:$PATH" npm install --save-exact <package>@<version>
 ```
 
+## 后端工具链（B0 阶段）
+
+后端（`backend/`）只在 Mac Studio 上开发。正式的 `backend_service.sh prepare` 要到 B1-2 才实现；在那之前，环境按下面的方式手动准备。它和将来 prepare 要做的事一致，只是还没有收进脚本：
+
+| 工具 | 版本 | 位置 |
+| --- | --- | --- |
+| uv | 0.12.7 | `.tools/uv/uv`，从 GitHub release 下载并校验 SHA256 |
+| Python | 3.12.12 | `.runtime/python/`，由 uv 管理 |
+| 依赖 | 由 `backend/uv.lock` 锁定；mlx-vlm 锁定到 git commit | `backend/.venv/` |
+
+uv 调用时固定使用项目内的目录，不使用全局缓存或系统 Python：
+
+```bash
+cd backend && UV_CACHE_DIR=../.cache/uv UV_PYTHON_INSTALL_DIR=../.runtime/python UV_PYTHON_PREFERENCE=only-managed \
+  ../.tools/uv/uv sync --frozen --all-groups --python 3.12.12
+```
+
+修改依赖时，先改 `backend/pyproject.toml`，用同样的环境变量执行 `uv lock`，再执行 `uv sync`，然后把 `uv.lock` 一起提交。
+
 ## 前端代码结构
 
 | 目录 | 职责 | 允许依赖 |

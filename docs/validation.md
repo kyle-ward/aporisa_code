@@ -2,6 +2,23 @@
 
 本文只记录已经实际运行过的检查，以及明确尚未验证的事项。预期不写成结果，替身测试也不代替真实验收。
 
+## B0-1：后端环境（2026-09-29，Mac Studio）
+
+执行者：agent，经用户授权联网安装。
+
+| 项目 | 实际结果 |
+|---|---|
+| 硬件与系统 | Apple M3 Ultra，统一内存 103,079,215,104 字节（96 GiB），macOS 27.0（26A428） |
+| GPU 可锁定内存上限 | `iogpu.wired_limit_mb=87040`，由用户设置，并写入 `/etc/sysctl.conf`；MLX 报告的 `max_recommended_working_set_size` 为 91,268,055,040 字节（85.0 GiB），说明上限已经生效。重启后是否仍然生效，尚未验证 |
+| uv | 0.12.7，从 GitHub release 下载并校验 SHA256，安装在 `.tools/uv/uv` |
+| Python | 3.12.12（uv 管理，只使用受管 Python），安装在 `.runtime/python/` |
+| 依赖 | `backend/uv.lock` 共 60 个包，`uv sync --frozen --all-groups` 安装到 `backend/.venv`；mlx 0.32.3（mlx-metal 0.32.3），mlx-vlm 0.7.4（git `00093678`），transformers 5.17.0，huggingface-hub 1.33.0，hf-xet 1.6.0 |
+| 冒烟测试 | `mx.metal.is_available()` 为 True；`mlx_vlm.models.qwen4_exp.ple_storage` 可以导入 |
+
+**已验证**：`./scripts/check.sh backend` 由用户运行并通过（最小实现：ruff；有测试时运行 pytest；另外包括 Shell 语法和 `git diff --check`）。
+
+**尚未验证**：还没有加载任何模型权重。
+
 ## 迁移到 Mac Studio 后的前端复验（2026-09-29，Mac Studio）
 
 环境：Mac Studio M3 Ultra 96GB，macOS 27.0（arm64）；由用户执行 `./frontend.sh prepare`，装好项目内的 Node v24.21.0 和锁定的依赖。

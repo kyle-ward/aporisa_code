@@ -41,8 +41,22 @@ check_backend() {
     aporisa_log INFO "Backend has no sources yet; backend checks skipped."
     return
   fi
-  aporisa_error "Backend checks are not implemented yet."
-  exit 1
+  local python="$APORISA_ROOT/backend/.venv/bin/python"
+  [ -x "$python" ] || {
+    aporisa_log REPAIRABLE "Backend environment is missing; prepare it with the project uv first."
+    exit 1
+  }
+  cd "$APORISA_ROOT/backend"
+  export PYTHONDONTWRITEBYTECODE=1
+  aporisa_log INFO "Backend: lint"
+  "$python" -m ruff check --config pyproject.toml .
+  if compgen -G "tests/test_*.py" >/dev/null; then
+    aporisa_log INFO "Backend: tests"
+    "$python" -m pytest -q
+  else
+    aporisa_log INFO "Backend has no tests yet; pytest skipped."
+  fi
+  aporisa_log READY "Backend checks passed."
 }
 
 check_shell

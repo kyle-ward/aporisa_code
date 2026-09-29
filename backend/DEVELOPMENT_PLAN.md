@@ -29,7 +29,7 @@
 |---|---|---|
 | D-01 | **从零开始写**后端，不复制 local_llm 再改。可以借鉴 local_llm 的工程做法（生命周期、准入、日志），但重新实现 | 用户决定 |
 | D-02 | 模型：**Qwen3.8-Flash-Next** | 用户决定 |
-| D-03 | 推理引擎：**MLX**，以 **mlx-vlm 作为库**来加载模型和使用算子，**不使用** `mlx_vlm.server`。mlx-vlm 锁定到具体的 git commit | 51B 表外置、混合缓存、MTP 都已在上游实现；状态可控；Python 技术栈与 local_llm 一致 |
+| D-03 | 推理引擎：**MLX**，以 **mlx-vlm 作为库**来加载模型和使用算子，**不使用** `mlx_vlm.server`。mlx-vlm 锁定到具体的 git commit：`00093678a1f6bd513212d94778ffc381d6d731bf`（v0.7.4 tag，2026-09-28），mlx 为 0.32.3（B0-1 已定） | 51B 表外置、混合缓存、MTP 都已在上游实现；状态可控；Python 技术栈与 local_llm 一致 |
 | D-04 | **51B 的 N-gram/PLE 表放在 SSD 上**，使用 mlx-vlm 的 `ple_storage` 按行 mmap 读取 | 用户决定；可以省下约 30GiB 常驻内存 |
 | D-05 | 量化文件**自己从官方 FP8 checkpoint 转换**，不用社区现成的 group size 32 版本。具体格式（affine 4-bit gs64 或 mxfp4）**待 B0 实测**后决定 | 社区版外置 PLE 后主体仍有约 77–80GB，太紧 |
 | D-06 | **单并发**：同一时刻只有一个生成在运行 | 硬件约束，也是用户的使用场景 |
@@ -59,6 +59,8 @@
 | QSA | 稀疏注意力，2 个 KV 头，head dim 256，每个 token 只看 2048 个 token 的预算。另外维护一个索引键缓存 |
 | PLE | 2000 万条 n-gram，在第 2 层注入。每个 token 按哈希读 16 行，约 2.7KB。Q4 group size 32 下约 30GiB |
 | 上下文 | 原生 262,144 |
+| 官方 checkpoint | BF16：`Qwen/Qwen3.8-Flash-Next`，360.0 GB，revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`；FP8：`Qwen/Qwen3.8-Flash-Next-FP8`，185.6 GB，144 个文件，revision `236dfdf285828023ca3bcd3f37366c58a3469b13`。数据来自 HF API（2026-09-29），许可证字段为 `other`，具体条款待写入 `models-and-licenses.md` |
+| mlx-vlm 实现 | 架构名 `qwen4_exp`；外置 PLE（`ple_storage.py`）只支持两种 PLE 量化布局：affine 4-bit gs32 和 nvfp4 gs16；FP8 转换（`fp8.py`）和 MTP 草稿模型（`split_mtp`）都在 v0.7.4 中 |
 | 思考控制 | `enable_thinking`（默认开）、`preserve_thinking`（默认开）、`reasoning_effort`：xhigh / medium / low |
 | 采样 | 思考模式：temperature 1.0、top_p 0.95、top_k 20；非思考模式：temperature 0.7、top_p 0.8、top_k 20、presence_penalty 1.5 |
 
@@ -434,7 +436,8 @@ backend/
 - [ ] 思考标签和工具调用的格式（B0-6）
 - [ ] 私有 IPC 的最终格式（msgpack 还是其他）
 - [ ] 图片输入是否在 B2 实现
-- [ ] 官方 FP8 checkpoint 的实际大小和固定的 revision
+- [x] 官方 FP8 checkpoint 的实际大小和固定的 revision：185.6 GB，`236dfdf`（见第 3 节）
+- [ ] 主体用 gs64、PLE 用 gs32 的混合量化，`mlx_vlm.convert` 能否直接表达（上游 README 的示例是全部使用 gs32），还是需要自定义量化谓词（B0-3）
 - [ ] 转换配方如何描述和版本化，才能让转换产物的身份可以复现（B1-2）
 
 ## 15. 变更记录
@@ -443,3 +446,4 @@ backend/
 - **2026-09-29**：新增 D-14，推理强度由前端控制，默认 medium，并提出换档不能让缓存失效的要求。本文是临时开发文档，后端完成后会拆分到 `docs/` 并删除。
 - **2026-09-29**：新增 D-15，模型配置、本地权重、服务生命周期三者解耦。权重的下载和转换从 `prepare` 移到独立的 `model_weights.sh`；公开别名从 `.env` 移到 configs 的 `POINTERS`。同步修改第 5.1、9、11 节，以及 B0-2、B1-2。
 - **2026-09-29**：新增 D-16，GPU 可锁定内存上限暂定 85 GiB，并持久化到 `/etc/sysctl.conf`。同步修改第 3、9 节。
+- **2026-09-29**：完成 B0-1。锁定 mlx-vlm 的 commit 和 mlx 的版本；补上官方 checkpoint 的大小和 revision；新增待定问题：混合量化能否直接用 `mlx_vlm.convert` 表达。

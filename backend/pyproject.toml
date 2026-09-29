@@ -1,0 +1,29 @@
+[project]
+name = "aporisa-backend"
+version = "0.0.0"
+description = "Local, stateless-semantics inference backend implementing the Aporisa protocol"
+requires-python = ">=3.12,<3.13"
+# B0 scope: only what the exploratory scripts need. B1-1 adds the gateway stack.
+dependencies = [
+  "mlx==0.32.3",
+  # Pinned to the v0.7.4 tag commit: includes qwen4_exp (Qwen3.8-Flash-Next),
+  # external PLE storage, FP8 conversion and the MTP drafter.
+  "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git@00093678a1f6bd513212d94778ffc381d6d731bf",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "ruff==0.16.9"]
+
+[tool.uv]
+# No importable package until B1-1 creates src/aporisa_backend.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
