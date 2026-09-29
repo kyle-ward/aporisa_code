@@ -1,0 +1,139 @@
+# ---------------------------------------------------------------------------
+# Aporisa Code ignore rules. Secrets, runtimes, model weights, build outputs
+# and machine-generated state never enter version control.
+# ---------------------------------------------------------------------------
+
+# --- Secrets: each side owns its .env; only the examples are tracked --------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*.provisionprofile
+
+# --- macOS ------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon[]
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# --- JetBrains / PyCharm ------------------------------------------------------
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+.idea_modules/
+atlassian-ide-plugin.xml
+cmake-build-*/
+.fleet/
+
+# --- Other editors ----------------------------------------------------------
+.vscode/
+*.swp
+*.swo
+*~
+.history/
+
+# --- Project-owned runtimes, caches and downloaded assets ---------------------
+.runtime/
+.cache/
+.tools/
+
+# --- Per-machine generated service definitions --------------------------------
+deploy/generated/
+
+# --- Backend: Python / uv -----------------------------------------------------
+backend/.venv/
+backend/logs/
+**/__pycache__/
+**/*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Frontend: Node / Electron / Vite ------------------------------------------
+aporisa_code/node_modules/
+aporisa_code/dist/
+aporisa_code/out/
+aporisa_code/release/
+aporisa_code/coverage/
+aporisa_code/.vite/
+aporisa_code/*.tsbuildinfo
+node_modules/
+.npm/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.eslintcache
+.stylelintcache
+.vitest/
+
+# --- Packaged app artifacts -----------------------------------------------------
+*.app/
+*.dmg
+*.pkg
+*.zip
+*.blockmap
+
+# --- Model weights and large binaries (force-add only after explicit review) ----
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.mlpackage/
+*.npz
+
+# --- Runtime artifacts: logs, sessions, local evaluation output ----------------
+*.log
+logs/
+*.jsonl.tmp
+*.sqlite-journal
+*.db-wal
+*.db-shm
+
+# --- Generic build / temp output ------------------------------------------------
+build/
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# --- Local agent tool state -------------------------------------------------------
+.claude/settings.local.json
