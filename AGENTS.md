@@ -17,10 +17,13 @@
 - **优先参考 openai/codex 的设计思想和协议细节**。ZCode、opencode 只在 codex 没有对应做法时作为补充。
 - 在向 codex 靠拢的同时，保持本文件规定的工程风格。如果刻意偏离 codex 的做法，要在相关文档里写明原因。
 - 协议中和 OpenAI 重合的部分，以 Responses API 的条目（item）模型为蓝本，不使用 Chat Completions 的形状。
-- 参考仓库只读，不能为了适配本项目去改动它们。这些仓库包括：
-  - `/Users/Zhuanz1/Personal/SmartCare/dgx_spark/local_llm`
-  - `/Users/Zhuanz1/Personal/SmartCare/dgx_spark/local_asr`
-  - 以及任何外部克隆的仓库
+- 参考仓库只读，不能为了适配本项目去改动它们。两台机器上的路径不同，指的是同一批仓库：
+
+| 仓库 | MacBook Air（前端开发） | Mac Studio（后端开发） |
+|---|---|---|
+| local_llm | `/Users/Zhuanz1/Personal/SmartCare/dgx_spark/local_llm` | `/Users/aporisa/Personal/SmartCare/dgx_spark/local_llm` |
+| local_asr | `/Users/Zhuanz1/Personal/SmartCare/dgx_spark/local_asr` | `/Users/aporisa/Personal/SmartCare/dgx_spark/local_asr` |
+| 其他 | 任何外部克隆的仓库 | 同左 |
 
 ## 当前阶段
 
@@ -79,22 +82,44 @@
 - 恢复次数必须有上限。不自动重放失败的用户请求，也不把部分结果伪装成成功。
 - 公共路由不透传引擎的模型管理接口、文件路径、原始错误或私有端口。
 
+### 模型配置与权重（后端）
+
+参照 local_llm 的做法：**模型配置、本地权重、服务生命周期三者解耦**，换模型时只改配置指针，不改网关、协议或生命周期脚本。
+
+- `backend/src/aporisa_backend/configs/` 中维护三样东西，随代码评审：
+  - `MODEL_LIST`：可读的模型身份字符串，可以包含尚未下载、尚未配置推理参数的名字；没被引用的项不校验、不加载。
+  - `POINTERS`：公开模型别名 → 模型身份。公开别名只在这里维护，不放进 `.env`，也没有别名转换表。
+  - `PROFILES`：以身份为 key 的推理参数（架构、量化策略、内存预算、模型适配层的选择等），不包含目录、仓库或 revision。
+- 本地权重的**唯一记录**是 `.runtime/model-assets/<目录>.json`：身份、目录、来源仓库、固定的 revision、状态和完整的 SHA256 清单。不进入 Git，configs 中不重复保存资产映射。
+- 自行转换得到的产物（例如从官方 FP8 checkpoint 量化、外置 PLE）登记为**独立的身份**，记录中写明源身份、转换配方和转换工具的版本，能追溯到来源。
+- 注册、下载、映射、加载相互独立：下载不修改 configs；注册不代表已下载；磁盘上未注册的权重不会加载。启动只校验指针实际引用的身份：在 `MODEL_LIST` 中、有合法的 profile、有唯一且完整的本地记录、SHA256 全部通过。缺任何一项直接失败，不回退、不自动下载。
+- 切换模型的流程：下载或转换新权重 → 修改 `POINTERS`（必要时补 `PROFILES`）→ `stop` → `prepare` → `start` → 真实验证。不需要重新下载已有权重，也不需要改 `.env`。
+- 后端从加载到退出持有所用模型目录的共享锁；下载、转换、删除要取得该目录的独占锁，模型正在使用时直接拒绝。
+- 故障时不切换到另一个模型。
+
 ## 生命周期
 
 - 每一侧只有一个公开入口：
   - 后端：`backend_service.sh`，模式为 `doctor / prepare / install / start / stop / restart / status / uninstall / help`，在 Mac 上由系统 LaunchDaemon 管理。
   - 前端：`frontend.sh`，模式为 `doctor / prepare / dev / build / install / uninstall / help`。app 不是后台服务，所以没有 start 和 stop。
-- **`prepare` 是唯一允许联网安装依赖、下载模型或构建镜像的模式。** `start`、`build`、内部 `run` 都离线执行，缺少产物时直接失败，不做隐式修复。
+- 模型权重有一个**独立的维护入口** `model_weights.sh`，模式为 `download / convert / list / delete`。它不属于服务生命周期，不启停服务、不占用推理准入：
+  - `download`：必须给出精确的仓库 ID 和显式的 `--identity`，可以用 `--revision` 固定到某个 commit；不指定时先解析远端版本，再固定到不可变的 commit。支持断点续传，每个文件都校验完才发布。已绑定的身份不能悄悄换源或换版本。
+  - `convert`：从已登记的源身份按固定配方派生产物，产物登记为新的身份。
+  - `list`：只读，扫描目录和元数据，不联网、不计算大文件哈希。
+  - `delete`：参数必须是精确的目录名，同时删除权重、暂存和身份记录，不改 configs。
+- **服务生命周期中，`prepare` 是唯一允许联网的模式**：它安装依赖，并完整核验指针引用的权重，**从不下载、转换或修复权重**。新机器上可以先 prepare 装好依赖，因为缺权重而非零退出；用 `model_weights.sh` 补齐权重后，再次 prepare。
+- `start`、`build`、内部 `run` 都离线执行，缺少产物时直接失败，不做隐式修复。
 - 后端的 install 只注册一个空闲服务，start 开启自启并等待就绪，stop 关闭自启并等待进程树退出，uninstall 只移除已停止或空闲的服务，并保留模型、缓存和日志。
 - doctor、prepare 和 start 共用同一套检查实现，失败时返回非零。
 - 脚本由项目目录所有者执行，**不要对整个脚本使用 sudo**，需要特权的步骤在脚本内部局部提权。
 - 只追踪自己创建的进程树，不按进程名批量结束进程。
 - 系统服务的真实 install、start、stop、restart、uninstall 由用户手动执行和验收。
+- `model_weights.sh` 的 download、convert、delete 由用户执行；`list` 是只读的，agent 可以运行。
 
 ## 配置、隐私和日志
 
 - 两侧各有自己的 `.env` 和 `.env.example`，根目录不放 `.env`：
-  - `backend/.env`：端口、API key 等部署差异。
+  - `backend/.env`：端口、API key 等部署差异。公开模型别名不在这里，见「模型配置与权重」。
   - `aporisa_code/.env`：开发期 OpenRouter key 等，只给 CLI 和测试读取。
 - `.env` 只放部署差异。稳定、非敏感的策略按主题拆分到各自的 `configs/` 模块，随代码一起评审。
 - 新增环境变量前，先证明它确实是部署差异而不是工程调参，并同步更新 `.env.example`、脚本、测试和文档。
@@ -136,6 +161,7 @@
 | `docs/development.md` | 生命周期、配置、测试和排障 |
 | `docs/validation.md` | 已验证的事实、未验证的项目 |
 | `docs/macos.md` | 后端系统服务的运维 |
+| `docs/model-management.md` | 模型配置指针、权重的下载、转换和维护 |
 | `docs/models-and-licenses.md` | 模型、上游来源和许可证 |
 
 - 公共字段和事件语义只在 `docs/protocol.md` 定义，其他文档只链接引用，不再维护第二份。

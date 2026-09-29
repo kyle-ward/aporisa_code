@@ -2,6 +2,14 @@
 
 本文只记录已经实际运行过的检查，以及明确尚未验证的事项。预期不写成结果，替身测试也不代替真实验收。
 
+## 迁移到 Mac Studio 后的前端复验（2026-09-29，Mac Studio）
+
+环境：Mac Studio M3 Ultra 96GB，macOS 27.0（arm64）；由用户执行 `./frontend.sh prepare`，装好项目内的 Node v24.21.0 和锁定的依赖。
+
+**已验证**：`./scripts/check.sh frontend` 通过，包括 Shell 语法、类型检查、import 边界、Vitest（6 个文件、81 个用例）和 `git diff --check`。结论：F1 的确定性检查在 Studio 上结果与在 Air 上一致。
+
+**尚未验证**：一致性测试 CLI 还没有在 Studio 上对另一个进程中的 mock server 运行过；真实后端仍未开始。
+
 ## F1：SDK、mock 与一致性测试（2026-09-29，MacBook Air）
 
 环境：macOS 27.0（arm64），项目内 Node 24.21.0，TypeScript 7.0.2，Vitest 5.0.2，zod 4.6.5，ws 8.22.0。

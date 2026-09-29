@@ -41,6 +41,8 @@
 | D-12 | 备选模型：**Qwen3.8-27B**。如果 Flash-Next 在可行的量化下质量或速度不达标，就切换过去，协议和网关都不用改 | 社区评测显示 4-bit 下两者质量相当 |
 | D-13 | 提速采取「**架构一步到位，参数分步调优**」：精确续接、条目边界快照、SSD 溢出、token 一致性、预热、MTP 从设计阶段就纳入；各种数值由实测决定 | 用户要求优化一步到位 |
 | D-14 | **推理强度由前端按请求控制**，对标 Claude Code 和 codex；`default_effort` 为 **medium**；**切换档位不能让已有的前缀缓存失效**（见第 5.2 节） | 用户决定 |
+| D-15 | **模型配置、本地权重、服务生命周期三者解耦**，照搬 local_llm：configs 中维护 `MODEL_LIST` / `POINTERS` / `PROFILES`；权重由独立的 `model_weights.sh`（download / convert / list / delete）维护，并登记本地身份记录；`prepare` 只核验权重，不下载、不转换 | 用户决定；Qwen 系列之后可能出更强的模型，换模型只改指针。规则见 AGENTS.md「模型配置与权重」 |
+| D-16 | GPU 可锁定内存上限**持久化**到 `/etc/sysctl.conf`，暂定 85 GiB（87040 MB）；doctor 和 start 仍然检查实际值 | 用户决定（2026-09-29 已设置并确认：文件内容与运行时的值都是 87040）；否则重启后后端无法开机自启 |
 
 ---
 
@@ -50,7 +52,7 @@
 
 | 项目 | 数值 |
 |---|---|
-| 硬件 | Mac Studio M3 Ultra，96GB 统一内存；macOS 默认允许 GPU 锁定约 75% 的内存，可以用 `sysctl iogpu.wired_limit_mb` 提高，**由用户执行，重启后失效** |
+| 硬件 | Mac Studio M3 Ultra，96GB 统一内存；macOS 默认允许 GPU 锁定约 75% 的内存，可以用 `sysctl iogpu.wired_limit_mb` 提高，**由用户执行**。单独执行 sysctl 重启后会失效，所以同时写入 `/etc/sysctl.conf` 做持久化（D-16） |
 | 参数 | 125B MoE，每 token 激活 6B（512 个专家中选 10 个，另有 1 个共享专家）；另外有 51B 的 N-gram/PLE 表、4B 的 MTP 层，以及视觉编码器 |
 | 层结构 | 48 层，排列为 12 ×（3 × Gated DeltaNet + 1 × Qwen Sparse Attention），每层后接 MoE；隐藏维度 2560 |
 | DeltaNet | 线性注意力，保存**大小固定的循环状态**，不能截断 |
@@ -70,7 +72,7 @@
 | DeltaNet 状态 | 约 100MB，大小固定 |
 | 分块预填充的临时激活 | 约 3GB |
 | macOS 和系统进程 | 约 6–8GB |
-| **合计** | **约 82–88GB**，需要把 GPU 可锁定内存上限提高到约 88GB |
+| **合计** | **约 82–88GB**（含 macOS）。GPU 侧约 76–80GB；另有快照存储（第 6.6 节）不在此表中。GPU 可锁定内存上限暂定 **85 GiB（87040 MB）**，给 macOS 和开发工具留 11 GiB；最终值由 B0-4 决定 |
 
 **速度参考**（社区数据，M3 Ultra，MLX 4-bit）：预填充 889 tok/s（2K 上下文），解码 24 tok/s，MTP 加速约 1.42 倍。长上下文下的预填充曲线**待 B0 实测**。
 
@@ -140,7 +142,7 @@
 
 | 字段 | 初值 | 说明 |
 |---|---|---|
-| `id` | 由 `.env` 中的公开别名配置，例如 `aporisa-local-v0` | 不暴露真实型号 |
+| `id` | configs 中 `POINTERS` 的 key，例如 `aporisa-local-v0` | 不暴露真实型号；不放进 `.env`（D-15） |
 | `context_window` | 262144 | D-07 |
 | `max_output_tokens` | 32768（**待 B0**） | 思考模式在 xhigh 档可能很长 |
 | `effective_context_window_percent` | 95 | 与 codex 一致 |
@@ -283,23 +285,24 @@
 ## 9. 生命周期与部署
 
 - **唯一公开入口**：`backend_service.sh`，模式为 `doctor / prepare / install / start / stop / restart / status / uninstall / help`，语义与 AGENTS.md 一致。在 macOS 上由系统 LaunchDaemon 管理。
-- **`prepare`**，这是唯一联网的模式：
+- **`prepare`**，这是服务生命周期中唯一联网的模式（D-15）：
   1. 安装项目内的 uv，并用 Python 3.12 按 `backend/uv.lock` 安装依赖。mlx 和 mlx-vlm 都锁定到具体版本或 commit。
-  2. 按固定的 revision 下载官方 FP8 checkpoint（**待确认实际大小**）。
-  3. 转换成选定的量化格式。
-  4. 生成外置 PLE 的模型视图（硬链接）；必要时把 PLE 重排成按行存储的格式。
-  5. 拆出 MTP 草稿模型（B2）。
-  6. 计算全部产物的 SHA256，写入准备收据。
+  2. 完整核验 `POINTERS` 实际引用的权重身份（SHA256），写入源码收据。**不下载、不转换、不修复权重**；缺权重时非零退出，并提示使用 `model_weights.sh`。
+- **`model_weights.sh`**，独立的权重维护入口，不属于服务生命周期（D-15）：
+  1. `download`：按固定的 revision 下载官方 FP8 checkpoint（**待确认实际大小**），登记为源身份。
+  2. `convert`：从源身份按固定配方派生产物，登记为新身份，记录源身份、配方和工具版本。配方包括：转换成选定的量化格式；生成外置 PLE 的模型视图，必要时把 PLE 重排成按行存储的格式；拆出 MTP 草稿模型（B2）。
+  3. `list` / `delete`：只读列出，或按目录名删除。
+  4. 每个身份的完整 SHA256 清单写在 `.runtime/model-assets/` 下的本地记录里。
 - **`doctor`** 检查：
   - Apple Silicon、Metal 可用；
   - 空闲磁盘；
   - 准备收据和完整的 SHA256；
   - `.env` 配置；
-  - **GPU 可锁定内存上限**：读取 `sysctl iogpu.wired_limit_mb`，低于要求时报 `[MANUAL]`，并给出需要用户自己执行的命令；
+  - **GPU 可锁定内存上限**：读取 `sysctl iogpu.wired_limit_mb`，低于要求时报 `[MANUAL]`，并给出需要用户自己执行的两条命令（sysctl 立即生效、写入 `/etc/sysctl.conf` 持久化）。开机自启时 LaunchDaemon 以普通用户运行，不能提权，所以只有持久化以后，重启后才能自启成功；
   - 启动前的可用内存；
   - 端口。
 - **`start`**：完全离线；加载模型 → 运行预热（纯文本、工具调用、预热 + 续接、上下文超长的拒绝路径）→ 就绪。
-- **`.env`**，放在 `backend/.env`，只放部署差异：API key、公共端口、公开模型别名。
+- **`.env`**，放在 `backend/.env`，只放部署差异：API key、公共端口。公开模型别名在 configs 的 `POINTERS` 中（D-15）。
 - **日志**：JSONL，字段走白名单，不记录任何正文、思考内容或工具参数。控制台使用 `[Aporisa]` 标签。
 
 ---
@@ -331,7 +334,8 @@ backend/
 ├── .env.example
 ├── pyproject.toml / uv.lock
 ├── src/aporisa_backend/
-│   ├── configs/                 按主题拆分的策略：network / limits / model / cache / logging …
+│   ├── configs/                 按主题拆分的策略：network / limits / models（MODEL_LIST、POINTERS、PROFILES）/ cache / logging …
+│   ├── weights/                 权重维护：身份记录、下载、转换配方、目录锁（model_weights.sh 调用）
 │   ├── gateway/                 app、http_sse、websocket、admission、validation、errors、health
 │   ├── ipc/                     帧格式、消息类型、客户端和服务端
 │   ├── engine/
@@ -343,7 +347,7 @@ backend/
 │   │   └── speculative/         MTP、提示词查找（B2）
 │   ├── lifecycle/               checks、artifacts、receipts、cli
 │   └── logging_config.py
-├── scripts/                     prepare、convert、benchmark、validate_runtime
+├── scripts/                     B0 一次性脚本、benchmark、validate_runtime
 └── tests/                       单元测试（worker 使用假模型），网关测试（使用假 worker）
 ```
 
@@ -373,7 +377,7 @@ backend/
 | # | 任务 | 验收标准 |
 |---|---|---|
 | B0-1 | 环境：安装 uv 和 Python 3.12，把 mlx 和 mlx-vlm 锁定到某个 commit；记录 macOS 版本和 `iogpu.wired_limit_mb` 的当前值 | 版本信息记录在案 |
-| B0-2 | 下载官方 FP8 checkpoint，确认实际大小 | 大小和 revision 记录在案 |
+| B0-2 | 下载官方 FP8 checkpoint，确认实际大小。B0 阶段 `model_weights.sh` 还不存在，下载到 `.runtime/` 下，并记录 revision，B1-2 再登记为正式身份 | 大小和 revision 记录在案 |
 | B0-3 | 转换两个候选格式：affine 4-bit gs64 和 mxfp4（PLE 都用 affine 4-bit gs32），各自生成外置 PLE 的视图 | 两份产物可以加载 |
 | B0-4 | **内存**：分别在空上下文、128K、262K 下测峰值内存，并确定需要的 GPU 可锁定内存上限 | 262K 满上下文能运行，并给出余量 |
 | B0-5 | **速度曲线**：在 2K、32K、128K、262K 四个点测预填充速度和解码速度；对比两种量化格式和不同的预填充分块大小 | 曲线和推荐配置 |
@@ -394,7 +398,7 @@ backend/
 | # | 任务 | 验收标准 |
 |---|---|---|
 | B1-1 | 工程骨架：`pyproject.toml`、`uv.lock`、`configs/`、白名单日志、`scripts/check_backend.sh` 接入 `check.sh backend` | 用户运行 `./scripts/check.sh backend` 通过 |
-| B1-2 | 生命周期：`backend_service.sh` 全部模式；LaunchDaemon 模板；准备收据；GPU 可锁定内存上限检查 | 状态机和 local_llm 同样严格；用户手动完成验收 |
+| B1-2 | 生命周期：`backend_service.sh` 全部模式；LaunchDaemon 模板；准备收据；GPU 可锁定内存上限检查。`model_weights.sh` 的 download / convert / list / delete、本地身份记录、目录锁，以及 configs 中的 `MODEL_LIST` / `POINTERS` / `PROFILES`（D-15）；B0 的产物登记为正式身份 | 状态机和 local_llm 同样严格；用户手动完成验收 |
 | B1-3 | 网关：认证、严格 JSON、schema 和语义校验、准入、两种传输、错误映射、健康检查 | 使用假 worker 的网关测试通过 |
 | B1-4 | IPC 以及 worker 的启动和恢复，恢复次数有上限 | 杀掉 worker 后能按规定恢复 |
 | B1-5 | 模型适配层：模板渲染、tokenize、增量解析（推理、消息、工具调用） | 单元测试覆盖 B0-6 确认的格式 |
@@ -431,8 +435,11 @@ backend/
 - [ ] 私有 IPC 的最终格式（msgpack 还是其他）
 - [ ] 图片输入是否在 B2 实现
 - [ ] 官方 FP8 checkpoint 的实际大小和固定的 revision
+- [ ] 转换配方如何描述和版本化，才能让转换产物的身份可以复现（B1-2）
 
 ## 15. 变更记录
 
 - **2026-09-29**：初稿。记录 D-01 到 D-13；给出架构、缓存设计，以及 B0、B1、B2 的划分。
 - **2026-09-29**：新增 D-14，推理强度由前端控制，默认 medium，并提出换档不能让缓存失效的要求。本文是临时开发文档，后端完成后会拆分到 `docs/` 并删除。
+- **2026-09-29**：新增 D-15，模型配置、本地权重、服务生命周期三者解耦。权重的下载和转换从 `prepare` 移到独立的 `model_weights.sh`；公开别名从 `.env` 移到 configs 的 `POINTERS`。同步修改第 5.1、9、11 节，以及 B0-2、B1-2。
+- **2026-09-29**：新增 D-16，GPU 可锁定内存上限暂定 85 GiB，并持久化到 `/etc/sysctl.conf`。同步修改第 3、9 节。
