@@ -1,0 +1,27 @@
+{
+  "name": "aporisa-code",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Aporisa Code: local agent app (harness core, Aporisa SDK and Electron shell).",
+  "type": "module",
+  "engines": {
+    "node": "24.21.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "boundaries": "node tools/check-boundaries.ts",
+    "test": "vitest run",
+    "schema:export": "node tools/export-schema.ts",
+    "conformance": "node tools/conformance.ts"
+  },
+  "dependencies": {
+    "ws": "8.22.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.0",
+    "@types/ws": "8.18.1",
+    "typescript": "7.0.2",
+    "vitest": "5.0.2"
+  }
+}

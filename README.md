@@ -10,6 +10,13 @@ Aporisa Code 是一个安装在本机、直接运行的 agent app，只支持 ma
 
 开发期间，前端可以通过兼容层接入 OpenRouter 进行测试，映射差异见 [OpenRouter 兼容映射](docs/compat-openrouter.md)。
 
-**当前状态：F0 合同 v0 草案阶段，尚未实现任何功能。** 生命周期入口（`backend_service.sh`、`frontend.sh`）和检查入口（`scripts/check.sh`）会随实现逐步加入，本文件届时同步更新。
+**当前状态：已完成 F1。** 协议合同 v0 已定稿；前端的 SDK（native driver，WebSocket 默认、HTTP 兜底）、mock server、stub driver 和 wire 层一致性测试都已实现，并通过了确定性检查。harness、UI、OpenRouter 兼容层和后端尚未开始。验证范围见 [验证记录](docs/validation.md)。
+
+```bash
+./frontend.sh prepare         # 安装项目内的 Node 和锁定的依赖（唯一联网的模式）
+./scripts/check.sh frontend   # 前端确定性检查
+```
+
+开发流程见 [开发文档](docs/development.md)。
 
 协作约定和工程规范见 [AGENTS.md](AGENTS.md)。

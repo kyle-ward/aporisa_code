@@ -1,6 +1,6 @@
-# Aporisa 协议 v0（草案）
+# Aporisa 协议 v0
 
-> **状态：F0 草案，尚未实现，未经验收。** 本文是 harness（Aporisa SDK）和推理后端之间的唯一合同。任何代码、schema 或 mock 与本文不一致时，以本文为准，并按第 13 节的流程同步。
+> **状态：v0 已定稿。** 前端的 SDK（native driver）和 mock server 已按本文实现，并通过了 wire 层一致性测试（见 [validation.md](validation.md)）。后端尚未实现。本文是 harness（Aporisa SDK）和推理后端之间的唯一合同。任何代码、schema 或 mock 与本文不一致时，以本文为准，并按第 13 节的流程同步。
 >
 > 修订日期：2026-09-29。协议路径版本：`/v1`。
 
