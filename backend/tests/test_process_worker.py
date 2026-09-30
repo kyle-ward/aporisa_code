@@ -7,6 +7,7 @@ content; the wire conformance suite runs against the real model (docs/validation
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 
@@ -95,3 +96,94 @@ async def test_worker_crash_fails_stream_and_restarts(served):
     )
     status, events = await post_stream(base, request("again", max_output_tokens=4))
     assert status == 200 and check_stream(events)
+
+
+async def test_runtime_health_includes_worker_status(served):
+    base = served.base
+    status, events = await post_stream(
+        base, request("status please", max_output_tokens=4, prompt_cache_key="health")
+    )
+    assert status == 200
+    response = check_stream(events)
+    async with httpx.AsyncClient(timeout=30) as client:
+        health = (await client.get(f"{base}/health/runtime", headers=auth())).json()
+    assert health["state"] == "ready"
+    # Asked right after the terminal event: "last" is already this response (no race).
+    usage = response["usage"]
+    last_prefill = health["worker"]["last"]["prefill_tokens"]
+    assert last_prefill == usage["input_tokens"] - usage["input_tokens_details"]["cached_tokens"]
+    worker = health["worker"]
+    assert worker["sessions"] >= 1 and worker["weights_bytes"] > 0
+    assert worker["ple_prefetch"] is True
+    assert worker["released_cache_bytes"] >= 0 and "sys_swapouts" in worker["startup"]
+    assert worker["system"]["swap_used_bytes"] >= 0 and worker["ple_files_cached_bytes"] >= 0
+    last = worker["last"]
+    assert last["restore_path"] in ("cold", "live", "snapshot")
+    assert last["ple_bytes_read"] > 0 and last["snapshot_count"] >= 1
+
+
+MARKER = "zq-private-marker-7f3a"
+TERMINAL = ("response.completed", "response.incomplete", "response.failed")
+
+
+async def test_logs_never_contain_request_content(served):
+    """B1-9: prompts, tool data, metadata and outputs never reach a log line."""
+    import logging
+
+    import websockets
+
+    from aporisa_backend.logging_config import LOGGER, ConsoleFormatter, SafeFormatter
+
+    lines: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            lines.append(SafeFormatter().format(record))
+            lines.append(ConsoleFormatter().format(record))
+
+    handler, level = Capture(), LOGGER.level
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+    try:
+        tools = [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": f"Look up {MARKER}.",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            }
+        ]
+        body = request(
+            f"Tell me about {MARKER}.",
+            max_output_tokens=6,
+            instructions=f"System {MARKER}.",
+            tools=tools,
+            client_metadata={"note": MARKER},
+            prompt_cache_key=f"key-{MARKER}",
+        )
+        body["input"] += [
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "lookup",
+                "arguments": f'{{"q": "{MARKER}"}}',
+            },
+            {"type": "function_call_output", "call_id": "c1", "output": f"result {MARKER}"},
+        ]
+        status, events = await post_stream(served.base, body)
+        assert status == 200 and check_stream(events)
+        status, error = await post_stream(served.base, {**body, MARKER: 1})
+        assert status == 400
+        async with websockets.connect(
+            served.ws_url, additional_headers={"authorization": f"Bearer {API_KEY}"}
+        ) as ws:
+            await ws.send(json.dumps({"type": "response.create", **body}))
+            while True:
+                event = json.loads(await ws.recv())
+                if event["type"] in TERMINAL:
+                    break
+    finally:
+        LOGGER.removeHandler(handler)
+        LOGGER.setLevel(level)
+    assert lines, "no log lines were captured"
+    assert not [line for line in lines if MARKER in line]

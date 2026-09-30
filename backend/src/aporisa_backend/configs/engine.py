@@ -13,18 +13,28 @@ class EngineConfig:
     prefill_chunk: int = 2048
     # B0-8: one snapshot is ~110 MiB on the real model; 16 is ~1.8 GiB (6.6, B2-5 tunes).
     max_snapshots: int = 16
-    # Snapshot budget = wired limit - resident weights - activations - margin (6.6).
+    # Session budget (KV + snapshots of all sessions), evaluated before every request (6.6, C1):
+    #   available memory now + session memory now + MLX buffer cache now
+    #   - activation reserve - buffer cache limit - desktop margin,
+    # capped by wired limit - weights - activation reserve - safety margin. The model never
+    # grows into memory the desktop is using, so snapshots cannot push macOS into compressing
+    # other programs (P4: a 132K prefill compressed them at up to ~2 GiB/s).
     activation_reserve_bytes: int = 4 * GIB
     safety_margin_bytes: int = 2 * GIB
-    # Same allocator cache bound local_llm uses on the Mac.
-    cache_limit_bytes: int = 2 * GIB
+    desktop_margin_bytes: int = 4 * GIB
+    # Freed MLX buffers kept for reuse. 0.5 GiB instead of local_llm's 2 GiB: on a 96 GiB
+    # machine holding 67 GiB of weights, every GiB returned to macOS matters more than the
+    # small reallocation cost.
+    cache_limit_bytes: int = GIB // 2
     ple_threads: int = 64
     # Soft RLIMIT_NOFILE the gateway and worker raise themselves to. launchd's default is 256;
     # the external PLE table alone holds 384 memmaps (128 shards x 3 tensors).
     open_files: int = 65536
-    # How long the gateway waits for the worker to confirm a cancel before killing it. One
-    # prefill chunk at 260K context takes several seconds.
-    cancel_timeout_s: float = 30
+    # How long the gateway waits for the worker to confirm a cancel before killing it. The
+    # worker checks between prefill chunks (and while waiting for PLE prefetch); one 2048-token
+    # chunk near 260K context takes ~4 s unloaded but was seen to exceed 30 s under memory
+    # pressure (P4 validation), so allow 60 s before treating the engine as stuck.
+    cancel_timeout_s: float = 60
     # Bounded stderr tail kept while the worker starts, for the failure message.
     startup_stderr_lines: int = 40
 

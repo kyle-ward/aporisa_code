@@ -38,18 +38,18 @@ def load(init: dict) -> Engine:
 
     from mlx_vlm.utils import load_model
 
-    model = load_model(model_dir, lazy=False)
+    model = load_model(model_dir, lazy=True)
     lm = model.language_model
-    mx.eval(lm.parameters())
+    released = materialize(model, model_dir)
     weights = int(mx.get_active_memory())
     adapter = ADAPTERS[init["adapter"]](Codec(model_dir), init["model"])
     prefetcher = PlePrefetcher(lm, config.ple_threads) if external_ple(lm) else None
     budget = init.get("snapshot_budget_bytes")
     if budget is None:
-        budget = wired - weights - config.activation_reserve_bytes - config.safety_margin_bytes
+        budget = session_budget(wired, weights, config)
     sessions = SessionStore(
         lm.make_cache,
-        budget_bytes=max(0, int(budget)),
+        budget_bytes=budget,
         kv_bytes_per_token=int(init["kv_bytes_per_token"]),
         max_snapshots=config.max_snapshots,
     )
@@ -70,9 +70,98 @@ def load(init: dict) -> Engine:
         "weights_bytes": weights,
         "snapshot_budget_bytes": sessions.budget_bytes,
         "ple_prefetch": prefetcher is not None,
+        "released_cache_bytes": released,
     }
     engine.model_ref = model  # keeps the vision tower and config alive with the process
     return engine
+
+
+def session_budget(wired: int, weights: int, config: EngineConfig):
+    """The session budget as a function of the machine's state right now (configs/engine.py).
+
+    available (free + reclaimable) + what sessions and the MLX buffer cache already hold is
+    what the model could use without taking memory from other programs; the reserves keep
+    room for activations, the buffer cache and the desktop's own growth.
+    """
+    import psutil
+
+    ceiling = wired - weights - config.activation_reserve_bytes - config.safety_margin_bytes
+
+    def budget(store: SessionStore) -> int:
+        headroom = (
+            psutil.virtual_memory().available
+            + store.total_bytes()
+            + mx.get_cache_memory()
+            - config.activation_reserve_bytes
+            - config.cache_limit_bytes
+            - config.desktop_margin_bytes
+        )
+        return min(ceiling, headroom)
+
+    return budget
+
+
+def materialize(model, model_dir: Path) -> int:
+    """Reads the lazily loaded weights into GPU buffers one decoder layer at a time.
+
+    Every weight file is read through the page cache. Loading everything at once briefly
+    needs the weights twice (cached file pages plus GPU buffers), more than the machine has,
+    and the kernel answers with a burst of compression that stalls the desktop (P4: ~56 GiB
+    compressed and decompressed during one start). Releasing each layer's file pages right
+    after the layer is evaluated keeps the cache to about one layer. Returns the bytes still
+    cached at the end, released as well.
+    """
+    import json
+    from collections import defaultdict
+
+    from ..pagecache import release_all
+
+    weight_map = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    per_layer: dict[int, set[Path]] = defaultdict(set)
+    for name, file in weight_map.items():
+        if ".model.layers." in name:
+            per_layer[int(name.split(".model.layers.")[1].split(".")[0])].add(model_dir / file)
+    release_all({model_dir / file for file in weight_map.values()})
+    for index, layer in enumerate(model.language_model.model.layers):
+        mx.eval(layer.parameters())
+        release_all(per_layer.get(index, ()))
+    mx.eval(model.parameters())  # embeddings, head, norms, vision tower
+    return release_weight_cache(model_dir)
+
+
+def release_weight_cache(model_dir: Path) -> int:
+    """Releases the page cache of the loaded weight files; returns the bytes that were cached."""
+    import json
+
+    from ..pagecache import release_all, resident_bytes
+
+    index = json.loads((model_dir / "model.safetensors.index.json").read_text())
+    files = sorted({model_dir / name for name in index["weight_map"].values()})
+    cached = 0
+    for path in files:
+        try:
+            cached += resident_bytes(path)
+        except OSError:
+            pass
+    release_all(files)
+    return cached
+
+
+def ple_cached_bytes(engine: Engine) -> int | None:
+    """Page-cache residency of the files the external PLE table reads (whole files)."""
+    from ..pagecache import resident_bytes
+
+    if engine.prefetcher is None:
+        return None
+    shards = engine.prefetcher.table._shards
+    files = {array.filename for _, _, arrays in shards for array in arrays.values()}
+    total = 0
+    for name in files:
+        try:
+            total += resident_bytes(Path(name))
+        except OSError:
+            return None
+    return total
 
 
 def _run(engine: Engine, request: dict, session: str | None = None) -> list[dict]:

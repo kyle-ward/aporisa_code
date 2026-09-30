@@ -117,7 +117,7 @@ class SessionStore:
         self,
         make_cache: Callable[[], list],
         *,
-        budget_bytes: int,
+        budget_bytes: int | Callable[[SessionStore], int],
         kv_bytes_per_token: int,
         max_snapshots: int = 16,
     ):
@@ -127,6 +127,19 @@ class SessionStore:
         self.max_snapshots = max_snapshots
         self.sessions: dict[str, Session] = {}
         self.evictions = 0
+
+    @property
+    def budget_bytes(self) -> int:
+        """Memory all sessions may hold now; a callable budget is re-evaluated each time."""
+        budget = self._budget(self) if callable(self._budget) else self._budget
+        return max(0, int(budget))
+
+    @budget_bytes.setter
+    def budget_bytes(self, value: int | Callable[[SessionStore], int]) -> None:
+        self._budget = value
+
+    def total_bytes(self) -> int:
+        return sum(s.nbytes() for s in self.sessions.values())
 
     def acquire(self, key: str | None, tokens: list[int]) -> Match:
         session = self.sessions.get(key) if key else None
@@ -177,18 +190,19 @@ class SessionStore:
         A request that alone exceeds the budget keeps running; it just keeps no snapshots
         beyond the one it takes at the prompt end.
         """
+        budget = self.budget_bytes
         need = self.estimate(total_tokens) + sum(s.nbytes for s in session.snapshots)
         others = sorted(
             (s for s in self.sessions.values() if s is not session and not s.busy),
             key=lambda s: s.last_used,
         )
         used = sum(s.nbytes() for s in others)
-        while others and used + need > self.budget_bytes:
+        while others and used + need > budget:
             victim = others.pop(0)
             used -= victim.nbytes()
             self.sessions.pop(victim.key, None)
             self.evictions += 1
-        if used + need > self.budget_bytes:
+        if used + need > budget:
             session.snapshots = session.snapshots[-1:]
         mx.clear_cache()
 

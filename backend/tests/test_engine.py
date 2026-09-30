@@ -237,3 +237,93 @@ def test_budget_evicts_idle_sessions(engine, script):
     finally:
         store.budget_bytes = saved
         store.release("b")
+
+
+def test_metrics_report_memory_pressure_and_chunk_time(engine, script):
+    script("\n</think>\n\nOK<|im_end|>")
+    finished = run(engine, request("pressure"))[-1]
+    metrics = finished["metrics"]
+    for key in ("sys_swapouts", "sys_compressions", "swap_growth_bytes", "major_faults"):
+        assert isinstance(metrics[key], int)
+    assert metrics["prefill_max_chunk_ms"] >= 0 and metrics["compressor_bytes"] >= 0
+    assert engine.info["released_cache_bytes"] >= 0
+
+
+def test_prefetch_wait_stays_responsive():
+    import concurrent.futures
+    import time
+
+    never = concurrent.futures.Future()
+    flags = gen.JobFlags()
+    flags.cancel.set()
+    started = time.monotonic()
+    with pytest.raises(gen.Cancelled):
+        gen.Engine._wait(never, flags)
+    flags = gen.JobFlags()
+    flags.interrupt.set()
+    assert gen.Engine._wait(never, flags) is False
+    assert time.monotonic() - started < 1
+    done = concurrent.futures.Future()
+    done.set_result(None)
+    assert gen.Engine._wait(done, gen.JobFlags()) is True
+
+
+def test_layerwise_load_matches_a_one_shot_load(engine, tiny_model_dir):
+    """runtime.load materializes layer by layer, releasing page cache as it goes (B)."""
+    from mlx_vlm.utils import load_model
+
+    eager = load_model(tiny_model_dir, lazy=False).language_model
+    tokens = engine.adapter.codec.encode("Layer by layer, the same weights. " * 8)
+
+    def logits(lm):
+        return np.array(gen.Engine._forward(engine, lm.make_cache(), tokens).astype(mx.float32))
+
+    staged = logits(engine.lm)
+    engine_lm, engine.lm = engine.lm, eager
+    try:
+        assert np.array_equal(logits(eager), staged)
+    finally:
+        engine.lm = engine_lm
+
+
+def test_session_budget_follows_available_memory(monkeypatch):
+    """C1: the budget is what the model can hold without taking the desktop's memory."""
+    import types
+
+    import psutil
+
+    from aporisa_backend.configs.engine import ENGINE
+    from aporisa_backend.engine import runtime
+
+    gib = 1024**3
+    available = {"bytes": 10 * gib}
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: types.SimpleNamespace(available=available["bytes"])
+    )
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 0)
+    budget = runtime.session_budget(wired=85 * gib, weights=67 * gib, config=ENGINE)
+    store = types.SimpleNamespace(total_bytes=lambda: 1 * gib)
+    reserves = (
+        ENGINE.activation_reserve_bytes + ENGINE.cache_limit_bytes + ENGINE.desktop_margin_bytes
+    )
+    assert budget(store) == 10 * gib + 1 * gib - reserves
+    available["bytes"] = 8 * gib  # the desktop grew: the budget shrinks with it
+    assert budget(store) == 9 * gib - reserves
+    available["bytes"] = 60 * gib  # plenty free: still capped by the wired limit
+    ceiling = 85 * gib - 67 * gib - ENGINE.activation_reserve_bytes - ENGINE.safety_margin_bytes
+    assert budget(store) == ceiling
+
+
+def test_session_store_evaluates_a_callable_budget(engine, script):
+    script("\n</think>\n\nOK<|im_end|>")
+    store = engine.sessions
+    saved = store._budget
+    calls = []
+    try:
+        store.budget_bytes = lambda s: calls.append(s.total_bytes()) or -5
+        assert store.budget_bytes == 0  # clamped
+        run(engine, request("callable budget"), "cb")
+        assert calls  # evaluated when making room for the request
+    finally:
+        store.budget_bytes = saved
+        store.release("cb")

@@ -52,7 +52,7 @@ check_backend() {
   "$python" -m ruff check --config pyproject.toml . ../scripts
   if compgen -G "tests/test_*.py" >/dev/null; then
     aporisa_log INFO "Backend: tests"
-    "$python" -m pytest -q
+    "$python" -m pytest -q -rs
   else
     aporisa_log INFO "Backend has no tests yet; pytest skipped."
   fi

@@ -51,3 +51,6 @@ doctor、prepare、run 共用同一套检查（`backend/src/aporisa_backend/life
 - 结构化日志：`backend/logs/aporisa_*.jsonl`，字段走白名单，不含提示词、生成内容、密钥、请求头或原始 URL。
 - `start` 超时或服务在就绪前退出时，脚本**不会**自动停止服务：先看 `status` 和控制台日志，再显式 `stop`。
 - `stop` 只追踪服务自己的进程树（PID/PPID），从不按进程名结束进程。
+- 运行状态：`curl -s -H "authorization: Bearer <key>" http://127.0.0.1:18080/health/runtime` 返回网关和 worker 的状态（会话、内存、最近一次请求的计量），只含数字和枚举。
+- 真实生成验证：`backend/.venv/bin/python scripts/validate_runtime.py`（见 [development.md](development.md)）。
+- 服务只监听 `127.0.0.1:18080`。从其他机器访问（例如 I1 集成时 Air 上的 native driver）由用户在 Studio 上现有的 Cloudflare Tunnel 转发到这个地址；后端不新增监听地址。

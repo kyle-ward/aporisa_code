@@ -387,18 +387,25 @@
 
 B1 起，每个请求记录以下字段，这些数据同时也是报告的实验数据：
 
-| 字段 | 含义 |
-|---|---|
-| `transport` | http 或 websocket |
-| `restore_path` | live、snapshot、ssd 或 cold |
-| `prompt_tokens`、`cached_tokens`、`prefilled_tokens` | 总 prompt 长度、复用长度、实际预填充长度 |
-| `ttft_ms`、`prefill_tok_s`、`decode_tok_s` | 首 token 时间、预填充速度、解码速度 |
-| `mtp_accept_rate` | MTP 草稿接受率（B2） |
-| `peak_memory_gb` | 峰值内存 |
-| `ple_bytes_read`、`ple_cache_hit_rate` | PLE 从 SSD 读取的字节数，以及行缓存命中率 |
-| `snapshot_count`、`snapshot_bytes`、`ssd_spill_count` | 快照数量、占用、溢出次数 |
+| 字段 | 含义 | 状态 |
+|---|---|---|
+| `transport` | http 或 websocket | B1 |
+| `restore_path` | live、snapshot 或 cold（B2 加 ssd） | B1 |
+| `input_tokens`、`cached_tokens`、`prefilled_tokens`、`output_tokens`、`reasoning_tokens` | 总 prompt 长度、复用长度、实际预填充长度、输出与推理 token 数 | B1 |
+| `queue_ms`、`duration_ms` | 准入排队时间、从准入到结束的总时间 | B1 |
+| `ttft_ms`、`prefill_tok_s`、`decode_tok_s` | 首 token 时间、预填充速度、解码速度（worker 计时） | B1 |
+| `peak_memory_gb` | 本次请求的 MLX 峰值内存（每个请求开始时重置） | B1 |
+| `ple_bytes_read`、`ple_lookup_ms`、`ple_prefetch_ms` | 从外置 PLE 表取出的字节数（经过页缓存，不区分是否真的读盘）、主线程在 PLE 查表上阻塞的时间、预取线程的读取时间 | B1 |
+| `snapshot_count`、`snapshot_bytes`、`session_bytes` | 请求结束时会话持有的快照数量、快照占用、会话总占用 | B1 |
+| `prefill_max_chunk_ms` | 本次预填充中最长的一块（PLE 查表加 GPU 计算，不可中断，决定取消多快得到确认） | B1 |
+| `sys_pageins`、`sys_pageouts`、`sys_compressions`、`sys_decompressions`、`sys_swapins`、`sys_swapouts`、`swap_growth_bytes`、`compressor_bytes`、`major_faults` | 本次请求期间的**系统级**内存压力（页数的变化量、swap 增长、请求结束时压缩器的占用）和 worker 进程的缺页次数；worker 就绪日志另带启动期间的同一组数字和 `released_cache_bytes` | B1 |
+| `mtp_accept_rate` | MTP 草稿接受率 | B2 |
+| `ple_cache_hit_rate` | PLE 行缓存命中率 | B2（行缓存属于 B2-5） |
+| `ssd_spill_count` | 快照溢出到 SSD 的次数 | B2 |
 
-通过需要认证的 `GET /health/runtime` 查看运维状态。这不属于公共协议。
+B2 的字段在实现之前不输出，不用 0 占位。
+
+通过需要认证的 `GET /health/runtime` 查看运维状态：网关状态、准入、重启次数、计数，以及 worker 自己的视图（会话数与占用、快照预算、淘汰次数、token 映射条数、常驻权重、活跃内存、wired 上限、PLE 预取是否开启、最近一次请求的计量）。worker 在 2 秒内没有回答时，`worker` 为 null。这不属于公共协议，只含数字和枚举。
 
 ---
 
@@ -631,7 +638,7 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 - **快照点**：本次新预填充区域内**最后 K−1 个** item 边界，以及 prompt 末尾（开始生成之前）。每个会话保留最近 K=16 个。（实现时收窄：长历史冷启动有几百个边界，每个边界都切块会把 2048 的块切碎；复用几乎都发生在历史尾部。）
 - 会话同时保存 T 末尾的 logits。R 与 T 完全相同时（预热后发送同一请求）直接从这组 logits 开始解码。快照也保存所在位置的 logits（约 0.5 MB），所以快照正好落在 R 末尾时也能直接解码：同一请求重试或重新生成时，整个 prompt 都能复用（真实模型一致性测试中 W16 暴露了这一点）。
 - **生成之后**：T 等于 prompt 加上已经喂进模型的生成 token（最后采样出的那个 token 还没有喂入）。下一次请求的渲染会把它连同 `<|im_end|>\n` 一起作为增量追加。
-- **内存预算**：预算 = wired 上限 − 常驻权重 − 激活预留（4 GiB）− 安全余量（2 GiB），affine 格式约 12 GiB。开始生成前按 `(len(R) + max_output_tokens) × 29 KB + 快照` 估算需求，不够时按 LRU 淘汰空闲会话（整个丢弃；B2 改为溢出到 SSD）。单个请求本身超出预算时，只保留 prompt 末尾的一个快照。
+- **内存预算**（P4 验收中按实测修订，用户选择的 C1）：每次请求开始前重新计算：预算 = 当前可用内存 + 会话已占用 + MLX 缓冲缓存 − 激活预留（4 GiB）− 缓冲缓存上限（0.5 GiB）− 桌面余量（4 GiB），并且不超过「wired 上限 − 常驻权重 − 激活预留 − 安全余量」。原先只按 wired 上限算（约 12 GiB），默认 wired 之外的内存都归模型，而这台 96 GiB 的机器上 macOS 和桌面程序约占 14 GiB，长上下文会把它们挤进压缩。开始生成前按 `(len(R) + max_output_tokens) × 29 KB + 快照` 估算需求，不够时按 LRU 淘汰空闲会话（整个丢弃；B2 改为溢出到 SSD）。单个请求本身超出预算时，只保留 prompt 末尾的一个快照。MLX 缓冲缓存上限从 2 GiB 降到 0.5 GiB。
 - **token 映射**（第 6.5 节）：键是 assistant 回合**按模板渲染出的文本**的 sha256，值是生成提示符加上生成的 token id，一直到 `<|im_end|>`（在 `</tool_call>` 处停止时补上 `<|im_end|>`）。按文本做键，item 带什么 id、`phase` 都不影响命中；值包含生成提示符，所以 `none` 档（提示符里已有空 think 块）也能逐 token 复现。LRU 上限 1024 个回合或 800 万个 id。被中断、失败或达到输出上限的回合不记录。
 
 **生成**（`generate.py`，第 7 节）：
@@ -694,7 +701,12 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 | P1 | `protocol/`、`configs/`、日志、网关、假 worker | 网关加假 worker 通过 W01–W24 |
 | P2 | `ipc/`、worker 主循环、适配层、会话、生成、PLE 预取 | 小模型测试通过；用户在真实模型上完成预热，一致性测试 W01–W24 全部通过（2026-09-30 完成） |
 | P3 | 生命周期脚本、权重维护、检查、LaunchDaemon | 用户手动完成 install/start/stop/uninstall 的验收（2026-09-30 完成） |
-| P4 | 可观测性字段、`/health/runtime`、`validate_runtime.py` | 第 10 节的字段出现在 JSONL 中 |
+| P4 | 可观测性字段、`/health/runtime`、`validate_runtime.py` | 第 10 节的字段出现在 JSONL 中（2026-09-30 完成；B1-10 的长上下文验收也在此通过） |
+
+**P4 定稿（2026-09-30，用户确认）**：
+- 范围：补全第 10 节的日志字段（`queue_ms`、`ple_bytes_read`、`ple_read_ms`、`snapshot_count`、`snapshot_bytes`、`session_bytes`；`ple_cache_hit_rate`、`mtp_accept_rate`、`ssd_spill_count` 属于 B2，不输出占位值）；`/health/runtime` 合并 worker 状态（限时 2 秒，拿不到时为 null）；`scripts/validate_runtime.py`（对运行中的服务做有上限的真实生成检查，另有可选的长上下文检查，用来验收 B1-10：预填充速度对照 B0-5、全程不增加 swap）；隐私自检测试（小模型端到端，断言日志中不出现请求正文）。
+- 网络：服务只监听 `127.0.0.1:18080`，不新增监听地址。I1 及外网访问由用户在 Studio 上现有的 Cloudflare Tunnel 转发到这个地址（用户决定）。
+- B1 收尾（删除迁移脚本和 `backend/scripts/b0_*.py`、补 `docs/architecture.md`）不放进 P4，在用户验收 P4 之后单独进行（用户决定）。
 
 ---
 
@@ -736,3 +748,7 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 - **2026-09-30**：P3 代码完成：`backend_service.sh` 与 LaunchDaemon、`model_weights.sh`（download / convert / list / delete）、身份记录与目录租约、共用检查与分级校验、B0 产物迁移脚本；第 14.6 节写入用户确认的 6 项决策。`dev_serve.py` 删除，`MODEL_LIST` 去掉 mxfp4、加入 MTP 身份。新增直接依赖 huggingface-hub、hf-xet、packaging（锁文件中原本就有，版本不变）。
 - **2026-09-30**：P3 验收中首次 `start` 失败：launchd 的文件描述符软上限 256 不够外置 PLE 表的 384 个 memmap；网关和 worker 启动时把软上限提高到 65536。控制台前缀按用户偏好统一改为 `[Aporisa Code]`（前后端的脚本、CLI 工具和 AGENTS.md 的约定）。
 - **2026-09-30**：P3 验收完成：修复文件描述符上限后，`start` 就绪（加载加预热 21 秒），对系统服务运行一致性测试 W01–W24 全部通过，`stop / uninstall` 干净退出。start 等待上限改为 300 秒。
+- **2026-09-30**：P4 代码完成：第 10 节的字段（按实现改名：`ple_lookup_ms`、`ple_prefetch_ms`、`session_bytes`；`peak_memory_gb` 改为按请求重置）、`/health/runtime` 合并 worker 状态、`scripts/validate_runtime.py`（含 B1-10 的长上下文验收）、日志隐私自检测试。测试夹具改为经身份记录定位本地模型文件（B0 目录删除后原路径失效，测试被静默跳过）；`check.sh backend` 显示跳过原因。
+- **2026-09-30**：P4 验证中发现启动时桌面卡顿、运行期速度只有 P3 验收时的三分之一、`--long` 期间 worker 未能在 30 秒内确认取消。用户同意先做测量和三项改进：记录系统级内存压力（每个请求、启动期间、验证脚本每秒采样）；计算 SHA256 后释放文件的页缓存；worker 加载后释放权重文件的页缓存（实测 `F_NOCACHE` 读取仍会留下大部分缓存，改用 `msync(MS_INVALIDATE)`）；预填充在等待 PLE 预取时也响应取消和中断，取消确认上限改为 60 秒。PLE 行存储（有界缓存、绕过页缓存）等重启后的测量结果再决定。
+- **2026-09-30**：重启后的测量确认启动卡顿来自加载时的大规模压缩周转（约 56 GiB），运行速度已恢复正常，WebSocket 检查失败是状态刷新的竞态。用户同意先做 A（先记录计量再发终止事件，慢统计改为按需）和 B（逐层加载并逐层释放页缓存）；内存预算的余量（C）等 `--long` 的数据再定。
+- **2026-09-30**：C1 实现：会话预算改为按当前实际余量动态计算（给桌面留 4 GiB 余量），MLX 缓冲缓存上限降到 0.5 GiB；第 14.5 节同步修订。

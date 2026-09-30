@@ -32,7 +32,7 @@
 ## 当前阶段
 
 - 前端：F0（合同 v0）和 F1（SDK、mock、一致性测试）已经完成，下一阶段是 F2（OpenRouter 兼容 driver）。
-- 后端：B0（探路与实测）已经完成，B1（协议核心）实现中：P1、P2、P3 已完成，下一步是 P4（可观测性、`validate_runtime.py`）。设计见 `backend/DEVELOPMENT_PLAN.md` 第 14 节。
+- 后端：B0（探路与实测）已经完成，B1（协议核心）实现中：P1–P4 已完成，下一步是 B1 收尾。设计见 `backend/DEVELOPMENT_PLAN.md` 第 14 节。
 - 已验证的范围见 `docs/validation.md`。
 - 新能力在实现并验收之前，一律不得声称已经实现。文档中「目标规范」和「当前实现状态」必须分开写。
 

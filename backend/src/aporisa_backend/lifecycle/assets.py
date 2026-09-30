@@ -255,10 +255,15 @@ def lease_active(layout: Layout, folder: str) -> bool | None:
 
 
 def sha256(path: Path) -> str:
+    """SHA256 of a weight file; its pages are released from the page cache afterwards, so
+    verifying ~100 GiB does not push other programs' memory into compression and swap."""
+    from ..pagecache import release_all
+
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(8 * 1024**2), b""):
             digest.update(block)
+    release_all([path])
     return digest.hexdigest()
 
 

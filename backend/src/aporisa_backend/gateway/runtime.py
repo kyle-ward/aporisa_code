@@ -22,6 +22,19 @@ from .events import Assembler, AssemblyError, new_id
 from .worker_client import Job, WorkerClient, WorkerGone
 
 KEEPALIVE = object()
+# System memory-pressure deltas the worker reports per request and for its startup.
+PRESSURE_FIELDS = (
+    "sys_pageins",
+    "sys_pageouts",
+    "sys_compressions",
+    "sys_decompressions",
+    "sys_swapins",
+    "sys_swapouts",
+    "swap_growth_bytes",
+    "major_faults",
+    "compressor_bytes",
+)
+WORKER_STATUS_TIMEOUT_S = 2
 WORKER_STREAM_CODES = {
     "server_error",
     "engine_failure",
@@ -70,7 +83,13 @@ class Runtime:
         started = time.monotonic()
         self.worker = self.worker_factory()
         await asyncio.wait_for(self.worker.start(), self.limits.worker_start_timeout_s)
-        event("worker_ready", duration_ms=round((time.monotonic() - started) * 1000))
+        info = getattr(self.worker, "info", None) or {}
+        event(
+            "worker_ready",
+            duration_ms=round((time.monotonic() - started) * 1000),
+            released_cache_bytes=info.get("released_cache_bytes"),
+            **{key: (info.get("startup") or {}).get(key) for key in PRESSURE_FIELDS},
+        )
         self.state = "ready"
         self.admission.accepting = True
         self.last_error_code = None
@@ -152,6 +171,20 @@ class Runtime:
     def new_run(self, params: dict, *, transport: str, session: str | None) -> ResponseRun:
         return ResponseRun(self, params, transport=transport, session=session)
 
+    async def status(self) -> dict:
+        """/health/runtime: gateway state plus the worker's own view (numbers only).
+
+        The worker answers from its control thread even while generating; when it cannot
+        answer within WORKER_STATUS_TIMEOUT_S the gateway part is still returned.
+        """
+        worker = None
+        if self.ready():
+            try:
+                worker = await asyncio.wait_for(self.worker.status(), WORKER_STATUS_TIMEOUT_S)
+            except (TimeoutError, WorkerGone):
+                worker = None
+        return {**self.snapshot(), "worker": worker}
+
     def snapshot(self) -> dict:
         return {
             "state": self.state,
@@ -178,13 +211,16 @@ class ResponseRun:
         self.cancelled = asyncio.Event()
         self.accepted: dict = {}
         self.result: dict = {}
+        self.queue_ms: int | None = None
         self.status = "rejected"
         self.started = time.monotonic()
 
     async def open(self) -> None:
         """Admission and the worker's accept/reject; raises ProtocolError before any event."""
         runtime = self.runtime
+        queued = time.monotonic()
         await runtime.admission.acquire()
+        self.queue_ms = round((time.monotonic() - queued) * 1000)
         self.acquired = True
         runtime.runs.add(self)
         try:
@@ -357,6 +393,20 @@ class ResponseRun:
             prefill_tok_s=metrics.get("prefill_tok_s"),
             decode_tok_s=metrics.get("decode_tok_s"),
             peak_memory_gb=round(peak / 1024**3, 1) if peak else None,
+            queue_ms=self.queue_ms,
+            **{
+                key: metrics.get(key)
+                for key in (
+                    "ple_bytes_read",
+                    "ple_lookup_ms",
+                    "ple_prefetch_ms",
+                    "snapshot_count",
+                    "snapshot_bytes",
+                    "session_bytes",
+                    *PRESSURE_FIELDS,
+                    "prefill_max_chunk_ms",
+                )
+            },
         )
 
 

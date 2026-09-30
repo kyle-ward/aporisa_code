@@ -11,10 +11,12 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 
 import mlx.core as mx
 
+from .. import vmstats
 from .adapters.qwen38 import CALL_CLOSE, STOP_IDS, Qwen38Adapter, RenderPlan, TokenMap
 from .sessions import Session, SessionStore, cache_offset
 
@@ -95,6 +97,9 @@ class Engine:
         self.metrics: dict = {}
         self.info: dict = {}
         self.model_ref = None
+        self._ple_start = (0, 0.0, 0.0)
+        self._vm_start: dict = {}
+        self._max_chunk_s = 0.0
 
     # --- model calls ----------------------------------------------------------------------
 
@@ -130,19 +135,37 @@ class Engine:
                 raise Cancelled
             if flags.interrupt.is_set():
                 return False
-            if prefetch is not None:
-                prefetch.result()
+            if prefetch is not None and not self._wait(prefetch, flags):
+                return False
+            chunk_started = time.monotonic()
             logits = self._forward(session.cache, tokens[begin:end])
             prefetch = (
                 self._prefetch(tokens, *pieces[index + 1]) if index + 1 < len(pieces) else None
             )
             mx.eval(logits, [entry.state for entry in session.cache])
+            # One chunk (PLE lookup + GPU) cannot be interrupted; its duration bounds how
+            # fast a cancel is confirmed.
+            self._max_chunk_s = max(self._max_chunk_s, time.monotonic() - chunk_started)
             session.tokens.extend(tokens[begin:end])
             session.logits = logits
             if end in cuts:
                 session.snapshot(limit)
             mx.clear_cache()
         return True
+
+    @staticmethod
+    def _wait(future, flags: JobFlags) -> bool:
+        """Waits for a PLE prefetch while staying responsive: raises Cancelled on a cancel,
+        returns False on an interrupt."""
+        while True:
+            try:
+                future.result(timeout=0.1)
+                return True
+            except FutureTimeout:
+                if flags.cancel.is_set():
+                    raise Cancelled from None
+                if flags.interrupt.is_set():
+                    return False
 
     def _prefetch(self, tokens: list[int], begin: int, end: int):
         if self.prefetcher is None:
@@ -157,6 +180,10 @@ class Engine:
     def generate(self, job: dict, send: Send, flags: JobFlags) -> None:
         """Runs one job, sending worker messages. Raises Cancelled after a hard cancel."""
         started = time.monotonic()
+        mx.reset_peak_memory()  # peak_memory_bytes is per request
+        self._ple_start = self._ple_counters()
+        self._vm_start = vmstats.sample()
+        self._max_chunk_s = 0.0
         request, job_id = job["request"], job["id"]
 
         def emit(message: dict) -> None:
@@ -272,9 +299,26 @@ class Engine:
             message["reason"] = reason
         return message
 
+    def _ple_counters(self) -> tuple[int, float, float]:
+        """(bytes gathered from the external table, main-thread lookup s, prefetch thread s)."""
+        if self.prefetcher is None:
+            return (0, 0.0, 0.0)
+        stats = self.prefetcher.table.stats
+        return (stats.bytes_read, stats.elapsed_seconds, self.prefetcher.seconds)
+
     def _metrics(self, match, input_tokens, prefill_s, output_tokens, decode_s, started) -> dict:
         prefilled = input_tokens - match.cached
+        session = match.session
+        ple = [now - then for now, then in zip(self._ple_counters(), self._ple_start, strict=True)]
         return {
+            "ple_bytes_read": int(ple[0]) if self.prefetcher is not None else None,
+            "ple_lookup_ms": round(ple[1] * 1000) if self.prefetcher is not None else None,
+            "ple_prefetch_ms": round(ple[2] * 1000) if self.prefetcher is not None else None,
+            **vmstats.delta(self._vm_start, vmstats.sample()),
+            "prefill_max_chunk_ms": round(self._max_chunk_s * 1000),
+            "snapshot_count": len(session.snapshots),
+            "snapshot_bytes": sum(s.nbytes for s in session.snapshots),
+            "session_bytes": session.nbytes(),
             "restore_path": match.path,
             "prefill_tokens": prefilled,
             "prefill_tok_s": round(prefilled / prefill_s, 1)

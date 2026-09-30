@@ -45,7 +45,7 @@ class Server:
 
     def __enter__(self) -> Server:
         self.thread.start()
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 60  # a real worker loads and warms up first
         while not self.server.started:
             if time.monotonic() > deadline or not self.thread.is_alive():
                 raise RuntimeError("test server did not start")

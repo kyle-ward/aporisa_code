@@ -58,6 +58,21 @@ cd backend && UV_CACHE_DIR=../.cache/uv UV_PYTHON_INSTALL_DIR=../.runtime/python
 | `configs/` | 随代码评审的策略：模型指针、资源上限、引擎、部署、服务超时 |
 | `fake/` | 测试用的进程内假 worker |
 
+## 对运行中的服务做真实生成验证
+
+`scripts/validate_runtime.py` 由用户显式运行，不属于 `check.sh`。它按 `backend/.env` 的 key 和端口，对已经启动的服务逐项检查：文本、推理、工具调用及工具结果续写、`prompt_cache_key` 前缀复用、WebSocket 续接、中途换档到 `none`、`/health/runtime`。结果只含数字，追加到 `.runtime/validation/validate_<时间>.jsonl`。
+
+```bash
+backend/.venv/bin/python scripts/validate_runtime.py
+backend/.venv/bin/python scripts/validate_runtime.py --long 131072
+```
+
+`--long` 增加长上下文检查（B1-10 的验收）：一次冷预填充，服务端预填充速度要达到 B0-5 同长度「纯计算」速度的 80%；紧接着续接一轮，只预填充增量；整个过程 swap 用量不增长。
+
+运行期间每秒采样一次系统的压缩器、swap 和空闲内存，每项检查结束时报告它造成的系统级内存压力，最后给出整轮的汇总；数据都在同一个结果文件里。
+
+## 前台运行
+
 开发期可以在前台运行服务（不经过 launchd，检查与正式服务相同），Ctrl+C 停止：
 
 ```bash

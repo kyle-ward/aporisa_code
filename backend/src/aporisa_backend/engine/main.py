@@ -37,11 +37,15 @@ EXIT_GRACE_S = 30
 
 class Worker:
     def __init__(self, channel: Channel, init: dict):
+        from .. import vmstats
         from . import runtime
 
         self.channel, self.init = channel, init
+        before = vmstats.sample()
         self.engine = runtime.load(init)
         runtime.warmup(self.engine, init["model"]["id"])
+        # Memory pressure the whole startup (load + warmup) caused system-wide.
+        self.engine.info["startup"] = vmstats.delta(before, vmstats.sample())
         adapter_class = runtime.ADAPTERS[init["adapter"]]
         self.count_adapter = adapter_class(Codec(Path(init["model_dir"])), init["model"])
         self.inbox: queue.Queue[dict] = queue.Queue()
@@ -52,6 +56,10 @@ class Worker:
         self._update_view()
 
     def send(self, message: dict) -> None:
+        if message.get("type") in ("finished", "failed"):
+            # The client may ask /health/runtime the moment it sees the terminal event: the
+            # job's metrics must already be the "last" ones by then.
+            self.view = {**self.view, "last": dict(self.engine.metrics)}
         try:
             self.channel.send(message)
         except OSError:
@@ -66,6 +74,22 @@ class Worker:
             "token_map_turns": len(self.engine.token_map),
             "active_memory_bytes": int(mx.get_active_memory()),
             "last": dict(self.engine.metrics),
+        }
+
+    def _status(self) -> dict:
+        """Status reply (control thread): the cached view plus point-in-time memory facts.
+        Counting PLE page-cache residency takes ~0.6 s, so it runs only when asked."""
+        from .. import vmstats
+        from .runtime import ple_cached_bytes
+
+        system = vmstats.sample()
+        return {
+            **self.view,
+            "ple_files_cached_bytes": ple_cached_bytes(self.engine),
+            "system": {
+                key: system[key]
+                for key in ("free_bytes", "wired_bytes", "compressor_bytes", "swap_used_bytes")
+            },
         }
 
     # --- main thread ----------------------------------------------------------------------
@@ -152,7 +176,7 @@ class Worker:
                     traceback.print_exc(file=sys.stderr)
                     self.send({"id": job_id, "type": "counted", "error": "internal_error"})
             elif op == "status":
-                self.send({"id": job_id, "type": "status", "status": dict(self.view)})
+                self.send({"id": job_id, "type": "status", "status": self._status()})
             elif op == "release_session":
                 self.inbox.put(message)
             elif op == "shutdown":

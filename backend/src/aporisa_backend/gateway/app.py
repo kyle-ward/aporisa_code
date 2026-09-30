@@ -130,7 +130,7 @@ class Gateway:
         if path == "/health/runtime" and method == "GET":
             if not self.authorized(scope):
                 raise ProtocolError("invalid_api_key", "Invalid API key.")
-            return await send_json(send, 200, runtime.snapshot(), request_id)
+            return await send_json(send, 200, await runtime.status(), request_id)
         if not path.startswith("/v1/"):
             raise ProtocolError("not_found", "Unknown endpoint.")
         if not self.authorized(scope):

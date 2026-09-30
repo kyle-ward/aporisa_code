@@ -157,3 +157,27 @@ def test_open_files_limit_is_raised_from_launchd_default():
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0 and int(result.stdout) >= 65536
+
+
+def test_page_cache_release_and_hashing_leave_no_cache(tmp_path):
+    from aporisa_backend import pagecache
+
+    path = tmp_path / "weights.safetensors"
+    path.write_bytes(b"\x07" * (32 * 1024**2))
+    path.read_bytes()
+    assert pagecache.resident_bytes(path) > 0
+    pagecache.release(path)
+    assert pagecache.resident_bytes(path) == 0
+    assets.sha256(path)  # verifying a weight file releases what it read
+    assert pagecache.resident_bytes(path) == 0
+    pagecache.release_all([tmp_path / "missing", path])  # best effort, never raises
+
+
+def test_vm_counters_and_deltas():
+    from aporisa_backend import vmstats
+
+    before = vmstats.sample()
+    after = vmstats.sample()
+    assert after["compressions"] >= before["compressions"] and after["swap_used_bytes"] >= 0
+    delta = vmstats.delta(before, after)
+    assert set(delta) >= {"sys_swapouts", "sys_compressions", "swap_growth_bytes", "major_faults"}
