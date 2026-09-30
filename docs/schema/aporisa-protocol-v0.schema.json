@@ -402,6 +402,38 @@
             "output"
           ],
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "configuration_update"
+            },
+            "reasoning": {
+              "type": "object",
+              "properties": {
+                "effort": {
+                  "type": "string",
+                  "enum": [
+                    "none",
+                    "low",
+                    "medium",
+                    "high"
+                  ]
+                }
+              },
+              "required": [
+                "effort"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "type",
+            "reasoning"
+          ],
+          "additionalProperties": false
         }
       ]
     },
@@ -807,6 +839,9 @@
             },
             "websocket": {
               "type": "boolean"
+            },
+            "reasoning_effort_updates": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -816,7 +851,8 @@
             "prompt_cache",
             "prewarm",
             "input_tokens",
-            "websocket"
+            "websocket",
+            "reasoning_effort_updates"
           ],
           "additionalProperties": false
         }
@@ -985,6 +1021,9 @@
                   },
                   "websocket": {
                     "type": "boolean"
+                  },
+                  "reasoning_effort_updates": {
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -994,7 +1033,8 @@
                   "prompt_cache",
                   "prewarm",
                   "input_tokens",
-                  "websocket"
+                  "websocket",
+                  "reasoning_effort_updates"
                 ],
                 "additionalProperties": false
               }
@@ -1433,6 +1473,38 @@
                   "type",
                   "call_id",
                   "output"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "configuration_update"
+                  },
+                  "reasoning": {
+                    "type": "object",
+                    "properties": {
+                      "effort": {
+                        "type": "string",
+                        "enum": [
+                          "none",
+                          "low",
+                          "medium",
+                          "high"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "effort"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "type",
+                  "reasoning"
                 ],
                 "additionalProperties": false
               }
@@ -2035,6 +2107,38 @@
                   "type",
                   "call_id",
                   "output"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "configuration_update"
+                  },
+                  "reasoning": {
+                    "type": "object",
+                    "properties": {
+                      "effort": {
+                        "type": "string",
+                        "enum": [
+                          "none",
+                          "low",
+                          "medium",
+                          "high"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "effort"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "type",
+                  "reasoning"
                 ],
                 "additionalProperties": false
               }
@@ -2656,6 +2760,38 @@
                   "output"
                 ],
                 "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "configuration_update"
+                  },
+                  "reasoning": {
+                    "type": "object",
+                    "properties": {
+                      "effort": {
+                        "type": "string",
+                        "enum": [
+                          "none",
+                          "low",
+                          "medium",
+                          "high"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "effort"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "type",
+                  "reasoning"
+                ],
+                "additionalProperties": false
               }
             ]
           }
@@ -3235,7 +3371,8 @@
                     "inference_timeout",
                     "output_limit_exceeded",
                     "structured_output_invalid",
-                    "engine_failure"
+                    "engine_failure",
+                    "tool_call_invalid"
                   ]
                 },
                 "message": {
@@ -3603,7 +3740,8 @@
                             "inference_timeout",
                             "output_limit_exceeded",
                             "structured_output_invalid",
-                            "engine_failure"
+                            "engine_failure",
+                            "tool_call_invalid"
                           ]
                         },
                         "message": {
@@ -5003,7 +5141,8 @@
                             "inference_timeout",
                             "output_limit_exceeded",
                             "structured_output_invalid",
-                            "engine_failure"
+                            "engine_failure",
+                            "tool_call_invalid"
                           ]
                         },
                         "message": {
@@ -5377,7 +5516,8 @@
                             "inference_timeout",
                             "output_limit_exceeded",
                             "structured_output_invalid",
-                            "engine_failure"
+                            "engine_failure",
+                            "tool_call_invalid"
                           ]
                         },
                         "message": {
@@ -5751,7 +5891,8 @@
                             "inference_timeout",
                             "output_limit_exceeded",
                             "structured_output_invalid",
-                            "engine_failure"
+                            "engine_failure",
+                            "tool_call_invalid"
                           ]
                         },
                         "message": {

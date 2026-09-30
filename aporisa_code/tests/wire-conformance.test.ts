@@ -1,6 +1,6 @@
 // Runs the wire-level conformance suite against the mock server (the executable contract).
 import { afterAll, beforeAll, describe, it } from "vitest";
-import { wireCases, type WireContext } from "../src/conformance/wire.ts";
+import { missingCapability, wireCases, type WireContext } from "../src/conformance/wire.ts";
 import { MockServer } from "../src/mock/index.ts";
 
 describe("wire conformance: mock server", () => {
@@ -14,7 +14,7 @@ describe("wire conformance: mock server", () => {
   afterAll(() => server.close());
 
   for (const testCase of wireCases) {
-    const run = testCase.requires && !server.model.capabilities[testCase.requires] ? it.skip : it;
+    const run = missingCapability(testCase, server.model) ? it.skip : it;
     run(`${testCase.id} ${testCase.title}`, () => testCase.run(context));
   }
 });

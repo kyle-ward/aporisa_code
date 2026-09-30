@@ -8,9 +8,13 @@
 - 只支持 macOS / Apple Silicon，不考虑其他平台。
 - 仓库分为三块：
   - **协议合同**：`docs/protocol.md` 加上机器可读的 schema，是前后端共同的唯一依据，不属于任何一方。
-  - **前端**：`aporisa_code/`，包含 harness core 和 Electron app，100% TypeScript，在 MacBook Air 上开发。
-  - **后端**：`backend/`，是通用的本地推理服务，以 `local_llm` 为起点，只在 Mac Studio 上开发和运行。
+  - **前端**：`aporisa_code/`，包含 harness core 和 Electron app，100% TypeScript，两台机器上都可以开发。
+  - **后端**：`backend/`，是通用的本地推理服务，以 `local_llm` 为起点，只在 Mac Studio 上开发和运行（Air 无法调试后端）。
 - **harness core 是项目的核心价值。** 后端只提供通用、无状态的推理能力，不包含任何 harness 逻辑。
+- 两台机器的分工：
+  - **Mac Studio**：以后端为主、前端为辅。发现必要的前端同步（例如合同变更），可以直接修改前端；必要时也可以顺带推进前端的阶段任务。
+  - **MacBook Air**：只开发前端，因为它无法调试后端。
+  - 两台机器**严格不同时开发**。换机器之前先把代码同步好，避免两边各改一份。
 
 ## 设计参考原则
 
@@ -19,7 +23,7 @@
 - 协议中和 OpenAI 重合的部分，以 Responses API 的条目（item）模型为蓝本，不使用 Chat Completions 的形状。
 - 参考仓库只读，不能为了适配本项目去改动它们。两台机器上的路径不同，指的是同一批仓库：
 
-| 仓库 | MacBook Air（前端开发） | Mac Studio（后端开发） |
+| 仓库 | MacBook Air | Mac Studio |
 |---|---|---|
 | local_llm | `/Users/Zhuanz1/Personal/SmartCare/dgx_spark/local_llm` | `/Users/aporisa/Personal/SmartCare/dgx_spark/local_llm` |
 | local_asr | `/Users/Zhuanz1/Personal/SmartCare/dgx_spark/local_asr` | `/Users/aporisa/Personal/SmartCare/dgx_spark/local_asr` |
@@ -27,7 +31,9 @@
 
 ## 当前阶段
 
-- F0（合同 v0）和 F1（SDK、mock、一致性测试）已经完成，已验证的范围见 `docs/validation.md`。下一阶段是 F2（OpenRouter 兼容 driver）。后端尚未开始。
+- 前端：F0（合同 v0）和 F1（SDK、mock、一致性测试）已经完成，下一阶段是 F2（OpenRouter 兼容 driver）。
+- 后端：B0（探路与实测）已经完成，B1（协议核心）实现中，设计见 `backend/DEVELOPMENT_PLAN.md` 第 14 节。
+- 已验证的范围见 `docs/validation.md`。
 - 新能力在实现并验收之前，一律不得声称已经实现。文档中「目标规范」和「当前实现状态」必须分开写。
 
 ## 开始工作前

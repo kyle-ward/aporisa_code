@@ -2,6 +2,7 @@
 // Shared by the mock server (wire level) and the stub driver (in-process).
 import {
   canonicalJson,
+  effectiveReasoningEffort,
   StreamValidator,
   type EventWithoutSequence,
   type InputItem,
@@ -341,7 +342,7 @@ export class MockEngine {
     this.requestIndex += 1;
     const declared = new Map((params.tools ?? []).map((tool) => [tool.name, tool.type]));
     let steps = plan.steps.filter((step) => {
-      if (step.type === "reasoning") return params.reasoning?.effort !== "none";
+      if (step.type === "reasoning") return effectiveReasoningEffort(params, this.model) !== "none";
       if (step.type === "function_call" || step.type === "custom_tool_call") {
         if (params.tool_choice === "none") return false;
         const expected = step.type === "function_call" ? "function" : "custom";

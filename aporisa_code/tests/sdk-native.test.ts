@@ -104,6 +104,21 @@ describe("native driver: WebSocket (default transport)", () => {
     ]);
   });
 
+  it("keeps incremental continuation across a mid-thread effort change via configuration_update", async () => {
+    const { driver, server } = await setup();
+    const first = request([user("one")], { reasoning: { effort: "high" }, prompt_cache_key: "thread-effort" });
+    const firstResponse = await driver.createResponse(first).final();
+    const second = request(
+      [...first.input, ...firstResponse.output, { type: "configuration_update", reasoning: { effort: "low" } }, user("two")],
+      { reasoning: { effort: "high" }, prompt_cache_key: "thread-effort" },
+    );
+    const secondResponse = await driver.createResponse(second).final();
+    expect(secondResponse.status).toBe("completed");
+    expect(server.stats.wsIncrementalCreates).toBe(1);
+    expect(server.requests[1]?.input.at(-2)).toEqual({ type: "configuration_update", reasoning: { effort: "low" } });
+    expect(secondResponse.usage?.input_tokens_details.cached_tokens).toBeGreaterThan(0);
+  });
+
   it("falls back to a full create when request properties change", async () => {
     const { driver, server } = await setup();
     const first = await driver.createResponse(request([user("one")])).final();
@@ -262,6 +277,13 @@ describe("native driver: errors and retries", () => {
     const stream = driver.createResponse(
       request([user("hi")], { text: { format: { type: "json_schema", name: "x", schema: { type: "object" }, strict: true } } }),
     );
+    await expect(stream.final()).rejects.toBeInstanceOf(AporisaRequestError);
+    expect(server.requests).toHaveLength(0);
+  });
+
+  it("rejects configuration_update locally when the model does not declare effort updates", async () => {
+    const { driver, server } = await setup({ model: mockModel({ capabilities: { ...mockModel().capabilities, reasoning_effort_updates: false } }) });
+    const stream = driver.createResponse(request([user("hi"), { type: "configuration_update", reasoning: { effort: "low" } }]));
     await expect(stream.final()).rejects.toBeInstanceOf(AporisaRequestError);
     expect(server.requests).toHaveLength(0);
   });

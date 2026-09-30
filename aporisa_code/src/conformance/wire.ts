@@ -34,8 +34,15 @@ export interface WireContext {
 export interface WireCase {
   id: string;
   title: string;
-  requires?: CapabilityName;
+  /** Capabilities the case needs; it is skipped when any of them is not declared. */
+  requires?: CapabilityName | readonly CapabilityName[];
   run(context: WireContext): Promise<void>;
+}
+
+/** The first required capability the model does not declare, if any. */
+export function missingCapability(testCase: WireCase, model: Model): CapabilityName | undefined {
+  const required = testCase.requires === undefined ? [] : [testCase.requires].flat();
+  return required.find((name) => !model.capabilities[name]);
 }
 
 // --- helpers -------------------------------------------------------------------------------
@@ -449,6 +456,65 @@ export const wireCases: WireCase[] = [
       }
     },
   },
+  {
+    id: "W23",
+    title: "configuration_update follows the capability, position and effort rules of §6.1",
+    async run(context) {
+      const update = (effort: string) => ({ type: "configuration_update", reasoning: { effort } });
+      const post = (input: unknown[]) =>
+        http(context.target, "POST", "/responses", { body: JSON.stringify({ ...baseRequest(context), stream: true, input }) });
+      if (!context.model.capabilities.reasoning_effort_updates) {
+        await expectError(await post([userMessage("hi"), update(context.model.reasoning.default_effort)]), 400, "unsupported_parameter");
+        return;
+      }
+      const call = { type: "function_call", call_id: "call_w23", name: "lookup", arguments: "{}" };
+      const output = { type: "function_call_output", call_id: "call_w23", output: "x" };
+      await expectError(await post([userMessage("hi"), call, update(context.model.reasoning.default_effort), output]), 400, "invalid_request");
+      const unsupported = (["none", "low", "medium", "high"] as const).find(
+        (effort) => !context.model.reasoning.supported_efforts.includes(effort),
+      );
+      if (unsupported) await expectError(await post([userMessage("hi"), update(unsupported)]), 400, "unsupported_parameter");
+
+      const efforts = context.model.reasoning.supported_efforts;
+      const target = efforts.includes("none") ? "none" : context.model.reasoning.default_effort;
+      const baseline = efforts.find((effort) => effort !== target) ?? target;
+      const { response } = await streamHttp(context.target, {
+        ...baseRequest(context),
+        reasoning: { effort: baseline },
+        input: [userMessage("hi"), call, output, update(target)],
+      });
+      assert.ok(response.status === "completed" || response.status === "incomplete");
+      if (target === "none") {
+        assert.ok(response.output.every((item) => item.type !== "reasoning"), "effort none produced a reasoning item");
+        assert.equal(response.usage?.output_tokens_details.reasoning_tokens, 0);
+      }
+    },
+  },
+  {
+    id: "W24",
+    title: "a configuration_update in the incremental input keeps WebSocket continuation",
+    requires: ["websocket", "reasoning_effort_updates"],
+    async run(context) {
+      const session = await openWs(context.target);
+      try {
+        const first = baseRequest(context);
+        session.send({ type: "response.create", ...first });
+        const previous = await readWsResponse(session);
+        assert.equal(previous.status, "completed", "continuation needs a completed response");
+        const effort = context.model.reasoning.supported_efforts.at(-1) ?? context.model.reasoning.default_effort;
+        session.send({
+          type: "response.create",
+          ...first,
+          input: [{ type: "configuration_update", reasoning: { effort } }, userMessage("One more sentence.")],
+          previous_response_id: previous.id,
+        });
+        const next = await readWsResponse(session);
+        assert.ok(next.status === "completed" || next.status === "incomplete");
+      } finally {
+        session.close();
+      }
+    },
+  },
 ];
 
 /** Runs every applicable case; returns per-case results for CLI reporting. */
@@ -456,8 +522,9 @@ export async function runWireConformance(target: WireTarget): Promise<{ id: stri
   const model = Model.parse(await (await http(target, "GET", `/models/${target.model}`)).json());
   const results = [];
   for (const testCase of wireCases) {
-    if (testCase.requires && !model.capabilities[testCase.requires]) {
-      results.push({ id: testCase.id, title: testCase.title, status: "skip" as const, detail: `requires ${testCase.requires}` });
+    const missing = missingCapability(testCase, model);
+    if (missing) {
+      results.push({ id: testCase.id, title: testCase.title, status: "skip" as const, detail: `requires ${missing}` });
       continue;
     }
     try {

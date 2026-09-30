@@ -29,7 +29,7 @@ cd aporisa_code && PATH="$PWD/.tools/node/bin:$PATH" npm install --save-exact <p
 
 ## 后端工具链（B0 阶段）
 
-后端（`backend/`）只在 Mac Studio 上开发。正式的 `backend_service.sh prepare` 要到 B1-2 才实现；在那之前，环境按下面的方式手动准备。它和将来 prepare 要做的事一致，只是还没有收进脚本：
+后端（`backend/`）只在 Mac Studio 上开发，Air 无法调试后端；前端两台机器都可以开发（见 AGENTS.md）。正式的 `backend_service.sh prepare` 要到 B1-2 才实现；在那之前，环境按下面的方式手动准备。它和将来 prepare 要做的事一致，只是还没有收进脚本：
 
 | 工具 | 版本 | 位置 |
 | --- | --- | --- |

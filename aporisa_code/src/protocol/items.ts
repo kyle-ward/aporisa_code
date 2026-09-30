@@ -1,6 +1,7 @@
 // Item model of the Aporisa protocol (docs/protocol.md §7.1).
 // Shapes follow the OpenAI Responses API items as used by openai/codex.
 import { z } from "zod";
+import { ReasoningEffort } from "./models.ts";
 
 const DATA_IMAGE_URL = /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/]+={0,2}$/;
 
@@ -94,6 +95,12 @@ export const CustomToolCallOutputItem = z.strictObject({
   output: ToolOutput,
 });
 
+/** Input-only reasoning-effort update interpreted at its position in history (§6.1). */
+export const ConfigurationUpdateItem = z.strictObject({
+  type: z.literal("configuration_update"),
+  reasoning: z.strictObject({ effort: ReasoningEffort }),
+});
+
 export const InputItem = z.discriminatedUnion("type", [
   InputMessageItem,
   InputReasoningItem,
@@ -101,6 +108,7 @@ export const InputItem = z.discriminatedUnion("type", [
   FunctionCallOutputItem,
   InputCustomToolCallItem,
   CustomToolCallOutputItem,
+  ConfigurationUpdateItem,
 ]);
 
 // --- Output items: always carry a server id; message content may still be empty
@@ -153,6 +161,7 @@ export type ToolOutput = z.infer<typeof ToolOutput>;
 export type Role = z.infer<typeof Role>;
 export type MessagePhase = z.infer<typeof MessagePhase>;
 export type InputItem = z.infer<typeof InputItem>;
+export type ConfigurationUpdateItem = z.infer<typeof ConfigurationUpdateItem>;
 export type OutputItem = z.infer<typeof OutputItem>;
 export type OutputMessageItem = z.infer<typeof OutputMessageItem>;
 export type OutputReasoningItem = z.infer<typeof OutputReasoningItem>;

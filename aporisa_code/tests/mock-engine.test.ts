@@ -69,6 +69,27 @@ describe("mock engine", () => {
     expect(response.output.map((item) => item.type)).toEqual(["message"]);
   });
 
+  it("applies the effective effort from configuration_update over the request baseline", async () => {
+    const script: MockScript = () => ({ steps: [{ type: "reasoning", text: "think" }, { type: "message", text: "done" }] });
+    const user = params().input[0]!;
+    const toNone = await run(script, { reasoning: { effort: "high" }, input: [user, { type: "configuration_update", reasoning: { effort: "none" } }] });
+    expect(toNone.response.output.map((item) => item.type)).toEqual(["message"]);
+    expect(toNone.response.usage?.output_tokens_details.reasoning_tokens).toBe(0);
+    const toHigh = await run(script, { reasoning: { effort: "none" }, input: [user, { type: "configuration_update", reasoning: { effort: "high" } }] });
+    expect(toHigh.response.output.map((item) => item.type)).toEqual(["reasoning", "message"]);
+  });
+
+  it("ends with tool_call_invalid after keeping the items completed before it", async () => {
+    const { response, events } = await run(() => ({
+      steps: [{ type: "message", text: "Let me check.", phase: "commentary" }, { type: "reasoning", text: "unused" }],
+      failAfter: { steps: 1, code: "tool_call_invalid", message: "Tool call markup is not closed." },
+    }));
+    expect(response.status).toBe("failed");
+    expect(response.error).toEqual({ code: "tool_call_invalid", message: "Tool call markup is not closed." });
+    expect(response.output.map((item) => item.type)).toEqual(["message"]);
+    expect(events.at(-1)?.type).toBe("response.failed");
+  });
+
   it("rejects scripts that call undeclared tools", async () => {
     await expect(run(() => ({ steps: [{ type: "function_call", name: "nope", arguments: "{}" }] }))).rejects.toThrow(/undeclared/);
   });

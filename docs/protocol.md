@@ -2,7 +2,7 @@
 
 > **状态：v0 已定稿。** 前端的 SDK（native driver）和 mock server 已按本文实现，并通过了 wire 层一致性测试（见 [validation.md](validation.md)）。后端尚未实现。本文是 harness（Aporisa SDK）和推理后端之间的唯一合同。任何代码、schema 或 mock 与本文不一致时，以本文为准，并按第 13 节的流程同步。
 >
-> 修订日期：2026-09-29。协议路径版本：`/v1`。
+> 修订日期：2026-09-30（v0 修订：2026-09-29 新增 `configuration_update` 输入 item 和 `reasoning_effort_updates` 能力，见第 6.1 节；2026-09-30 明确 `function_call` 的保证范围，新增流中错误码 `tool_call_invalid`，见第 7.1、9.2 节）。协议路径版本：`/v1`。
 
 ## 1. 范围与原则
 
@@ -117,6 +117,7 @@
 - 服务端只为**本连接上最近一次以 `completed` 结束的 response** 保留续接状态。
 - 客户端可以在下一次 `response.create` 中带上 `previous_response_id`，同时 `input` **只放新增的 items**。前提是：本次请求中除 `input`、`client_metadata`、`generate` 以外的所有字段，都与上一次请求**完全相同**。
 - 语义上，这等价于一次完整请求，其 `input` 为：上一次请求的完整 `input`，加上上一次的 `output`，再加上本次的 `input`。
+- 中途换档不修改 `reasoning` 字段，而是在 `input` 中追加 `configuration_update`（第 6.1 节），所以换档不会打断续接。
 - 带有 `previous_response_id` 时，`input` 可以为空（典型用法是预热之后立即正式生成）。
 - 服务端无法满足续接时，返回 `error`，错误码为 `previous_response_not_found`，并且不开始生成。可能的原因包括：状态已经丢失、id 不是最近一次 response、字段不一致。客户端收到后，**在同一连接上改发不带 `previous_response_id` 的完整请求**。这不计入第 9.3 节的重试次数。
 - 客户端是否能续接，由它自己比对本次请求和上一次请求来判断，参照 codex 的 `get_incremental_items`。判断不出来时，一律发送完整请求。
@@ -184,6 +185,7 @@
 | `prewarm` | 扩展 X2：是否支持 `generate: false` 预热 |
 | `input_tokens` | 扩展 X3：是否提供 token 计数端点 |
 | `websocket` | 是否支持 WebSocket 传输及增量续接（第 3.3 节）。原生后端必须为 true |
+| `reasoning_effort_updates` | 是否支持用 `configuration_update` 输入 item 在对话中途换档（第 6.1 节），对应 codex 的 `supports_reasoning_effort_updates` |
 
 wire 上的能力只有 boolean 两种取值。Aporisa SDK 对 harness 暴露的是**三态**能力：`supported`、`emulated`、`unsupported`。原生 driver 只会给出 `supported` 或 `unsupported`；`emulated` 只会由兼容 driver 给出，具体见 [compat-openrouter.md](compat-openrouter.md)。
 
@@ -197,7 +199,7 @@ wire 上的能力只有 boolean 两种取值。Aporisa SDK 对 harness 暴露的
 | `tools` | ToolSpec[] | 否 | 工具定义，见第 8 节 |
 | `tool_choice` | `"auto"` \| `"none"` | 否 | 默认 `"auto"` |
 | `parallel_tool_calls` | boolean | 否 | 默认 false；只有在 `capabilities.parallel_tool_calls` 为 true 时才可以设为 true |
-| `reasoning` | `{"effort": ...}` | 否 | `effort` 取值必须在 `supported_efforts` 内。另可带 `"summary":"auto"`，前提是 `reasoning.summary` 为 true |
+| `reasoning` | `{"effort": ...}` | 否 | 推理强度的**基线**，含义见第 6.1 节。`effort` 取值必须在 `supported_efforts` 内。另可带 `"summary":"auto"`，前提是 `reasoning.summary` 为 true |
 | `text` | `{"format": JsonSchemaFormat}` | 否 | 结构化输出，需要 `capabilities.structured_output` |
 | `max_output_tokens` | integer | 否 | 1 到模型的 `max_output_tokens`，包括推理 token |
 | `prompt_cache_key` | string，1–128 字符 | 否 | 缓存亲和键（X1）。harness 一般取 thread id。服务端未声明 `prompt_cache` 时也接受这个字段，但它不产生任何效果 |
@@ -213,6 +215,24 @@ wire 上的能力只有 boolean 两种取值。Aporisa SDK 对 harness 暴露的
 **结构约束**（违反时返回 400 `invalid_request`）：
 - `input` 中每个 `function_call` / `custom_tool_call`，在它**之后**都必须有且仅有一个 `call_id` 相同的对应 output；每个 output 也必须对应它之前的某个 call。这对应 codex 的历史规范化不变量，由 harness 保证，服务端负责校验。
 - 在 `input` 里，assistant 角色的 `message`、`reasoning` 和工具调用 item，只能来自先前的模型输出。服务端不校验它们的来源，但 harness 不得伪造。
+- `configuration_update` 不能出现在一个工具调用和它的 output 之间：它之前的所有调用都必须已经有了 output。它的 `reasoning.effort` 必须在 `supported_efforts` 内，否则返回 400 `unsupported_parameter`。
+
+### 6.1 推理强度：基线与中途换档
+
+照搬 codex 的 `configuration_update`：换档写进历史的尾部，而不是修改请求字段。这样换档不会让前缀失效。
+
+- **生效强度**：本次生成使用的推理强度按以下顺序确定：
+  1. `input` 中最后一个 `configuration_update` 的 `reasoning.effort`（WebSocket 续接时，按展开后的完整 `input` 计算）；
+  2. 没有则取请求的 `reasoning.effort`；
+  3. 都没有则取模型的 `default_effort`。
+- **基线**：请求的 `reasoning.effort` 表示 `input` 开头时生效的强度。harness 在同一个上下文窗口内保持它不变。
+- **换档**：用户在对话中途改档时，harness 在 `input` 末尾追加一个 `configuration_update`（位置在下一条用户消息之前，或者工具结果之后），并把它作为历史的一部分保存，之后的请求原样回传。每个 `configuration_update` 从它所在的位置起生效，直到下一个 `configuration_update` 为止。换档后强度和当前生效强度相同时，不追加。
+- 这样换档只改变历史的尾部：服务端可以继续复用已有的前缀（X1）；`reasoning` 字段不变，WebSocket 续接也不受影响（第 3.3 节）。
+- 上下文压缩后开始新的上下文窗口时，harness 可以把当前强度作为新的基线，并丢弃旧的 `configuration_update`。
+- `configuration_update` 只能由 harness 按用户的选择生成，不能来自模型输出或工具结果。服务端不校验来源。
+- 模型没有声明 `capabilities.reasoning_effort_updates` 时，客户端不得发送 `configuration_update`，服务端返回 400 `unsupported_parameter`。此时只能通过修改 `reasoning.effort` 来换档，代价是前缀缓存失效、WebSocket 续接退回完整请求。兼容 driver 的模拟方式见 [compat-openrouter.md](compat-openrouter.md)。
+- **生效强度为 `none` 时**，本次生成不得产生 `reasoning` item，`usage.output_tokens_details.reasoning_tokens` 为 0。
+- 服务端在内部如何表达 `configuration_update`（例如渲染为一段指令），属于后端的模型适配细节，不属于协议。
 
 ## 7. Item 模型
 
@@ -255,7 +275,13 @@ wire 上的能力只有 boolean 两种取值。Aporisa SDK 对 harness 暴露的
  "arguments":"{\"cmd\":\"ls\"}"}
 ```
 
-`arguments` 是 **JSON 字符串**，不是对象，这和 Responses API 一致。服务端保证它是一个合法的 JSON 对象，并在工具声明了 `strict: true` 时符合参数 schema。
+`arguments` 是 **JSON 字符串**，不是对象，这和 Responses API 一致。
+
+- 服务端保证它**总是语法合法的 JSON 对象**。
+- 工具声明了 `strict: true` 时，还保证它符合参数 schema（第 8.3 节）。
+- 没有声明 `strict: true` 时，服务端按参数 schema 尽量转换参数值的类型，转换不了的值保留为 JSON 字符串；缺少或多出的参数原样保留。是否符合 schema 由 harness 校验，不符合时按 codex 的做法把错误作为这次调用的 output 回给模型。
+- `name` 只保证符合第 8.2 节的命名规则，**不保证在本次请求的 `tools` 中**。收到未声明的工具名时，harness 同样把错误作为 output 回给模型。
+- 模型输出的工具调用连一个 item 都拼不出来时（见第 9.2 节 `tool_call_invalid`），服务端以 `response.failed` 结束，不会输出不合法的 `function_call`。
 
 **`function_call_output`**
 
@@ -274,6 +300,15 @@ wire 上的能力只有 boolean 两种取值。Aporisa SDK 对 harness 暴露的
 ```
 
 `input` 是自由文本，不是 JSON。这对应 codex 的 `apply_patch` 等工具。
+
+**`configuration_update`**（只用于输入，需要 `capabilities.reasoning_effort_updates`）
+
+```json
+{"type":"configuration_update","reasoning":{"effort":"high"}}
+```
+
+- 只出现在 `input` 中，不会出现在输出里，也没有 `id`。对象只有 `type` 和 `reasoning` 两个键，`reasoning` 只有 `effort` 一个键。
+- 语义和位置规则见第 6 节的结构约束和第 6.1 节。
 
 ### 7.2 Response 对象
 
@@ -411,6 +446,9 @@ v0 只支持 `format.type = "text"`，带语法约束的格式留待后续版本
 | `output_limit_exceeded` | 输出字节超出上限 |
 | `structured_output_invalid` | 结构化输出没有通过最终校验 |
 | `engine_failure` | 引擎故障 |
+| `tool_call_invalid` | 模型输出的工具调用结构损坏，无法组成 `function_call` item（例如调用没有闭合、没有函数名、函数名不符合第 8.2 节的命名规则）。在它之前已经完成的 item 保留在 `output` 中，写到一半的调用被丢弃。`message` 从固定的几条说明中选一条，指出是哪种损坏，不回显模型输出的内容。服务端不自动重试 |
+
+参数类型不符、缺少参数、工具名不在 `tools` 中，都**不属于** `tool_call_invalid`，照常输出 `function_call`，由 harness 处理（第 7.1 节）。
 
 达到 `max_output_tokens` 不算失败，以 `response.incomplete` 结束，`reason` 为 `max_output_tokens`。
 

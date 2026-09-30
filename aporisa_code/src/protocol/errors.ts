@@ -35,6 +35,7 @@ export const StreamErrorCode = z.enum([
   "output_limit_exceeded",
   "structured_output_invalid",
   "engine_failure",
+  "tool_call_invalid",
 ]);
 
 export const ErrorBody = z.strictObject({

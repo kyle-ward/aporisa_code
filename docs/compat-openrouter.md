@@ -2,7 +2,7 @@
 
 > **状态：F0 草案，尚未实现。** 本文只描述前端兼容 driver 如何把 [Aporisa 协议](protocol.md)（接口集合 C）映射到 OpenRouter 的 Responses API。标注「待实测」的条目只依据 OpenRouter 的公开文档，要在 F2 阶段用真实请求确认，确认后再修改本文。
 >
-> 修订日期：2026-09-29。
+> 修订日期：2026-09-30（新增 `configuration_update` 的模拟方式；新增不合法工具参数的处理）。
 
 ## 1. 原则
 
@@ -40,6 +40,7 @@
 | `tool_choice` | 映射 | 只使用 `auto` 和 `none` |
 | `parallel_tool_calls` | 映射 | 待实测，看各模型实际是否遵守 |
 | `reasoning.effort` | 映射 | OpenRouter 允许的取值是 `minimal`、`low`、`medium`、`high`。Aporisa 的 `none` 映射为不发送 `reasoning`（待实测） |
+| `configuration_update`（input item） | **模拟** | OpenRouter 没有对应的机制。driver 按 [protocol.md](protocol.md) 第 6.1 节算出生效强度，把它作为请求级的 `reasoning.effort` 发送，并从发往上游的 `input` 中移除全部 `configuration_update`；harness 保存的历史不变。这和 codex 对不支持换档的模型的做法相同。代价是上游的前缀缓存可能失效，对结果语义没有影响。能力上声明 `reasoning_effort_updates: emulated` |
 | `text.format` | 映射 | 待实测，看各模型实际支持情况 |
 | `prompt_cache_key` | 映射 | 按原样透传，是否生效取决于上游，待实测。`cached_tokens` 以返回的 usage 为准 |
 | `generate:false`（X2） | **不支持** | `capabilities.prewarm = false` |
@@ -58,6 +59,7 @@
 | `response.reasoning_text.delta` | 映射 | OpenRouter 文档中的事件名是 `response.reasoning.delta`，driver 负责改名（待实测实际的事件名） |
 | 其余 `response.*` 事件 | 映射 | 按 [protocol.md](protocol.md) 第 7.3 节的顺序规则做校验；上游违反规则时，按协议错误处理 |
 | 上游产生的未知 item 或事件 | 不支持 | 按协议错误处理，不能静默丢弃 |
+| 上游 `function_call` 的 `arguments` 不是合法的 JSON 对象 | 映射 | 以 `response.failed`（`tool_call_invalid`）结束，保证交给 harness 的 `arguments` 总是合法的 JSON 对象（[protocol.md](protocol.md) 第 7.1 节）。上游是否会出现这种情况待实测 |
 | `usage` | 映射 | 字段缺失时按协议错误处理，不能填 0 |
 
 ## 6. 错误映射
@@ -80,4 +82,5 @@
 | `prewarm` | false |
 | `websocket` | false |
 | `input_tokens` | emulated |
+| `reasoning_effort_updates` | emulated |
 | 明文推理内容 | 通常没有，只有 summary 和加密内容 |

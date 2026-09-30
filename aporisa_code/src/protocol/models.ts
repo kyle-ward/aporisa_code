@@ -22,6 +22,7 @@ export const WireCapabilities = z.strictObject({
   prewarm: z.boolean(),
   input_tokens: z.boolean(),
   websocket: z.boolean(),
+  reasoning_effort_updates: z.boolean(),
 });
 
 export const Model = z.strictObject({

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  effectiveReasoningEffort,
   incrementalInput,
+  InputItem,
+  requestViolation,
   parseStrictJson,
   schemaSubsetViolation,
   StreamValidator,
@@ -150,5 +153,41 @@ describe("continuation", () => {
     expect(incrementalInput(first, output, { ...first, input: base, max_output_tokens: 10 })).toBeNull();
     expect(incrementalInput(first, output, { ...first, input: [...request("other").input, ...output] })).toBeNull();
     expect(incrementalInput(first, output, { ...first, input: first.input })).toBeNull();
+  });
+});
+
+describe("reasoning effort updates (§6.1)", () => {
+  const model = mockModel();
+  const user = { type: "message" as const, role: "user" as const, content: [{ type: "input_text" as const, text: "hi" }] };
+  const update = (effort: "none" | "low" | "medium" | "high") => ({ type: "configuration_update" as const, reasoning: { effort } });
+  const call = { type: "function_call" as const, call_id: "call_1", name: "lookup", arguments: "{}" };
+  const output = { type: "function_call_output" as const, call_id: "call_1", output: "x" };
+  const params = (input: ResponseParams["input"], extra: Partial<ResponseParams> = {}): ResponseParams => ({ model: model.id, input, ...extra });
+
+  it("accepts updates after completed tool calls and rejects them between a call and its output", () => {
+    expect(requestViolation(params([user, call, output, update("high")]), model)).toBeNull();
+    expect(requestViolation(params([user, call, update("high"), output]), model)).toMatchObject({ code: "invalid_request", param: "input[2]" });
+  });
+
+  it("requires the capability and a supported effort", () => {
+    const undeclared = mockModel({ capabilities: { ...model.capabilities, reasoning_effort_updates: false } });
+    expect(requestViolation(params([user, update("high")]), undeclared)).toMatchObject({ code: "unsupported_parameter", param: "input[1]" });
+    const narrow = mockModel({ reasoning: { ...model.reasoning, supported_efforts: ["medium", "high"] } });
+    expect(requestViolation(params([user, update("low")]), narrow)).toMatchObject({
+      code: "unsupported_parameter",
+      param: "input[1].reasoning.effort",
+    });
+  });
+
+  it("is input-only and strict: no id, no extra keys", () => {
+    expect(InputItem.safeParse(update("low")).success).toBe(true);
+    expect(InputItem.safeParse({ ...update("low"), id: "cu_1" }).success).toBe(false);
+    expect(InputItem.safeParse({ type: "configuration_update", reasoning: { effort: "low", summary: "auto" } }).success).toBe(false);
+  });
+
+  it("resolves the effective effort: last update, then the baseline, then the model default", () => {
+    expect(effectiveReasoningEffort(params([user, update("low"), user, update("high")], { reasoning: { effort: "none" } }), model)).toBe("high");
+    expect(effectiveReasoningEffort(params([user], { reasoning: { effort: "none" } }), model)).toBe("none");
+    expect(effectiveReasoningEffort(params([user]), model)).toBe(model.reasoning.default_effort);
   });
 });

@@ -2,7 +2,7 @@
 // Shape validation is done by the zod schemas; this covers docs/protocol.md §5–§8 rules
 // that depend on the model or span several fields.
 import type { InputItem } from "./items.ts";
-import type { Model } from "./models.ts";
+import type { Model, ReasoningEffort } from "./models.ts";
 import type { ResponseParams } from "./request.ts";
 import type { HttpErrorCode } from "./errors.ts";
 import { schemaSubsetViolation } from "./tools.ts";
@@ -110,6 +110,18 @@ export function inputViolation(input: readonly InputItem[], model: Model): Reque
         }
         break;
       }
+      case "configuration_update": {
+        if (!model.capabilities.reasoning_effort_updates) {
+          return violation("unsupported_parameter", param, "Reasoning effort updates are not supported.");
+        }
+        if (!model.reasoning.supported_efforts.includes(item.reasoning.effort)) {
+          return violation("unsupported_parameter", `${param}.reasoning.effort`, "Reasoning effort is not supported.");
+        }
+        if (openCalls.size > 0) {
+          return violation("invalid_request", param, "A configuration update cannot precede pending tool outputs.");
+        }
+        break;
+      }
       case "reasoning":
         break;
     }
@@ -118,4 +130,19 @@ export function inputViolation(input: readonly InputItem[], model: Model): Reque
     return violation("invalid_request", "input", "Every tool call needs exactly one later output.");
   }
   return null;
+}
+
+/**
+ * Effort in force for the generation (§6.1): the last configuration_update in the (expanded)
+ * input, else the request baseline, else the model default.
+ */
+export function effectiveReasoningEffort(
+  params: Pick<ResponseParams, "input" | "reasoning">,
+  model: Model,
+): ReasoningEffort {
+  for (let index = params.input.length - 1; index >= 0; index -= 1) {
+    const item = params.input[index];
+    if (item?.type === "configuration_update") return item.reasoning.effort;
+  }
+  return params.reasoning?.effort ?? model.reasoning.default_effort;
 }

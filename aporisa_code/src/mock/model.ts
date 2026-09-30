@@ -24,6 +24,7 @@ export function mockModel(overrides: Partial<Model> = {}): Model {
       prewarm: true,
       input_tokens: true,
       websocket: true,
+      reasoning_effort_updates: true,
     },
     ...overrides,
   };
