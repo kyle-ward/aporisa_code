@@ -2,6 +2,13 @@
 
 本文只记录已经实际运行过的检查，以及明确尚未验证的事项。预期不写成结果，替身测试也不代替真实验收。
 
+## B1 收尾（2026-09-30，Mac Studio）
+
+- 删除 B0 的一次性脚本 `backend/scripts/b0_*.py`（历史见提交 `c89d1b2`）和 B0 产物迁移脚本 `scripts/migrate_b0_artifacts.py`（历史见提交 `dfd2495`，迁移已在真实数据上完成，B0 目录已删除），连同迁移脚本的测试。下面各节提到这些脚本的地方是当时的记录。
+- 新增 `docs/architecture.md`：职责、进程模型、网关与 worker 的内部接口、不变量、与参考实现的刻意差异。
+- agent 运行：后端测试（开发期运行，不是 CI 门禁）与 ruff 通过；前端 `check.sh frontend` 通过。待用户运行 `./scripts/check.sh backend`。
+- **B1 状态**：完成。尚未进行：集成节点 I1（Air 上的 native driver 经 Cloudflare Tunnel 连接 Studio 后端，重跑 F1 测试）；开机自启后的冷启动耗时；长时间 soak（B2-7）。
+
 ## B1 P4：可观测性与真实运行验证（2026-09-30，Mac Studio）
 
 范围：DEVELOPMENT_PLAN 第 10 节的日志字段、`/health/runtime` 合并 worker 状态、`scripts/validate_runtime.py`、日志隐私自检。
@@ -177,7 +184,7 @@
 
 ## B0-2 至 B0-7：checkpoint、转换、内存、速度、模板（2026-09-30，Mac Studio）
 
-脚本都在 `backend/scripts/`，都是 B0 的一次性脚本；测量结果写入 `.runtime/b0/results/*.jsonl`，不进入 Git。需要加载模型或转换权重的命令由用户运行；脚本逻辑先由 agent 在一个随机初始化的小 qwen4_exp 模型（`b0_tiny.py`）上验证过。
+脚本当时在 `backend/scripts/`，都是 B0 的一次性脚本（B1 收尾时删除，见提交 `c89d1b2`）；测量结果写入 `.runtime/b0/results/*.jsonl`，不进入 Git。需要加载模型或转换权重的命令由用户运行；脚本逻辑先由 agent 在一个随机初始化的小 qwen4_exp 模型（`b0_tiny.py`）上验证过。
 
 **B0-2 checkpoint**（执行者：用户下载，agent 校验）
 - `Qwen/Qwen3.8-Flash-Next-FP8`，revision `236dfdf285828023ca3bcd3f37366c58a3469b13`，144 个文件，185.6 GB。用户用 `hf download` 下载。

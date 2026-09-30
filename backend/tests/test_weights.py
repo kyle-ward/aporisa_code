@@ -1,13 +1,12 @@
-"""Weight maintenance: records, leases, inventories, download (fake Hub), convert, migration.
+"""Weight maintenance: records, leases, inventories, download (fake Hub), convert.
 
-No network: the Hub client is replaced by a local fake. convert and the B0 migration run on
-the tiny FP8 checkpoint through the real conversion pipeline.
+No network: the Hub client is replaced by a local fake. convert runs on the tiny FP8
+checkpoint through the real conversion pipeline.
 """
 
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import shutil
 import sys
@@ -17,7 +16,7 @@ from pathlib import Path
 import pytest
 from conftest import ALIAS, worker_init
 
-from aporisa_backend.lifecycle import assets, recipes, weights
+from aporisa_backend.lifecycle import assets, weights
 from aporisa_backend.lifecycle.assets import Layout
 
 REVISION = "a" * 40
@@ -245,62 +244,3 @@ def test_convert_produces_a_self_contained_identity(tmp_path, tiny_fp8_dir):
     # The served identity no longer needs its source: delete it, then load and warm up.
     weights.delete(layout, upstream["directory"])
     load_and_warm(served)
-
-
-def load_migration():
-    spec = importlib.util.spec_from_file_location(
-        "migrate_b0_artifacts", ROOT / "scripts" / "migrate_b0_artifacts.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_b0_migration_registers_without_reconverting(tmp_path, tiny_fp8_dir):
-    migration = load_migration()
-    layout = Layout(tmp_path)
-    full = layout.models / migration.B0_FULL
-    drafter = layout.models / migration.B0_MTP
-    assert recipes.quantize(tiny_fp8_dir, "affine4g64", full) == []
-    tools = recipes.tool_versions()
-    spec = recipes.RECIPES["affine4g64"]
-    (full / "recipe.json").write_text(
-        json.dumps(
-            {
-                "source": {"repository": "Tiny/FP8", "revision": REVISION},
-                "recipe": {
-                    "variant": "affine4g64",
-                    "q_mode": "affine",
-                    "q_bits": 4,
-                    "q_group_size": 64,
-                    "ple": spec["ple"],
-                    "router_gates": spec["router_gates"],
-                    "vision": "unquantized",
-                    "dtype": "bfloat16",
-                },
-                "tools": tools,
-                "converted_at": "2026-09-30T14:55:20+0800",
-            }
-        )
-    )
-    drafter.mkdir()
-    (drafter / "model.safetensors").write_bytes(b"\x01" * 64)
-    (drafter / "config.json").write_text("{}")
-    before = sorted(p.name for p in full.iterdir())
-
-    assert migration.migrate(layout, dry_run=True) == 0
-    assert assets.records(layout) == []
-    assert migration.migrate(layout, dry_run=False) == 0
-
-    served = assets.resolve_identity(layout, migration.IDENTITY)
-    mtp = assets.resolve_identity(layout, migration.MTP_IDENTITY)
-    assert served["version"] == recipes.recipe_digest("affine4g64", tools)[:16]
-    assert served["source"]["migrated_from"] == "b0" and mtp["source"]["output"] == "mtp"
-    for record in (served, mtp):
-        assets.verify_inventory(layout.weights(record), record["files"], full=True)
-    assert sorted(p.name for p in full.iterdir()) == before  # B0 directories untouched
-    assert (full / "model.safetensors").stat().st_nlink >= 2  # hard links, no copy
-    assert migration.migrate(layout, dry_run=False) == 0  # idempotent
-    weights.delete(layout, migration.B0_FULL)
-    weights.delete(layout, migration.B0_MTP)
-    load_and_warm(layout.weights(served))

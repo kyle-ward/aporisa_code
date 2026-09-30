@@ -1,6 +1,7 @@
 """Conversion recipes: official FP8 checkpoint -> served MLX artifact (14.6, decisions 1 and 4).
 
-Moved from the B0 script (backend/scripts/b0_convert.py). One recipe produces:
+Moved from the B0 conversion script (removed at B1 close; see commit c89d1b2). One recipe
+produces:
 
 - the served artifact: one self-contained directory with the external-PLE view (resident
   weights, index without PLE keys, config with `ple_storage`) plus the PLE shard files it

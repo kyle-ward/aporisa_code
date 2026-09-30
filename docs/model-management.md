@@ -70,16 +70,6 @@
 
 不需要重新下载已有权重，也不需要修改 `.env`。故障时服务不会自动切换到另一个模型。
 
-## 5. B0 产物的一次性迁移（B1）
+## 5. 历史：B0 产物的迁移
 
-B0 的转换脚本留下了 `Qwen3.8-Flash-Next--affine4g64`（完整 checkpoint）、它的 `-extple` 视图和 `-mtp`。`scripts/migrate_b0_artifacts.py` 用硬链接把它们登记为正式身份，不重新转换，也不占用额外磁盘：
-
-```bash
-backend/.venv/bin/python scripts/migrate_b0_artifacts.py --dry-run
-backend/.venv/bin/python scripts/migrate_b0_artifacts.py
-```
-
-- 先核对 B0 的 `recipe.json` 与包内配方、固定的工具版本一致，并核对张量布局。
-- 登记两个身份：`Qwen3.8-Flash-Next-affine4g64`（服务使用）和 `Qwen3.8-Flash-Next-affine4g64-mtp`（B2 的 MTP 草稿模型）。
-- B0 的目录保持原样；迁移完成后，用 `model_weights.sh delete` 删除它们即可（数据由新目录的硬链接保留）。
-- 这个脚本在 B1 收尾时删除。
+现有两个身份（`Qwen3.8-Flash-Next-affine4g64` 和 `-mtp`）是 B0 转换的产物。B1 P3 用一次性迁移脚本核对配方和工具版本后，以硬链接登记为正式身份，没有重新转换；之后删除了 B0 的旧目录和官方 FP8 checkpoint。迁移脚本已在 B1 收尾时删除，需要参考时见提交 `dfd2495` 中的 `scripts/migrate_b0_artifacts.py`。

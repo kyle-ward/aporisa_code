@@ -2,7 +2,7 @@
 
 本文记录后端使用的模型、上游来源、本地派生产物和许可证要点。模型配置指针（`MODEL_LIST` / `POINTERS` / `PROFILES`）和权重维护入口见 [model-management.md](model-management.md)；本地权重的唯一记录是 `.runtime/model-assets/` 下的身份记录。
 
-> **当前状态（2026-09-30）**：下面的派生产物由 B0 的一次性脚本生成。B1 P3 提供了迁移脚本 `scripts/migrate_b0_artifacts.py`，把服务使用的产物和 MTP 登记为正式身份（`Qwen3.8-Flash-Next-affine4g64`、`Qwen3.8-Flash-Next-affine4g64-mtp`）；以后的转换使用 `model_weights.sh convert`，配方相同。mxfp4 产物、B0 的旧目录和官方 FP8 checkpoint 都已于 2026-09-30 删除；需要重新转换时，按身份记录中的仓库和 revision 重新下载 FP8。
+> **当前状态（2026-09-30，B1 完成）**：本机登记了两个身份，都从上面的 FP8 checkpoint 转换而来，见下一节。官方 FP8 checkpoint、B0 的旧目录和 mxfp4 产物都已删除；需要重新转换时，按身份记录中的仓库和 revision 重新下载 FP8，再用 `model_weights.sh convert`。
 
 ## 模型
 
@@ -17,15 +17,16 @@
 
 对外只暴露公开模型别名，真实型号只在内部文档和配置中出现（AGENTS.md）。
 
-## 本地派生产物（B0）
+## 本地派生产物
 
-都由 `backend/scripts/b0_convert.py` 从上面的 FP8 checkpoint 转换得到，放在 `.runtime/models/` 下，不进入 Git。每个产物目录里都有 `recipe.json`，记录源 revision、转换配方和工具版本。
+配方 `affine4g64`（`backend/src/aporisa_backend/lifecycle/recipes.py`）：主体 affine 4-bit gs64；PLE affine 4-bit gs32，外置在 SSD 上按行读取；路由门控 affine 8-bit gs64；视觉编码器不量化。产物放在 `.runtime/models/<目录>/<配方摘要前 16 位>/`，不进入 Git；身份记录和每个目录里的 `recipe.json` 写明源仓库、revision、配方和工具版本。
 
-| 产物 | 配方 | 常驻权重 |
+| 身份 | 内容 | 常驻权重 |
 |---|---|---|
-| `Qwen3.8-Flash-Next--affine4g64` 及其 `-extple` 视图 | 主体 affine 4-bit gs64；PLE affine 4-bit gs32，外置在 SSD 上按行读取；路由门控 affine 8-bit gs64；视觉编码器不量化 | 66.8 GiB |
-| `Qwen3.8-Flash-Next--mxfp4` 及其 `-extple` 视图 | 主体 mxfp4；其余同上 | 63.1 GiB |
-| `Qwen3.8-Flash-Next--affine4g64-mtp` | 从同一 checkpoint 拆出的 MTP 草稿模型，affine 4-bit gs64 | 1.4 GiB |
+| `Qwen3.8-Flash-Next-affine4g64` | 服务使用的自包含目录：外置 PLE 视图加上它读取的 PLE 分片（PLE 29.8 GiB 留在 SSD 上） | 66.8 GiB |
+| `Qwen3.8-Flash-Next-affine4g64-mtp` | 同一次转换拆出的 MTP 草稿模型，B2-2 使用 | 1.4 GiB |
+
+这两个产物是 B0 用一次性转换脚本生成的，B1 P3 用迁移脚本以硬链接登记为正式身份，没有重新转换（两个脚本已在 B1 收尾时删除，分别见提交 `c89d1b2` 和 `dfd2495`）。B0 还评估过 mxfp4 格式（常驻 63.1 GiB），最终未采用，产物已删除。
 
 推理引擎：MLX 0.32.3；mlx-vlm 锁定为 git commit `00093678a1f6bd513212d94778ffc381d6d731bf`（v0.7.4）。两者均为 MIT 许可证。
 
@@ -34,7 +35,7 @@
 以下是阅读许可证原文后整理的要点，**不是法律意见**。原文随 checkpoint 一起下载（`LICENSE`），以原文为准。
 
 - **允许**：使用、修改、合并、发布、分发、再许可、出售、部署、托管、微调和制作衍生作品，量化转换也包括在内。
-- **署名**：所有副本和衍生作品都要附上版权声明和许可声明。`b0_convert.py` 会把 `LICENSE` 复制到每个转换产物里；这个修复之前生成的 5 个产物目录，已于 2026-09-30 手动补上。
+- **署名**：所有副本和衍生作品都要附上版权声明和许可声明。`model_weights.sh convert` 会把 `LICENSE` 复制到每个转换产物里；现有两个身份的目录里都有 `LICENSE`。
 - **第 1 条**：用于月活超过 1 亿或月收入超过 2000 万美元的商业产品时，要在界面上显著标明模型名称。本项目不涉及。
 - **第 2 条**：从事「Model as a Service」或「AI Work Assistant」业务并用于商业目的时，需要另外取得 Qwen 的授权。许可证中 AI Work Assistant 的定义是「主要用于 AI 辅助编程或办公的独立 AI 产品」，**Aporisa Code 正属于这一类**。
   - 许可证对**内部使用**有豁免，前提是不把软件、它的输出或底层模型能力提供给任何第三方。

@@ -10,11 +10,11 @@ Aporisa Code 是一个安装在本机、直接运行的 agent app，只支持 ma
 
 开发期间，前端可以通过兼容层接入 OpenRouter 进行测试，映射差异见 [OpenRouter 兼容映射](docs/compat-openrouter.md)。
 
-**当前状态：前端已完成 F1，后端已完成 B0、正在实现 B1。**
+**当前状态：前端已完成 F1，后端已完成 B0 和 B1。**
 
 - 协议合同 v0 已定稿（含 `configuration_update` 修订）。
 - 前端：SDK（native driver，WebSocket 默认、HTTP 兜底）、mock server、stub driver 和 wire 层一致性测试都已实现，并通过了确定性检查。harness、UI 和 OpenRouter 兼容层尚未开始。
-- 后端：B0 已完成，模型、量化格式和各项实测见 [开发计划](backend/DEVELOPMENT_PLAN.md) 与 [验证记录](docs/validation.md)。B1 中，网关加真实 worker 已在真实模型上通过 W01–W24（P2）；生命周期脚本 `backend_service.sh` 和权重维护入口 `model_weights.sh`（P3）已实现，系统服务的 install / start / stop / uninstall 和对服务的一致性测试已通过用户验收。
+- 后端：B1 已完成：作为 macOS 系统服务运行，对服务运行一致性测试 W01–W24 全部通过，真实生成验证（含 132K 上下文）通过。架构见 [架构](docs/architecture.md)，实测见 [验证记录](docs/validation.md)。集成节点 I1（前端从 Air 连接 Studio 上的后端）尚未进行。
 
 ```bash
 ./frontend.sh prepare         # 安装项目内的 Node 和锁定的依赖（唯一联网的模式）
