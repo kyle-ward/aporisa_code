@@ -133,6 +133,11 @@ def request_violation(params: dict, model: dict) -> None:
             raise _fail(
                 "unsupported_parameter", f"tools[{index}]", "Custom tools are not supported."
             )
+        strict = tool["type"] == "function" and tool.get("strict") is True
+        if strict and not caps["structured_output"]:
+            raise _fail(
+                "unsupported_parameter", f"tools[{index}].strict", "Strict tools are not supported."
+            )
         if tool["type"] == "function" and (reason := schema_subset_violation(tool["parameters"])):
             raise _fail(
                 "unsupported_schema", f"tools[{index}].parameters", f"Unsupported schema: {reason}."

@@ -156,6 +156,25 @@ describe("continuation", () => {
   });
 });
 
+describe("strict function tools (§8.3)", () => {
+  const user = { type: "message" as const, role: "user" as const, content: [{ type: "input_text" as const, text: "hi" }] };
+  const tool = (strict?: boolean) => ({
+    type: "function" as const,
+    name: "lookup",
+    parameters: { type: "object" as const, properties: {} },
+    ...(strict === undefined ? {} : { strict }),
+  });
+
+  it("needs structured_output for strict: true only", () => {
+    const plain = mockModel({ capabilities: { ...mockModel().capabilities, structured_output: false } });
+    const params = (strict?: boolean): ResponseParams => ({ model: plain.id, input: [user], tools: [tool(strict)] });
+    expect(requestViolation(params(true), plain)).toMatchObject({ code: "unsupported_parameter", param: "tools[0].strict" });
+    expect(requestViolation(params(false), plain)).toBeNull();
+    expect(requestViolation(params(), plain)).toBeNull();
+    expect(requestViolation(params(true), mockModel())).toBeNull();
+  });
+});
+
 describe("reasoning effort updates (§6.1)", () => {
   const model = mockModel();
   const user = { type: "message" as const, role: "user" as const, content: [{ type: "input_text" as const, text: "hi" }] };

@@ -104,6 +104,18 @@ def test_capability_checks():
     assert limit.value.code == "invalid_request"
 
 
+def test_strict_tools_need_structured_output():
+    def tool(**extra):
+        return {"type": "function", "name": "f", "parameters": {"type": "object"}, **extra}
+
+    with pytest.raises(ProtocolError) as strict:
+        request_violation({**request(), "tools": [tool(strict=True)]}, MODEL)
+    assert (strict.value.code, strict.value.param) == ("unsupported_parameter", "tools[0].strict")
+    request_violation({**request(), "tools": [tool(strict=False), tool(name="g")]}, MODEL)
+    capable = model_with(structured_output=True)
+    request_violation({**request(), "tools": [tool(strict=True)]}, capable)
+
+
 def test_effective_effort_order():
     update = lambda effort: {"type": "configuration_update", "reasoning": {"effort": effort}}  # noqa: E731
     params = {

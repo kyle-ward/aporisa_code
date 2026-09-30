@@ -14,7 +14,7 @@ Aporisa Code 是一个安装在本机、直接运行的 agent app，只支持 ma
 
 - 协议合同 v0 已定稿（含 `configuration_update` 修订）。
 - 前端：SDK（native driver，WebSocket 默认、HTTP 兜底）、mock server、stub driver 和 wire 层一致性测试都已实现，并通过了确定性检查。harness、UI 和 OpenRouter 兼容层尚未开始。
-- 后端：B0 已完成，模型、量化格式和各项实测见 [开发计划](backend/DEVELOPMENT_PLAN.md) 与 [验证记录](docs/validation.md)。B1 中，网关已经能配合假 worker 通过 W01–W24；真实 worker 和生命周期脚本尚未完成，还不能作为服务运行。
+- 后端：B0 已完成，模型、量化格式和各项实测见 [开发计划](backend/DEVELOPMENT_PLAN.md) 与 [验证记录](docs/validation.md)。B1 中，网关已经能配合假 worker 通过 W01–W24；真实 worker（P2）已实现并通过小模型测试，真实模型上的验收和生命周期脚本（P3）尚未完成，还不能作为服务运行。
 
 ```bash
 ./frontend.sh prepare         # 安装项目内的 Node 和锁定的依赖（唯一联网的模式）

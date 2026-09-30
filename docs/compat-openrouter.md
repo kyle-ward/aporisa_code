@@ -2,7 +2,7 @@
 
 > **状态：F0 草案，尚未实现。** 本文只描述前端兼容 driver 如何把 [Aporisa 协议](protocol.md)（接口集合 C）映射到 OpenRouter 的 Responses API。标注「待实测」的条目只依据 OpenRouter 的公开文档，要在 F2 阶段用真实请求确认，确认后再修改本文。
 >
-> 修订日期：2026-09-30（新增 `configuration_update` 的模拟方式；新增不合法工具参数的处理）。
+> 修订日期：2026-09-30（新增 `configuration_update` 的模拟方式；新增不合法工具参数的处理；`strict: true` 跟随 `structured_output`）。
 
 ## 1. 原则
 
@@ -35,7 +35,7 @@
 | Aporisa 字段 | 处理 | 说明 |
 |---|---|---|
 | `model`、`input`、`instructions`、`max_output_tokens` | 映射 | 原样传递 |
-| `tools`（function） | 映射 | 形状一致 |
+| `tools`（function） | 映射 | 形状一致。`strict: true` 按协议第 8.3 节跟随 `structured_output` 的能力声明：该能力实测为 supported 之前，driver 拒绝 `strict: true` |
 | `tools`（custom） | **模拟** | OpenRouter 文档里没有提到 custom 工具。driver 把它改写成只有一个 string 参数 `input` 的 function 工具，并把返回结果还原成 `custom_tool_call`。codex 也有同样的先例：`apply_patch` 同时有 function 和 freeform 两种形态。能力上声明 `custom_tools: emulated` |
 | `tool_choice` | 映射 | 只使用 `auto` 和 `none` |
 | `parallel_tool_calls` | 映射 | 待实测，看各模型实际是否遵守 |

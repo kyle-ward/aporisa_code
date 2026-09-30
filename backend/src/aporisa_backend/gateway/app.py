@@ -20,6 +20,7 @@ from ..configs.limits import LIMITS, ServiceLimits
 from ..protocol import schema, strict_json
 from ..protocol.errors import RETRY_AFTER_CODES, ProtocolError
 from .runtime import KEEPALIVE, Runtime
+from .websocket import install_log_filter, serve_websocket
 
 PUBLIC_HEALTH = {"/health/live", "/health/ready"}
 
@@ -74,8 +75,6 @@ class Gateway:
         elif scope["type"] == "http":
             await self._http(scope, receive, send)
         elif scope["type"] == "websocket":
-            from .websocket import serve_websocket
-
             await serve_websocket(self, scope, receive, send)
 
     async def _lifespan(self, receive, send) -> None:
@@ -247,4 +246,5 @@ class Gateway:
 
 
 def create_app(runtime: Runtime, api_key: str, limits: ServiceLimits = LIMITS) -> Gateway:
+    install_log_filter()
     return Gateway(runtime, api_key, limits)

@@ -2,7 +2,7 @@
 
 > **状态：v0 已定稿。** 前端的 SDK（native driver）和 mock server 已按本文实现，并通过了 wire 层一致性测试（见 [validation.md](validation.md)）。后端尚未实现。本文是 harness（Aporisa SDK）和推理后端之间的唯一合同。任何代码、schema 或 mock 与本文不一致时，以本文为准，并按第 13 节的流程同步。
 >
-> 修订日期：2026-09-30（v0 修订：2026-09-29 新增 `configuration_update` 输入 item 和 `reasoning_effort_updates` 能力，见第 6.1 节；2026-09-30 明确 `function_call` 的保证范围，新增流中错误码 `tool_call_invalid`，见第 7.1、9.2 节）。协议路径版本：`/v1`。
+> 修订日期：2026-09-30（v0 修订：2026-09-29 新增 `configuration_update` 输入 item 和 `reasoning_effort_updates` 能力，见第 6.1 节；2026-09-30 明确 `function_call` 的保证范围，新增流中错误码 `tool_call_invalid`，见第 7.1、9.2 节；同日明确 function 工具的 `strict: true` 需要 `structured_output` 能力，见第 5、8.3 节）。协议路径版本：`/v1`。
 
 ## 1. 范围与原则
 
@@ -180,7 +180,7 @@
 |---|---|
 | `parallel_tool_calls` | 一次响应里能否包含多个工具调用 |
 | `custom_tools` | 是否支持自由文本输入的 `custom` 工具（第 8 节） |
-| `structured_output` | 是否支持 `text.format` 的 json_schema 格式 |
+| `structured_output` | 是否支持约束生成：`text.format` 的 json_schema 格式，以及 function 工具的 `strict: true`（第 8.3 节） |
 | `prompt_cache` | 扩展 X1：是否按 `prompt_cache_key` 复用前缀，并回报 `cached_tokens` |
 | `prewarm` | 扩展 X2：是否支持 `generate: false` 预热 |
 | `input_tokens` | 扩展 X3：是否提供 token 计数端点 |
@@ -400,6 +400,7 @@ v0 只支持 `format.type = "text"`，带语法约束的格式留待后续版本
 - 允许的关键字：`properties`、`required`、`items`、`enum`、`description`、`additionalProperties`，以及非根位置的 `anyOf`。
 - 超出子集的关键字，返回 400 `unsupported_schema`。
 - `strict: true` 时，服务端在生成阶段就对参数做约束，并在完成后再校验一次。校验失败时，以 `response.failed` 结束，错误码为 `structured_output_invalid`。
+- `strict: true` 和 `text.format` 依赖同一种约束生成能力，需要 `capabilities.structured_output`。模型没有声明时，带 `strict: true` 的工具返回 400 `unsupported_parameter`（`param` 为 `tools[i].strict`）；`strict: false` 或省略总是允许。
 
 ## 9. 错误
 

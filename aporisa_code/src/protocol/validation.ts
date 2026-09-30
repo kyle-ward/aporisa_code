@@ -51,6 +51,9 @@ export function requestViolation(params: ResponseParams, model: Model): RequestV
       return violation("unsupported_parameter", `tools[${index}]`, "Custom tools are not supported.");
     }
     if (tool.type === "function") {
+      if (tool.strict === true && !caps.structured_output) {
+        return violation("unsupported_parameter", `tools[${index}].strict`, "Strict tools are not supported.");
+      }
       const reason = schemaSubsetViolation(tool.parameters);
       if (reason) return violation("unsupported_schema", `tools[${index}].parameters`, `Unsupported schema: ${reason}.`);
     }

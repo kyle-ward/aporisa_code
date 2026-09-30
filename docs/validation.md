@@ -2,6 +2,37 @@
 
 本文只记录已经实际运行过的检查，以及明确尚未验证的事项。预期不写成结果，替身测试也不代替真实验收。
 
+## B1 P2：真实 worker（2026-09-30，Mac Studio）
+
+范围：`ipc/`（socketpair 加 JSON 帧）、`gateway/process_worker.py`（启动、环境变量白名单、取消确认、进程组停止）、`engine/`（加载与预热、Qwen 适配层的渲染与增量解析、token 映射、会话与快照、预填充与解码、PLE 页预取）、`dev_serve.py`，以及合同修订「`strict: true` 需要 `structured_output`」。
+
+**agent 已验证（开发期运行单个测试文件，不是 CI 门禁）**
+- 后端全部 76 个测试通过，ruff 通过。新增的测试：
+  - 适配层 28 个：12 种请求（有无工具和 instructions、四个档位、多轮工具调用、并行调用、空推理、非字符串参数、Unicode、首尾空白）的渲染结果与官方模板 `apply_chat_template` 的**文本和 token 都完全一致**；自带 tokenizer 与 AutoTokenizer 一致；中途 developer 和 `configuration_update` 段恰好插在 item 边界上；token 映射让重新渲染复现生成时的 id；解析器的推理、回答、`phase`、空推理、`none` 档、按 schema 转换参数、并行与非并行停止、零参数调用、调用之后的文字，以及 5 种结构损坏的 `detail`；解析出的 item 重新渲染后等于模型生成的文本。
+  - 引擎 8 个（随机初始化的小 qwen4_exp 模型，与真实模型同样的转换流程：affine 4-bit gs64、外置 PLE、8-bit 路由门控）：PLE 行号的 numpy 实现与模型实际请求的行号一致（含 `<|endoftext|>` 处的窗口重置和跨块的窗口）；快照恢复后的 logits 与原始预填充和冷启动都**逐位相等**；生成后追加历史走活跃游标，`cached_tokens` 等于 prompt 加生成 token 数减 1；预热后同样的请求完全复用；工具调用与非并行停止；损坏调用以 `tool_call_invalid` 结束；输出上限、中断、硬取消、上下文超长；预算不足时淘汰空闲会话。
+  - 端到端 3 个（网关 + worker 子进程 + 小模型）：流顺序合法，计数与 usage 一致，同一 `prompt_cache_key` 复用前缀；客户端断开后取消送达引擎、名额释放、worker 仍然存活；SIGKILL worker 进程组后进行中的流以 `engine_failure` 结束，服务自动重启并恢复可用。
+  - 协议 1 个：`strict: true` 在未声明 `structured_output` 时返回 400 `unsupported_parameter`。
+- 前端 `./scripts/check.sh frontend` 通过，共 92 个用例（新增 1 个 `strict` 用例）；一致性测试 W19、W24 的前置请求输出预算改为 2048（真实模型要先推理），对假 worker 仍然全部通过。
+- `dev_serve` 在小模型上冒烟：就绪、完成一次流式请求、停止后没有残留的 worker 进程。
+
+**用户已验证**
+- `./scripts/check.sh backend` 通过（含上面新增的全部测试）。
+
+**真实模型验收（用户运行）**
+- 用 `dev_serve` 在 `Qwen3.8-Flash-Next--affine4g64-extple` 上启动：加载和预热成功，服务就绪。
+- 用前端一致性测试 CLI 对它运行 W01–W24：**24 项全部通过**（按 B1 的阶段划分，P2 的完成标志达到）。
+- 服务端日志（只有计数和缓存路径）显示：
+  - 冷启动的短请求 1.1–2.5 秒完成；W19、W24 的 WebSocket 续接走活跃游标，分别复用 71 个 token 中的 55 个、113 个中的 55 个；W16 的同 `prompt_cache_key` 复用走快照路径。
+  - W21 中断后以 `incomplete` 结束。
+- 发现并已修复的三个问题（修复后后端 77 个测试通过）：
+  - W17 拒绝未认证的 WebSocket 升级时，客户端收到的 401 是正确的，但 uvicorn 0.54.0 的 websockets-sansio 实现不把拒绝响应算作完成握手，多打印一条 `ERROR: ASGI callable returned without completing handshake.`。现在只对网关主动拒绝的连接过滤这一条日志（agent 复验：401 照常返回，日志不再出现）。
+  - 上下文超长被拒绝的请求被记录成「Response cancelled.」，现在记为「Request rejected before streaming.」；已开始但被客户端取消的记为 cancelled。
+  - W16 中同一请求第二次发送时只复用了 16 个 token 中的 11 个：prompt 末尾的快照没有保存 logits，必须回退到上一个边界。现在快照同时保存所在位置的 logits，重试或重新生成同一请求可以复用整个 prompt（新增测试）。
+- 修复后用户再次运行 `./scripts/check.sh backend`，通过。
+- 同时把 worker 的计量（首 token 时间、预填充和解码速度、峰值内存）写进每个 response 的日志行，worker 就绪日志也带上加载加预热的耗时。这些字段还没有在真实模型上看过，下次运行时一并确认。
+
+**尚未验证**：真实 agent 任务中的长上下文性能（续接收益、快照命中、PLE 预取的实际效果）；长时间运行的稳定性；生命周期脚本（P3）。
+
 ## B1 P1：网关与假 worker（2026-09-30，Mac Studio）
 
 范围：`backend/src/aporisa_backend/` 下的 `protocol/`（严格 JSON、按已提交的 schema 校验、语义规则）、`configs/`、`gateway/`（准入、事件组装、HTTP/SSE、WebSocket、计时与上限、worker 故障恢复）和 `fake/`（在进程内模拟 worker）。真实 worker 尚未实现，所以这一节**不代表后端能在真实模型上运行**。

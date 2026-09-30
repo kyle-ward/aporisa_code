@@ -54,6 +54,8 @@ export function userMessage(text: string): InputItem {
   return { type: "message", role: "user", content: [{ type: "input_text", text }] };
 }
 
+const CONTINUATION_SETUP_TOKENS = 2048;
+
 function baseRequest(context: WireContext, text = "Reply with one short sentence.") {
   return { model: context.target.model, input: [userMessage(text)], max_output_tokens: 256 };
 }
@@ -363,7 +365,8 @@ export const wireCases: WireCase[] = [
     async run(context) {
       const session = await openWs(context.target);
       try {
-        const first = baseRequest(context);
+        // A real model reasons before answering; give the setup response room to complete.
+        const first = { ...baseRequest(context), max_output_tokens: CONTINUATION_SETUP_TOKENS };
         session.send({ type: "response.create", ...first });
         const previous = await readWsResponse(session);
         assert.equal(previous.status, "completed", "continuation needs a completed response");
@@ -497,7 +500,8 @@ export const wireCases: WireCase[] = [
     async run(context) {
       const session = await openWs(context.target);
       try {
-        const first = baseRequest(context);
+        // A real model reasons before answering; give the setup response room to complete.
+        const first = { ...baseRequest(context), max_output_tokens: CONTINUATION_SETUP_TOKENS };
         session.send({ type: "response.create", ...first });
         const previous = await readWsResponse(session);
         assert.equal(previous.status, "completed", "continuation needs a completed response");

@@ -562,6 +562,7 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 | `interrupt` / `cancel` | `id` | 优雅中断 / 硬取消 |
 | `release_session` | `session` | WebSocket 连接关闭，丢弃它的 `conn:` 会话 |
 | `status` / `shutdown` | — | 运维状态 / 停机 |
+| `init` | `model_dir`、`model`（公开模型对象）、`adapter`、`kv_bytes_per_token`、`engine`（`configs/engine.py`） | 子进程启动后的第一帧；路径不放进命令行 |
 
 - **worker → 网关**（同一个 `id` 的消息严格有序）：
 
@@ -574,6 +575,7 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 | `item_done` | `item`（不含 id） | 权威的完整 item |
 | `finished` | `status`（completed / incomplete）、`reason`、`usage`、`metrics` | 终止 |
 | `failed` | `code` | 流开始之后的失败 |
+| `cancelled` | — | 该 job 已不再运行，并且它的其他消息都已发出；网关收到后才释放准入名额。30 秒内没有确认，网关结束 worker 进程组，交给恢复流程 |
 | `counted` / `status` / `ready` | … | 其他 op 的应答 |
 
 - item 的 id（`msg_`、`rs_`、`fc_`）、`call_id` 和 `sequence_number` 全部由网关生成；worker 不关心这些 id。
@@ -614,7 +616,8 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 - **增量解析器**：输入是生成的 token id 流，状态依次为推理区间、回答、工具调用；输出 `item_added`、`delta`、`item_done`。工具参数按工具的参数 schema 严格转换成 JSON 对象；message 结束时根据后面紧跟的是 `<tool_call>` 还是结束标记，判定 `phase`。
 - 工具调用的处理（合同已按第 13 节修订，协议第 7.1、9.2 节，用户同意）：
   - 能组成 `function_call` 的就照常输出：参数值转换不了类型就保留为字符串；缺少或多出参数、工具名不在 `tools` 中，都原样交给 harness，按 codex 的做法把错误回给模型。
-  - 只有结构损坏、拼不出 item 时（没有闭合、没有函数名、函数名不符合命名规则），才以 `response.failed`（`tool_call_invalid`）结束。worker 在 `failed` 消息里带上 `detail`（unclosed / no_function / bad_name），网关据此选一条固定说明，不回显模型输出。
+  - 只有结构损坏、拼不出 item 时（没有闭合、没有函数名、函数名不符合命名规则），才以 `response.failed`（`tool_call_invalid`）结束。worker 在 `failed` 消息里带上 `detail`（unclosed / no_function / bad_name；同一个参数出现两次时为 malformed，因为拼不出没有重复键的 JSON 对象），网关据此选一条固定说明，不回显模型输出。
+  - 参数值去掉首尾各一个换行，其余原样保留（代码编辑类参数依赖精确的空白）；arguments 的格式与 `json.dumps` 默认输出一致，逐个参数流式发出。
 
 **会话与快照**（`sessions.py`，取代第 6.2–6.4 节中「按哈希链匹配」的草案，改为按 token 前缀匹配）：
 
@@ -625,15 +628,21 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
   3. 否则新建 cache，从头预填充，这是冷启动路径。
 
   比较 26 万个整数的开销可以忽略，内存层不需要哈希链；哈希链留给 B2 的 SSD 层作为键。
-- **快照点**：本次新预填充区域内的每个 item 边界，以及 prompt 末尾（开始生成之前）。每个会话保留最近 K=16 个。
+- **快照点**：本次新预填充区域内**最后 K−1 个** item 边界，以及 prompt 末尾（开始生成之前）。每个会话保留最近 K=16 个。（实现时收窄：长历史冷启动有几百个边界，每个边界都切块会把 2048 的块切碎；复用几乎都发生在历史尾部。）
+- 会话同时保存 T 末尾的 logits。R 与 T 完全相同时（预热后发送同一请求）直接从这组 logits 开始解码。快照也保存所在位置的 logits（约 0.5 MB），所以快照正好落在 R 末尾时也能直接解码：同一请求重试或重新生成时，整个 prompt 都能复用（真实模型一致性测试中 W16 暴露了这一点）。
 - **生成之后**：T 等于 prompt 加上已经喂进模型的生成 token（最后采样出的那个 token 还没有喂入）。下一次请求的渲染会把它连同 `<|im_end|>\n` 一起作为增量追加。
 - **内存预算**：预算 = wired 上限 − 常驻权重 − 激活预留（4 GiB）− 安全余量（2 GiB），affine 格式约 12 GiB。开始生成前按 `(len(R) + max_output_tokens) × 29 KB + 快照` 估算需求，不够时按 LRU 淘汰空闲会话（整个丢弃；B2 改为溢出到 SSD）。单个请求本身超出预算时，只保留 prompt 末尾的一个快照。
-- **token 映射**（第 6.5 节）：键是 assistant 回合的 item（去掉 id 后的规范 JSON）的 sha256，值是生成时的 token id（包括结束 token）。LRU 上限 1024 个回合或 64 MiB。被中断或失败的回合不记录。
+- **token 映射**（第 6.5 节）：键是 assistant 回合**按模板渲染出的文本**的 sha256，值是生成提示符加上生成的 token id，一直到 `<|im_end|>`（在 `</tool_call>` 处停止时补上 `<|im_end|>`）。按文本做键，item 带什么 id、`phase` 都不影响命中；值包含生成提示符，所以 `none` 档（提示符里已有空 think 块）也能逐 token 复现。LRU 上限 1024 个回合或 800 万个 id。被中断、失败或达到输出上限的回合不记录。
 
 **生成**（`generate.py`，第 7 节）：
 
 - 按 2048 分块预填充，并在快照点处切开；每块之间检查取消。
-- 解码时按生效强度选择采样参数，支持 `presence_penalty`；`tool_choice:none` 时把 248058 的 logit 置为负无穷；`parallel_tool_calls=false` 时在 248059 处停止。
+- 解码时按生效强度选择采样参数。`presence_penalty` 按 OpenAI 的语义作用于本次已生成的全部 token（mlx-vlm 自带的实现只看最近 20 个，不采用）；词表补齐出来的行（id ≥ tokenizer 词表大小）一律屏蔽；`tool_choice:none` 时把 248058 的 logit 置为负无穷；`parallel_tool_calls=false` 时在 248059 处停止。
+- 解码循环不做流水线：PLE 查表需要在 CPU 上拿到 token 值，提前排下一步的计算收益有限。B2 引入 MTP 时再重构。
+- `output_tokens` 计入停止 token；`reasoning_tokens` 是推理区间内的 token 数（含 `</think>`），生效强度为 `none` 时为 0。
+- 预填充中收到中断：立即以 `incomplete`（`interrupted`）结束，不产生 item；已预填充的部分留在会话里供下次复用。
+- 计数（`count_tokens`）在控制线程完成，用独立的 tokenizer 实例，token 映射加锁共享，所以计数结果与生成时的 `input_tokens` 一致，也不会排在生成后面。
+- 生成中出现意外异常：该 job 以 `failed`（`engine_failure`）结束，丢弃全部会话（它们只是加速），worker 继续服务。
 - usage 使用真实计数；`reasoning_tokens` 是推理区间内的 token 数。
 
 **PLE 预取**（`ple_prefetch.py`，B1-10）：
@@ -672,7 +681,7 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 | 阶段 | 内容 | 完成标志 |
 |---|---|---|
 | P1 | `protocol/`、`configs/`、日志、网关、假 worker | 网关加假 worker 通过 W01–W24 |
-| P2 | `ipc/`、worker 主循环、适配层、会话、生成、PLE 预取 | 小模型测试通过；用户在真实模型上完成预热，并跑通一致性测试 |
+| P2 | `ipc/`、worker 主循环、适配层、会话、生成、PLE 预取 | 小模型测试通过；用户在真实模型上完成预热，一致性测试 W01–W24 全部通过（2026-09-30 完成） |
 | P3 | 生命周期脚本、权重维护、检查、LaunchDaemon | 用户手动完成 install/start/stop/uninstall 的验收 |
 | P4 | 可观测性字段、`/health/runtime`、`validate_runtime.py` | 第 10 节的字段出现在 JSONL 中 |
 
@@ -689,7 +698,6 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 - [x] 中途指令段的格式：中途 system 段（B0-12）
 - [ ] 各档位指令文字的效果：在更难的任务上评估（F6 或 B2）
 - [x] `developer` 角色的渲染方式：在原位置渲染为 system 段（B0-12）
-- [ ] 模型产生无法解析的工具调用时，用哪个错误码结束（协议第 9.2 节现有的错误码中没有完全对应的）
 - [x] eos 两个 id 分别对应什么；`<tool_call>` 和 `<think>` 是否为单个 token（第 5.4 节）
 - [x] 私有 IPC 的最终格式：socketpair 加长度前缀的 JSON 帧（第 14.3 节）
 - [x] 工具调用无法解析时的错误码：新增 `tool_call_invalid`，同时明确 `function_call` 的保证范围（合同已修订）
@@ -712,3 +720,5 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 - **2026-09-30**：新增第 14 节「B1 详细设计」（原第 14、15 节顺延为第 15、16 节）：定下代码结构、IPC（socketpair 加 JSON 帧）、网关持有续接语义、按 token 前缀匹配会话、动态内存预算、PLE 页预取和测试方案。
 - **2026-09-30**：B0 全部完成（B0-8 到 B0-12 的结果见 validation.md）：格式定为 affine 4-bit gs64；D-12 的备选暂不需要；打开 `parallel_tool_calls`；developer 和换档指令都渲染为中途 system 段；B2-2 默认起草深度 3。
 - **2026-09-30**：合同修订：明确 `function_call` 的保证范围，新增 `tool_call_invalid`；已同步到协议文档、TS 类型和 schema、mock 测试、兼容文档，以及后端网关和假 worker。B1 的 P1（协议校验、网关、假 worker）完成。
+- **2026-09-30**：B1 的 P2 完成代码和小模型测试：真实 worker、IPC、Qwen 适配层、会话与快照、PLE 预取、`dev_serve`。第 14.3–14.5 节按实现补充：`init` 帧和 `cancelled` 确认、快照点收窄到最后 K−1 个边界、token 映射改为按渲染文本做键、采样与计数细节。合同修订：function 工具的 `strict: true` 需要 `structured_output` 能力（协议第 5、8.3 节，前端校验与测试、兼容文档、后端校验同步修改）；一致性测试 W19、W24 的前置请求输出预算改为 2048。
+- **2026-09-30**：P2 在真实模型上验收：W01–W24 全部通过。修复验收中发现的三处问题：uvicorn 拒绝握手时的误报日志、被拒绝请求的日志名称、prompt 末尾的快照不保存 logits（第 14.5 节已补充）。worker 计量写入 response 日志。

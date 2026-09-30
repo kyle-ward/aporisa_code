@@ -146,4 +146,33 @@ async def eventually(predicate, within_s: float = 5.0) -> bool:
     return predicate()
 
 
+@pytest.fixture(scope="session")
+def tiny_model_dir(tmp_path_factory):
+    """A tiny random qwen4_exp checkpoint in the served layout (tests/tiny_model.py)."""
+    from assets import MODEL_DIR
+
+    if not (MODEL_DIR / "tokenizer.json").is_file():
+        pytest.skip(f"local model files not found under {MODEL_DIR}")
+    import tiny_model
+
+    return tiny_model.build(MODEL_DIR, tmp_path_factory.mktemp("tiny"))
+
+
+def worker_init(model_dir, **overrides) -> dict:
+    """The init frame the gateway sends a worker, for in-process engine tests."""
+    from aporisa_backend.configs.engine import ENGINE
+    from aporisa_backend.configs.models import public_model
+
+    return {
+        "op": "init",
+        "model_dir": str(model_dir),
+        "model": public_model(ALIAS, PROFILE),
+        "adapter": PROFILE.adapter,
+        "kv_bytes_per_token": PROFILE.kv_bytes_per_token,
+        "snapshot_budget_bytes": 2 * 1024**3,
+        "engine": ENGINE.as_dict(),
+        **overrides,
+    }
+
+
 __all__ = ["echo_script"]

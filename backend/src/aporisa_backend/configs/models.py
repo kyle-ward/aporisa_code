@@ -26,6 +26,8 @@ class ModelProfile:
     default_effort: str
     capabilities: dict[str, bool]
     wired_limit_mb: int
+    # KV bytes per context token, for the snapshot budget (B0-8 measured 28,560 on affine4g64).
+    kv_bytes_per_token: int = 28_560
     effective_context_window_percent: int = 95
     auto_compact_token_limit: int | None = None
     truncation_policy: dict = field(default_factory=lambda: {"mode": "bytes", "limit": 10_000})

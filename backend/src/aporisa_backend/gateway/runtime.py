@@ -67,9 +67,10 @@ class Runtime:
 
     async def _start_worker(self) -> None:
         event("worker_starting")
+        started = time.monotonic()
         self.worker = self.worker_factory()
         await asyncio.wait_for(self.worker.start(), self.limits.worker_start_timeout_s)
-        event("worker_ready")
+        event("worker_ready", duration_ms=round((time.monotonic() - started) * 1000))
         self.state = "ready"
         self.admission.accepting = True
         self.last_error_code = None
@@ -176,6 +177,7 @@ class ResponseRun:
         self.closed = False
         self.cancelled = asyncio.Event()
         self.accepted: dict = {}
+        self.result: dict = {}
         self.status = "rejected"
         self.started = time.monotonic()
 
@@ -205,6 +207,7 @@ class ResponseRun:
             await self.close()
             raise ProtocolError("internal_error", "The request could not be served.")
         self.accepted = first
+        self.status = "cancelled"  # until a terminal event says otherwise
 
     def interrupt(self) -> None:
         if self.runtime.worker is not None and not self.closed:
@@ -278,7 +281,7 @@ class ResponseRun:
                         for item in assembler.item_done(message["item"]):
                             yield item
                     elif kind == "finished":
-                        self.status = message["status"]
+                        self.status, self.result = message["status"], message
                         yield assembler.terminal(
                             message["status"], usage=message["usage"], reason=message.get("reason")
                         )
@@ -334,10 +337,12 @@ class ResponseRun:
             self.runtime.admission.release()
         self.runtime.runs.discard(self)
         self.runtime.counts[self.status] += 1
+        name = {"rejected": "response_rejected", "cancelled": "response_cancelled"}
+        usage = self.result.get("usage") or {}
+        metrics = self.result.get("metrics") or {}
+        peak = metrics.get("peak_memory_bytes")
         event(
-            "response_complete"
-            if self.status in ("completed", "incomplete", "failed")
-            else "response_cancelled",
+            name.get(self.status, "response_complete"),
             response_id=self.response_id,
             status=self.status,
             transport=self.transport,
@@ -345,6 +350,13 @@ class ResponseRun:
             input_tokens=self.accepted.get("input_tokens"),
             cached_tokens=self.accepted.get("cached_tokens"),
             restore_path=self.accepted.get("restore_path"),
+            prefilled_tokens=metrics.get("prefill_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            reasoning_tokens=(usage.get("output_tokens_details") or {}).get("reasoning_tokens"),
+            ttft_ms=metrics.get("first_token_ms"),
+            prefill_tok_s=metrics.get("prefill_tok_s"),
+            decode_tok_s=metrics.get("decode_tok_s"),
+            peak_memory_gb=round(peak / 1024**3, 1) if peak else None,
         )
 
 

@@ -8,6 +8,8 @@ a bounded lifetime, and the worker session `conn:<id>` that is released on disco
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import logging
 import time
 
 from starlette.responses import JSONResponse
@@ -135,20 +137,41 @@ class Connection:
                     pass
 
 
+# uvicorn's websockets-sansio protocol (0.54.0) never marks a denial response as a completed
+# handshake, so after a correct 401/404 denial it logs "ASGI callable returned without
+# completing handshake." (its 500 fallback is skipped; the client gets our response). The
+# filter drops that line only for connections this module denied on purpose.
+_DENIED = contextvars.ContextVar("aporisa_ws_denied", default=False)
+
+
+class _DeniedHandshakeFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (_DENIED.get() and "without completing handshake" in record.getMessage())
+
+
+def install_log_filter() -> None:
+    logger = logging.getLogger("uvicorn.error")
+    if not any(isinstance(f, _DeniedHandshakeFilter) for f in logger.filters):
+        logger.addFilter(_DeniedHandshakeFilter())
+
+
+async def _deny(websocket: WebSocket, error: ProtocolError, headers: dict | None = None) -> None:
+    _DENIED.set(True)
+    await websocket.send_denial_response(
+        JSONResponse(error.body(), status_code=error.status, headers=headers)
+    )
+
+
 async def serve_websocket(gateway, scope, receive, send) -> None:
     websocket = WebSocket(scope, receive, send)
     runtime = gateway.runtime
     if scope["path"] != "/v1/responses" or not runtime.model["capabilities"]["websocket"]:
-        error = ProtocolError("not_found", "Unknown endpoint.")
-        return await websocket.send_denial_response(
-            JSONResponse(error.body(), status_code=error.status)
-        )
+        return await _deny(websocket, ProtocolError("not_found", "Unknown endpoint."))
     if not gateway.authorized(scope):
-        error = ProtocolError("invalid_api_key", "Invalid API key.")
-        return await websocket.send_denial_response(
-            JSONResponse(
-                error.body(), status_code=error.status, headers={"www-authenticate": "Bearer"}
-            )
+        return await _deny(
+            websocket,
+            ProtocolError("invalid_api_key", "Invalid API key."),
+            {"www-authenticate": "Bearer"},
         )
     await websocket.accept()
     connection = Connection(gateway, websocket)
