@@ -10,7 +10,7 @@
 |---|---|
 | `MODEL_LIST` | 可读的模型身份。可以包含尚未下载的名字；没有被指针引用的身份不做校验，也不加载 |
 | `POINTERS` | 公开模型别名 → 身份。服务恰好启用一个别名，当前为 `aporisa-local-v0` → `Qwen3.8-Flash-Next-affine4g64` |
-| `PROFILES` | 以身份为 key 的推理参数：适配层、上下文窗口、输出上限、推理档位、能力、wired 内存要求、KV 字节数、启动所需的可用内存。不包含目录、仓库或 revision |
+| `PROFILES` | 以身份为 key 的推理参数：适配层、上下文窗口、输出上限、推理档位、能力、wired 内存要求、KV 字节数、启动所需的可用内存，以及 MTP 草稿模型的身份（`draft_identity`）和按上下文长度决定的每轮草稿数（`draft_schedule`）。不包含目录、仓库或 revision |
 
 ## 2. 本地记录与目录布局
 
@@ -26,6 +26,8 @@
 - `convert`：配方名、配方内容、配方摘要、转换工具的版本（mlx、mlx-vlm 的 commit），以及源身份的仓库和 revision。源权重删除之后，来源信息仍然保留在记录里，可以追溯。
 
 磁盘上有目录、但没有记录的权重不会被加载，`list` 会把它显示为 `unmanaged`。
+
+草稿模型身份（当前是 `Qwen3.8-Flash-Next-affine4g64-mtp`）被 profile 引用后，和被服务的身份一样处理：必须在 `MODEL_LIST` 中、有唯一的完整记录；prepare 完整校验两者并写进同一份收据；服务期间两个目录都持有共享租约，所以服务运行时也不能删除草稿模型目录。草稿模型缺失时 start 直接失败，不会悄悄退回普通解码。
 
 ## 3. `model_weights.sh`
 
@@ -65,7 +67,7 @@
 ## 4. 切换模型
 
 1. 下载或转换新权重，登记为新的身份。
-2. 修改 `POINTERS`，必要时补上 `MODEL_LIST` 和 `PROFILES`。
+2. 修改 `POINTERS`，必要时补上 `MODEL_LIST` 和 `PROFILES`（新模型有 MTP 草稿模型时，在 profile 中引用它的身份；没有时不填 `draft_identity`，解码按普通方式进行）。
 3. `./backend_service.sh stop` → `prepare` → `start`，然后做真实验证。
 
 不需要重新下载已有权重，也不需要修改 `.env`。故障时服务不会自动切换到另一个模型。

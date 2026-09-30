@@ -32,6 +32,7 @@ FIELDS = {
     "reasoning_tokens",
     "prefill_tok_s",
     "decode_tok_s",
+    "mtp_accept_rate",
     "peak_memory_gb",
     "ple_bytes_read",
     "ple_lookup_ms",

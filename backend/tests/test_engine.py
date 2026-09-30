@@ -276,7 +276,8 @@ def test_layerwise_load_matches_a_one_shot_load(engine, tiny_model_dir):
     tokens = engine.adapter.codec.encode("Layer by layer, the same weights. " * 8)
 
     def logits(lm):
-        return np.array(gen.Engine._forward(engine, lm.make_cache(), tokens).astype(mx.float32))
+        logits, _ = gen.Engine._forward(engine, lm.make_cache(), tokens)
+        return np.array(logits.astype(mx.float32))
 
     staged = logits(engine.lm)
     engine_lm, engine.lm = engine.lm, eager
@@ -327,3 +328,48 @@ def test_session_store_evaluates_a_callable_budget(engine, script):
     finally:
         store.budget_bytes = saved
         store.release("cb")
+
+
+def test_session_memory_is_what_session_bytes_reports(engine):
+    """A prefilled session holds its caches, snapshots and one logits row, nothing more (the
+    kept row used to pin the whole chunk's logits, ~1 GB per session and per snapshot)."""
+    import gc
+
+    def active():
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        return mx.get_active_memory()
+
+    tokens = [(i * 7919) % 200_000 + 1000 for i in range(2048)]
+    before = active()
+    match = engine.sessions.acquire("pinned", tokens)
+    engine._prefill(match.session, tokens, [1024], gen.JobFlags(), 16)
+    engine.sessions.done(match.session)
+    reported = match.session.nbytes()
+    held = active() - before
+    engine.sessions.release("pinned")
+    assert abs(held - reported) < 64 * 1024**2, (held, reported)
+
+
+def test_memory_pressure_drops_idle_sessions(engine, script, monkeypatch):
+    """Under the kernel's warn level a request first drops every idle session, and an idle
+    worker drops one per check (Worker._relieve_pressure)."""
+    from aporisa_backend import vmstats
+
+    script("\n</think>\n\nOK<|im_end|>")
+    store = engine.sessions
+    run(engine, request("first"), "p1")
+    run(engine, request("second"), "p2")
+    level = {"value": vmstats.PRESSURE_WARN}
+    monkeypatch.setattr(vmstats, "pressure_level", lambda: level["value"])
+    before = store.pressure_evictions
+    run(engine, request("third"), "p3")
+    assert set(store.sessions) == {"p3"} and store.pressure_evictions == before + 2
+    assert store.shed() is True and store.shed() is False  # p3 is idle now; then nothing left
+    level["value"] = vmstats.PRESSURE_NORMAL
+    run(engine, request("fourth"), "p4")
+    run(engine, request("fifth"), "p5")
+    assert {"p4", "p5"} <= set(store.sessions)
+    store.release("p4")
+    store.release("p5")

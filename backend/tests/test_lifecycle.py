@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from aporisa_backend.configs.models import active_pointer
+from aporisa_backend.configs.models import PROFILES, active_pointer
 from aporisa_backend.lifecycle import artifacts, assets, checks
 from aporisa_backend.lifecycle.assets import Layout
 from aporisa_backend.lifecycle.report import Report
@@ -44,20 +45,17 @@ def test_source_receipt_goes_stale(tmp_path):
         artifacts.verify_source_receipt(tmp_path)
 
 
-@pytest.fixture
-def served(tmp_path):
-    """The pointed identity registered in a temporary layout (a small stand-in directory)."""
-    _, identity = active_pointer()
-    layout = Layout(tmp_path)
+def register(layout: Layout, identity: str, folder: str) -> Path:
+    """A small stand-in directory registered as `identity` (a converted product)."""
     version = "d" * 16
-    directory = layout.models / "Served" / version
+    directory = layout.models / folder / version
     directory.mkdir(parents=True)
     (directory / "config.json").write_text("{}")
     (directory / "model.safetensors").write_bytes(b"\x00" * 128)
     record = {
         "schema": 1,
         "identity": identity,
-        "directory": "Served",
+        "directory": folder,
         "version": version,
         "state": "ready",
         "source": {
@@ -70,12 +68,23 @@ def served(tmp_path):
         },
         "files": assets.inventory(directory),
     }
-    assets.atomic_json(layout.record("Served"), record)
-    return layout, directory
+    assets.atomic_json(layout.record(folder), record)
+    return directory
+
+
+@pytest.fixture
+def served(tmp_path):
+    """The pointed identity and its profile's draft identity in a temporary layout."""
+    _, identity = active_pointer()
+    layout = Layout(tmp_path)
+    directory = register(layout, identity, "Served")
+    draft = PROFILES[identity].draft_identity
+    draft_directory = register(layout, draft, "Draft") if draft else None
+    return layout, directory, draft_directory
 
 
 def test_model_check_receipt_and_wired_limit(served, monkeypatch):
-    layout, directory = served
+    layout, directory, draft_directory = served
     monkeypatch.setattr(checks, "wired_limit_mb", lambda: 87040)
     report = Report()
     assert checks.model_check(layout.root, report, full=False) is None
@@ -97,6 +106,31 @@ def test_model_check_receipt_and_wired_limit(served, monkeypatch):
     report = Report()
     checks.model_check(layout.root, report, full=False)
     assert "wired_limit" in report.codes("MANUAL")
+
+
+def test_draft_model_is_verified_leased_and_required(served, monkeypatch):
+    """B2-2: the profile's MTP draft identity is part of the served selection."""
+    layout, _, draft_directory = served
+    assert draft_directory is not None
+    monkeypatch.setattr(checks, "wired_limit_mb", lambda: 87040)
+    report = Report()
+    selection = checks.model_check(layout.root, report, full=True)
+    assert selection is not None and selection.draft.directory == draft_directory
+    assert "draft" in report.codes("INFO")
+    artifacts.write_assets_receipt(layout, selection)
+    with artifacts.leases(layout, selection):
+        with pytest.raises(ValueError, match="in use"):
+            with assets.asset_lock(layout, "Draft", exclusive=True):
+                pass
+    (draft_directory / "config.json").write_text("[]")  # a changed draft file
+    report = Report()
+    assert checks.model_check(layout.root, report, full=False) is None
+    assert report.codes("MANUAL") == {"assets"}
+    shutil.rmtree(draft_directory.parent)  # no silent fallback to plain decoding
+    layout.record("Draft").unlink()
+    report = Report()
+    assert checks.model_check(layout.root, report, full=False) is None
+    assert report.codes("MANUAL") == {"model"}
 
 
 def test_model_check_without_weights(tmp_path, monkeypatch):

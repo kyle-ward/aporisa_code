@@ -17,6 +17,7 @@ from .adapters.qwen38 import Qwen38Adapter, TokenMap
 from .generate import Engine, JobFlags, Settings
 from .ple_prefetch import PlePrefetcher, external_ple
 from .sessions import SessionStore
+from .speculative import MtpDrafter
 from .tokens import Codec
 
 ADAPTERS = {"qwen38_flash_next": Qwen38Adapter}
@@ -41,17 +42,22 @@ def load(init: dict) -> Engine:
     model = load_model(model_dir, lazy=True)
     lm = model.language_model
     released = materialize(model, model_dir)
+    drafter = load_drafter(model, Path(init["draft_dir"])) if init.get("draft_dir") else None
     weights = int(mx.get_active_memory())
     adapter = ADAPTERS[init["adapter"]](Codec(model_dir), init["model"])
     prefetcher = PlePrefetcher(lm, config.ple_threads) if external_ple(lm) else None
     budget = init.get("snapshot_budget_bytes")
     if budget is None:
         budget = session_budget(wired, weights, config)
+    kv_bytes = int(init["kv_bytes_per_token"])
+    if drafter is not None:
+        kv_bytes += int(init["draft_kv_bytes_per_token"])
     sessions = SessionStore(
         lm.make_cache,
         budget_bytes=budget,
-        kv_bytes_per_token=int(init["kv_bytes_per_token"]),
+        kv_bytes_per_token=kv_bytes,
         max_snapshots=config.max_snapshots,
+        drafter=drafter,
     )
     engine = Engine(
         lm,
@@ -62,18 +68,44 @@ def load(init: dict) -> Engine:
             context_window=init["model"]["context_window"],
             max_output_tokens=init["model"]["max_output_tokens"],
             prefill_chunk=config.prefill_chunk,
+            draft_schedule=tuple(tuple(step) for step in init.get("draft_schedule") or ())
+            if drafter is not None
+            else ((0, 0),),
         ),
         prefetcher,
+        drafter,
     )
     engine.info = {
         "wired_limit_bytes": wired,
         "weights_bytes": weights,
         "snapshot_budget_bytes": sessions.budget_bytes,
         "ple_prefetch": prefetcher is not None,
+        "draft_schedule": [list(step) for step in engine.settings.draft_schedule],
         "released_cache_bytes": released,
     }
     engine.model_ref = model  # keeps the vision tower and config alive with the process
     return engine
+
+
+def load_drafter(model, draft_dir: Path) -> MtpDrafter:
+    """The MTP draft model (1.4 GiB on affine4g64), bound to the target's embeddings and head.
+
+    Read eagerly like the target, then its file pages are released: the page cache would
+    otherwise hold a second copy.
+    """
+    from mlx_vlm.speculative.drafters import load_drafter as load
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp import Qwen4ExpMTPDraftModel
+
+    from ..pagecache import release_all
+
+    draft, _kind = load(str(draft_dir), kind="mtp")
+    if not isinstance(draft, Qwen4ExpMTPDraftModel):
+        raise ValueError("the draft model is not a Qwen4-Exp MTP head")
+    draft.validate_target_compatibility(model)
+    draft.bind(model)
+    mx.eval(draft.parameters())
+    release_all(set(draft_dir.glob("*.safetensors")))
+    return MtpDrafter(draft)
 
 
 def session_budget(wired: int, weights: int, config: EngineConfig):
@@ -192,7 +224,7 @@ def warmup(engine: Engine, alias: str) -> None:
         }
 
     base = {"model": alias, "stream": True}
-    _terminal(
+    text = _terminal(
         _run(
             engine,
             {
@@ -204,6 +236,13 @@ def warmup(engine: Engine, alias: str) -> None:
         ),
         "text generation",
     )
+    if (
+        engine.drafter is not None
+        and text["type"] == "finished"
+        and text["usage"]["output_tokens"] > 1
+        and engine.metrics.get("mtp_accept_rate") is None
+    ):
+        raise WarmupError("speculative decoding: no drafts were verified")
     tools = [
         {
             "type": "function",

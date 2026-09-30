@@ -29,8 +29,23 @@ class ModelProfile:
     # KV bytes per context token, for the snapshot budget (B0-8 measured 28,560 on affine4g64).
     kv_bytes_per_token: int = 28_560
     # Startup waits (WAIT) below this much available memory: resident weights (66.8 GiB for
-    # affine4g64) plus room for activations and a working context.
+    # affine4g64, plus 1.4 GiB of MTP draft model) and room for activations and a context.
     min_available_memory_gib: int = 72
+    # Speculative decoding (B2-2). The draft model is a separate identity in MODEL_LIST with
+    # its own local record; start verifies and leases it like the served one and fails when
+    # it is missing (no silent fallback to plain decoding). draft_schedule: (context length
+    # from which it applies, drafts verified per decode round), ascending from 0. B0-10's
+    # "depth" was mlx-vlm's draft_block_size, i.e. drafts + 1: 2 drafts ("depth 3") won at a
+    # short context. P1 profiling on affine4g64: verifying 2 tokens costs ~5 ms more than 1 at
+    # any length (39/44 ms at 32K, 49/54 ms at 111K), but 3 tokens cost 54 ms at 32K and
+    # ~200 ms at 111K. Decoding 128 tokens (one run each, +-15% sampling noise): at 16K one
+    # draft 34.4 tok/s vs two 29.3/31.1; at 32K 29.7 vs 26.7/32.1; at 113K 26.4 vs 9.1. So
+    # from 16K on a round drafts one token; below, two (B0-10's short-context winner).
+    draft_identity: str | None = None
+    draft_schedule: tuple[tuple[int, int], ...] = ()
+    # KV bytes per context token the draft model adds: its one attention layer against the
+    # target's 12 (28,560 / 12). Only feeds the session estimate.
+    draft_kv_bytes_per_token: int = 0
     effective_context_window_percent: int = 95
     auto_compact_token_limit: int | None = None
     truncation_policy: dict = field(default_factory=lambda: {"mode": "bytes", "limit": 10_000})
@@ -42,6 +57,15 @@ class ModelProfile:
             raise ValueError("default_effort must be one of supported_efforts")
         if set(self.capabilities) != set(CAPABILITY_NAMES):
             raise ValueError("capabilities must declare exactly the protocol capability set")
+        schedule = self.draft_schedule
+        if (self.draft_identity is None) != (not schedule):
+            raise ValueError("draft_identity and draft_schedule go together")
+        if schedule and (
+            schedule[0][0] != 0
+            or any(a[0] >= b[0] for a, b in zip(schedule, schedule[1:], strict=False))
+            or any(count < 1 for _, count in schedule)
+        ):
+            raise ValueError("draft_schedule starts at 0, ascends and drafts at least one")
 
 
 CAPABILITY_NAMES = (
@@ -69,7 +93,8 @@ _FLASH_NEXT_CAPABILITIES = {
 
 MODEL_LIST: tuple[str, ...] = (
     "Qwen3.8-Flash-Next-affine4g64",
-    # MTP draft model converted with the same recipe; used by B2-2, never served on its own.
+    # MTP draft model converted with the same recipe; the served profile's draft_identity,
+    # never served on its own.
     "Qwen3.8-Flash-Next-affine4g64-mtp",
 )
 
@@ -86,6 +111,9 @@ PROFILES: dict[str, ModelProfile] = {
         default_effort="medium",
         capabilities=dict(_FLASH_NEXT_CAPABILITIES),
         wired_limit_mb=87_040,
+        draft_identity="Qwen3.8-Flash-Next-affine4g64-mtp",
+        draft_schedule=((0, 2), (16_384, 1)),
+        draft_kv_bytes_per_token=2_380,
     )
     for identity in ("Qwen3.8-Flash-Next-affine4g64",)
 }
@@ -101,6 +129,9 @@ def active_pointer(
     alias, identity = enabled[0]
     if identity not in MODEL_LIST or identity not in PROFILES:
         raise ValueError("the pointed identity needs a MODEL_LIST entry and a profile")
+    draft = PROFILES[identity].draft_identity
+    if draft is not None and (draft not in MODEL_LIST or draft == identity):
+        raise ValueError("the profile's draft identity needs its own MODEL_LIST entry")
     return alias, identity
 
 

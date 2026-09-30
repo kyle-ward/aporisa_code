@@ -1,0 +1,131 @@
+"""MTP speculative decoding: the draft side (B2-2, DEVELOPMENT_PLAN.md 7).
+
+The model's native MTP head is a one-layer model that predicts the token after next from
+(embedding of token t+1, target hidden state at t). It keeps its own small KV cache, one
+entry per such pair, at position t. For a session holding T target tokens the drafter has
+consumed the pairs for positions 0..T-2 and keeps the target hidden state at T-1; the pair
+for position T-1 needs token T, which is only known once it is sampled.
+
+A decode round (generate.py) samples the bonus token b, asks for n drafts, verifies
+[b, d1..dn] in one target forward and keeps the longest prefix whose tokens the target
+sampled itself. Every emitted token is a target sample, drawn with the request's sampler
+exactly once per position, so the output is the one plain decoding produces (same tokens
+for the same random state); drafts only decide how many positions one forward covers.
+Drafts are the drafter's argmax: with a deterministic draft, "accept when the target sample
+equals it" is the same rule as speculative rejection sampling.
+
+Drafter state is an accelerator like the rest of the session: pairs fed during a round for
+drafted tokens use the drafter's own hidden states and are trimmed afterwards; the pairs
+for accepted tokens are fed again with the target's hidden states.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import mlx.core as mx
+
+
+@dataclass
+class DraftState:
+    cache: list
+    hidden: mx.array | None = None  # target hidden state after the last target token
+    appended: int = 0  # drafter pairs fed for drafted tokens this round (to trim)
+    first_fed: bool = False  # the next observed token's pair was fed by propose()
+    pending: list[tuple[list[int], mx.array]] = field(default_factory=list)
+
+    def offset(self) -> int:
+        return int(self.cache[0].offset or 0) if self.cache else 0
+
+    def nbytes(self) -> int:
+        total = sum(int(getattr(entry, "nbytes", 0) or 0) for entry in self.cache)
+        return total + (self.hidden.nbytes if self.hidden is not None else 0)
+
+    def arrays(self) -> list:
+        values = [entry.state for entry in self.cache]
+        return values + ([self.hidden] if self.hidden is not None else [])
+
+
+class MtpDrafter:
+    """Drives the mlx-vlm Qwen4-Exp MTP draft model bound to the target (runtime.load)."""
+
+    def __init__(self, draft_model):
+        self.model = draft_model
+
+    def new_state(self) -> DraftState:
+        return DraftState(self.model.make_cache())
+
+    def _feed(self, state: DraftState, tokens: list[int], hidden: mx.array):
+        """Feeds pairs (tokens[i], hidden[:, i]); returns the last (logit, pre-mixer) hidden."""
+        model = self.model
+        model._next_position = state.offset()
+        ids = mx.array([tokens], dtype=mx.int32)
+        logits_hidden, hidden_out = model._forward_hidden(
+            model._input_embed(ids), hidden, ids, state.cache
+        )
+        return logits_hidden[:, -1:], hidden_out[:, -1:]
+
+    def observe(self, state: DraftState, tokens: list[int], hidden: mx.array, start: int) -> None:
+        """The target consumed `tokens` at positions start.. and produced `hidden`
+        ([1, len(tokens), W]). Queues the pairs this makes complete: token i pairs with the
+        hidden state at the position before it."""
+        if not tokens:
+            return
+        if state.appended:
+            for entry in state.cache:
+                entry.trim(state.appended)
+            state.appended = 0
+        if state.first_fed:
+            pairs, previous = tokens[1:], hidden[:, :-1]
+        elif start > 0 and state.hidden is not None:
+            pairs = tokens
+            previous = mx.concatenate([state.hidden, hidden[:, :-1]], axis=1)
+        else:
+            pairs, previous = tokens[1:], hidden[:, :-1]
+        state.first_fed = False
+        if pairs:
+            state.pending.append((pairs, previous))
+        # A copy: a slice would share (and keep alive) the whole chunk's hidden states,
+        # 2048 x 10240 bf16 per session and per snapshot that holds this row.
+        state.hidden = mx.contiguous(hidden[:, -1:])
+
+    def flush(self, state: DraftState) -> None:
+        """Feeds the queued pairs (before a snapshot, at the end of a request)."""
+        if state.pending:
+            tokens = [t for chunk, _ in state.pending for t in chunk]
+            hidden = mx.concatenate([h for _, h in state.pending], axis=1)
+            state.pending = []
+            self._feed(state, tokens, hidden)
+
+    def propose(self, state: DraftState, bonus: int, count: int) -> list[int]:
+        """Up to `count` greedy drafts following `bonus` (sampled, not yet in the target)."""
+        if count <= 0 or state.hidden is None:
+            return []
+        tokens = [t for chunk, _ in state.pending for t in chunk] + [bonus]
+        hidden = mx.concatenate([h for _, h in state.pending] + [state.hidden], axis=1)
+        state.pending = []
+        logits_hidden, hidden_out = self._feed(state, tokens, hidden)
+        state.first_fed = True
+        head = self.model._lm_head_fn
+        drafts = [int(mx.argmax(head(logits_hidden)[0, -1]).item())]
+        while len(drafts) < count:
+            logits_hidden, hidden_out = self._feed(state, drafts[-1:], hidden_out)
+            state.appended += 1
+            drafts.append(int(mx.argmax(head(logits_hidden)[0, -1]).item()))
+        return drafts
+
+    @staticmethod
+    def snapshot(state: DraftState) -> mx.array | None:
+        return state.hidden
+
+    def restore(self, state: DraftState, hidden: mx.array | None, offset: int) -> bool:
+        """Rewinds to a target snapshot at `offset`; False when the drafter cannot follow."""
+        self.flush(state)
+        excess = state.offset() - (offset - 1)
+        if hidden is None or offset < 1 or excess < 0 or state.appended:
+            return False
+        if excess:
+            for entry in state.cache:
+                entry.trim(excess)
+        state.hidden, state.first_fed = hidden, False
+        return True

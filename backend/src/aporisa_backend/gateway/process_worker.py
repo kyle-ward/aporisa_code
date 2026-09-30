@@ -48,12 +48,14 @@ class ProcessWorker(WorkerClient):
         model: dict,
         profile: ModelProfile,
         *,
+        draft_dir: Path | None = None,
         engine: EngineConfig = ENGINE,
         stop_timeout_s: float = 15,
         python: str = sys.executable,
         snapshot_budget_bytes: int | None = None,
     ):
         self.model_dir, self.model, self.profile = Path(model_dir), model, profile
+        self.draft_dir = Path(draft_dir) if draft_dir is not None else None
         self.engine, self.stop_timeout_s, self.python = engine, stop_timeout_s, python
         self.snapshot_budget_bytes = snapshot_budget_bytes
         self.proc: asyncio.subprocess.Process | None = None
@@ -101,6 +103,9 @@ class ProcessWorker(WorkerClient):
                 "model": self.model,
                 "adapter": self.profile.adapter,
                 "kv_bytes_per_token": self.profile.kv_bytes_per_token,
+                "draft_dir": str(self.draft_dir) if self.draft_dir is not None else None,
+                "draft_schedule": [list(step) for step in self.profile.draft_schedule],
+                "draft_kv_bytes_per_token": self.profile.draft_kv_bytes_per_token,
                 "snapshot_budget_bytes": self.snapshot_budget_bytes,
                 "engine": self.engine.as_dict(),
             }

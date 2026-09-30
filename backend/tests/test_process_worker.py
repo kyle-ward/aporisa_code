@@ -23,7 +23,8 @@ from aporisa_backend.gateway.runtime import Runtime
 
 
 @pytest.fixture
-def served(tiny_model_dir):
+def served(tiny_model_dir, tiny_draft_dir):
+    """The real worker process on the tiny model, with the tiny MTP draft model."""
     workers: list[ProcessWorker] = []
     service_limits = limits(restart_backoff_s=0.1, worker_start_timeout_s=120)
 
@@ -32,6 +33,7 @@ def served(tiny_model_dir):
             tiny_model_dir,
             public_model(ALIAS, PROFILE),
             PROFILE,
+            draft_dir=tiny_draft_dir,
             snapshot_budget_bytes=2 * 1024**3,
         )
         workers.append(worker)
@@ -115,6 +117,8 @@ async def test_runtime_health_includes_worker_status(served):
     worker = health["worker"]
     assert worker["sessions"] >= 1 and worker["weights_bytes"] > 0
     assert worker["ple_prefetch"] is True
+    # MTP loaded and warmed up with the profile's schedule
+    assert worker["draft_schedule"] == [list(step) for step in PROFILE.draft_schedule]
     assert worker["released_cache_bytes"] >= 0 and "sys_swapouts" in worker["startup"]
     assert worker["system"]["swap_used_bytes"] >= 0 and worker["ple_files_cached_bytes"] >= 0
     last = worker["last"]

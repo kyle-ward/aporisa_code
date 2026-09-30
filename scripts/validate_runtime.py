@@ -13,13 +13,17 @@ with the key and port from backend/.env. Default checks take a few minutes:
   prompt cache  the same prompt_cache_key reuses the prefix (cached_tokens, faster TTFT)
   websocket     previous_response_id continuation prefills only the new input
   effort switch a trailing configuration_update to none produces no reasoning
+  speculative   MTP (B2-2): decode speed with drafts against B0-10's plain decoding, and
+                the draft acceptance rate, in effort none and medium
   runtime       /health/runtime includes the worker's view
 
 --long TOKENS adds the B1-10 acceptance: one cold prefill of about TOKENS tokens (server
 prefill speed against B0-5's compute-only speed) and a continuation on top of it, with
-swap usage required not to grow. System memory (compressor, swap, free) is sampled every
-second and each check records the memory pressure it caused. Results (numbers only, never
-text) are appended to .runtime/validation/validate_<time>.jsonl.
+swap usage required not to grow; then a longer answer on the same context, whose decode
+speed (with MTP) must not fall below B0-5's plain decoding at that length. System memory
+(compressor, swap, free) is sampled every second and each check records the memory pressure
+it caused. Results (numbers only, never text) are appended to
+.runtime/validation/validate_<time>.jsonl.
 """
 
 from __future__ import annotations
@@ -49,7 +53,15 @@ LONG_TIMEOUT_S = 3600
 TERMINAL = {"response.completed", "response.incomplete", "response.failed"}
 # B0-5 (docs/validation.md): affine4g64 compute-only prefill tok/s by context length.
 B0_PREFILL = [(2048, 954), (32768, 771), (131072, 682), (262144, 574)]
+# B0-5: affine4g64 plain decode tok/s by context length (DEVELOPMENT_PLAN.md section 3).
+B0_DECODE = [(2048, 30.2), (32768, 26.2), (131072, 20.9), (262144, 16.2)]
+LONG_DECODE_MIN_TOKENS = 64
 PREFILL_RATIO_REQUIRED = 0.8
+# B0-10: plain decoding at a short context, 31.0 tok/s (greedy) and 30.7 (thinking sampling);
+# MTP with 2 drafts reached 1.57x and 1.47x. B2-2 requires at least 1.3x of the plain speed.
+B0_PLAIN_DECODE_TOK_S = 30.7
+MTP_SPEEDUP_REQUIRED = 1.3
+MTP_MIN_OUTPUT_TOKENS = 128
 SWAP_GROWTH_ALLOWED = 256 * 1024**2
 
 TOOLS = [
@@ -165,6 +177,7 @@ class Validator:
                 free_bytes=now["free_bytes"],
                 swapouts=now["swapouts"],
                 compressions=now["compressions"],
+                pressure_level=now["pressure_level"],
             )
             await asyncio.sleep(1)
 
@@ -322,6 +335,43 @@ class Validator:
         self.record("effort_switch", passed=True, **_usage(response["usage"]))
         emit("READY", "Mid-conversation switch to effort none passed.")
 
+    async def speculative(self, client):
+        required = B0_PLAIN_DECODE_TOK_S * MTP_SPEEDUP_REQUIRED
+        prompt = (
+            "Explain step by step how a hash map handles collisions, with a short Python "
+            "example. Be thorough."
+        )
+        results = []
+        for effort in ("none", "medium"):
+            body = self.request([user(prompt)], reasoning={"effort": effort}, max_output_tokens=384)
+            response, _ = await self.stream(client, body)
+            status = response["status"]
+            check(status in ("completed", "incomplete"), f"status {status}")
+            last = (await self.runtime(client))["worker"]["last"]
+            output = response["usage"]["output_tokens"]
+            speed, rate = last.get("decode_tok_s") or 0, last.get("mtp_accept_rate")
+            self.record(
+                f"speculative.{effort}",
+                output_tokens=output,
+                decode_tok_s=speed,
+                mtp_accept_rate=rate,
+                speedup=round(speed / B0_PLAIN_DECODE_TOK_S, 3),
+            )
+            check(rate is not None, f"effort {effort}: no drafts were verified")
+            check(output >= MTP_MIN_OUTPUT_TOKENS, f"effort {effort}: only {output} tokens")
+            check(
+                speed >= required,
+                f"effort {effort}: decode {speed:.1f} tok/s < {required:.1f} "
+                f"({MTP_SPEEDUP_REQUIRED}x B0-10 plain)",
+            )
+            results.append(f"{effort} {speed:.1f} tok/s (accept {rate:.2f})")
+        self.record("speculative", passed=True)
+        emit(
+            "READY",
+            f"Speculative decoding passed: {'; '.join(results)}; "
+            f"B0-10 plain {B0_PLAIN_DECODE_TOK_S} tok/s.",
+        )
+
     async def runtime_status(self, client):
         status = await self.runtime(client)
         worker = status.get("worker")
@@ -375,11 +425,27 @@ class Validator:
         second, ttft_warm = await self.stream(client, follow)
         cached = second["usage"]["input_tokens_details"]["cached_tokens"]
         swap_growth = psutil.swap_memory().used - swap_before
+        # Decode speed at this context: a longer answer continuing the same session.
+        answer = {
+            **follow,
+            "input": [
+                *follow["input"],
+                *as_input(second["output"]),
+                user("Now describe the text in detail, in about 200 words."),
+            ],
+        }
+        third, _ = await self.stream(client, answer)
+        decoded = (await self.runtime(client))["worker"]["last"]
+        decode_speed = decoded.get("decode_tok_s") or 0
+        decode_reference = _reference(count, B0_DECODE)
+        long_output = third["usage"]["output_tokens"]
         self.record(
             "long_context",
             passed=ratio >= PREFILL_RATIO_REQUIRED
             and cached >= first["usage"]["input_tokens"]
-            and swap_growth < SWAP_GROWTH_ALLOWED,
+            and swap_growth < SWAP_GROWTH_ALLOWED
+            and long_output >= LONG_DECODE_MIN_TOKENS
+            and decode_speed >= decode_reference,
             input_tokens=first["usage"]["input_tokens"],
             prefill_tok_s=speed,
             b0_compute_tok_s=round(reference),
@@ -391,6 +457,10 @@ class Validator:
             ple_prefetch_ms=last.get("ple_prefetch_ms"),
             peak_memory_bytes=last.get("peak_memory_bytes"),
             swap_growth_bytes=swap_growth,
+            decode_output_tokens=long_output,
+            decode_tok_s=decode_speed,
+            b0_plain_decode_tok_s=round(decode_reference, 1),
+            mtp_accept_rate=decoded.get("mtp_accept_rate"),
         )
         check(
             ratio >= PREFILL_RATIO_REQUIRED,
@@ -398,10 +468,17 @@ class Validator:
         )
         check(cached >= first["usage"]["input_tokens"], f"continuation cached {cached}")
         check(swap_growth < SWAP_GROWTH_ALLOWED, f"swap grew by {swap_growth / 1024**2:.0f} MiB")
+        check(long_output >= LONG_DECODE_MIN_TOKENS, f"long answer had {long_output} tokens")
+        check(
+            decode_speed >= decode_reference,
+            f"decode {decode_speed:.1f} tok/s at {count} tokens is below B0-5 plain "
+            f"{decode_reference:.1f}",
+        )
         emit(
             "READY",
             f"Long context passed: {count} tokens at {speed:.0f} tok/s ({ratio:.0%} of B0-5 "
             f"compute-only {reference:.0f}); continuation TTFT {ttft_warm or 0:.2f}s; "
+            f"decode {decode_speed:.1f} tok/s (B0-5 plain {decode_reference:.1f}); "
             f"swap growth {swap_growth / 1024**2:.0f} MiB.",
         )
 
@@ -415,9 +492,8 @@ def _usage(usage: dict) -> dict:
     }
 
 
-def _reference(tokens: int) -> float:
-    """B0-5 compute-only prefill speed, interpolated in log(context length)."""
-    points = B0_PREFILL
+def _reference(tokens: int, points=B0_PREFILL) -> float:
+    """A B0-5 speed (prefill by default), interpolated in log(context length)."""
     if tokens <= points[0][0]:
         return points[0][1]
     for (x0, y0), (x1, y1) in zip(points, points[1:], strict=False):
@@ -464,6 +540,7 @@ async def main() -> int:
             ("prompt_cache", validator.prompt_cache(client)),
             ("websocket", validator.websocket(client)),
             ("effort_switch", validator.effort_switch(client)),
+            ("speculative", validator.speculative(client)),
             ("runtime", validator.runtime_status(client)),
         ]
         for name, coroutine in checks:

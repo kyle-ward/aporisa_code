@@ -88,7 +88,13 @@ class Worker:
             "ple_files_cached_bytes": ple_cached_bytes(self.engine),
             "system": {
                 key: system[key]
-                for key in ("free_bytes", "wired_bytes", "compressor_bytes", "swap_used_bytes")
+                for key in (
+                    "free_bytes",
+                    "wired_bytes",
+                    "compressor_bytes",
+                    "swap_used_bytes",
+                    "pressure_level",
+                )
             },
         }
 
@@ -97,8 +103,13 @@ class Worker:
     def run(self) -> None:
         threading.Thread(target=self._control, name="control", daemon=True).start()
         self.send({"type": "ready", "info": self.engine.info})
+        interval = self.init["engine"].get("idle_pressure_check_s") or 5.0
         while True:
-            message = self.inbox.get()
+            try:
+                message = self.inbox.get(timeout=interval)
+            except queue.Empty:
+                self._relieve_pressure()
+                continue
             op = message["op"]
             if op == "generate":
                 self._generate(message)
@@ -107,6 +118,14 @@ class Worker:
                 self._update_view()
             elif op == "shutdown":
                 return
+
+    def _relieve_pressure(self) -> None:
+        """Idle: while the kernel reports memory pressure, drop one idle session (LRU) per
+        check; the level takes a moment to follow freed memory."""
+        from .. import vmstats
+
+        if vmstats.pressure_level() >= vmstats.PRESSURE_WARN and self.engine.sessions.shed():
+            self._update_view()
 
     def _generate(self, message: dict) -> None:
         job_id = message["id"]

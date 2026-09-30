@@ -175,3 +175,40 @@ def build(source: Path, root: Path) -> Path:
     view = root / "q4-extple"
     prepare_external_ple_model(quantized, view)
     return view
+
+
+def build_mtp(view: Path, target: Path) -> Path:
+    """A tiny random MTP draft model for `view`, in the layout of the served -mtp identity
+    (4-bit affine gs64, the router gate kept in bf16 like the upstream splitter)."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten, tree_map
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp import Model, ModelConfig
+
+    text = json.loads((view / "config.json").read_text())["text_config"]
+    quantization = {"group_size": 64, "bits": 4, "mode": "affine"}
+    config = {"model_type": "qwen4_exp_mtp", "block_size": 2, "text_config": text}
+    mx.random.seed(1)
+    model = Model(ModelConfig.from_dict(config))
+    model.update(
+        tree_map(
+            lambda v: v.astype(mx.bfloat16) if mx.issubdtype(v.dtype, mx.floating) else v,
+            model.parameters(),
+        )
+    )
+    nn.quantize(
+        model,
+        group_size=64,
+        bits=4,
+        class_predicate=lambda path, module: (
+            hasattr(module, "to_quantized")
+            and not path.endswith("mlp.gate")
+            and module.weight.shape[-1] % 64 == 0
+        ),
+    )
+    target.mkdir(parents=True)
+    weights = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(target / "model.safetensors"), weights, metadata={"format": "mlx"})
+    config.update(quantization=quantization, quantization_config=quantization)
+    (target / "config.json").write_text(json.dumps(config, indent=1))
+    return target

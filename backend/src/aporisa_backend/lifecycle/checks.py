@@ -118,9 +118,9 @@ def model_check(root: Path, report: Report, *, full: bool, progress: bool = Fals
         report.add(
             "model",
             "MANUAL",
-            "The pointed identity has no unique, completed local record: check POINTERS and "
-            "MODEL_LIST in configs/models.py and ./model_weights.sh list. prepare never "
-            "downloads or converts weights.",
+            "The pointed identity (or its profile's draft identity) has no unique, completed "
+            "local record: check POINTERS, MODEL_LIST and PROFILES in configs/models.py and "
+            "./model_weights.sh list. prepare never downloads or converts weights.",
         )
         return None
     report.add(
@@ -129,6 +129,18 @@ def model_check(root: Path, report: Report, *, full: bool, progress: bool = Fals
         f"Serving alias {selection.alias} -> {selection.identity} "
         f"({selection.record['directory']}/{selection.record['version']}).",
     )
+    if selection.draft is not None:
+        report.add(
+            "draft",
+            "INFO",
+            f"MTP draft model: {selection.draft.identity} "
+            f"({selection.draft.record['directory']}/{selection.draft.record['version']}), "
+            "drafts per decode round by context length: "
+            + ", ".join(
+                f"{count} from {start}" for start, count in selection.profile.draft_schedule
+            )
+            + ".",
+        )
     limit = wired_limit_mb()
     if limit is None or limit < selection.profile.wired_limit_mb:
         report.add(

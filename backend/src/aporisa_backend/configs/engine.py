@@ -26,6 +26,12 @@ class EngineConfig:
     # machine holding 67 GiB of weights, every GiB returned to macOS matters more than the
     # small reallocation cost.
     cache_limit_bytes: int = GIB // 2
+    # The budget above is evaluated when a request starts; between requests the desktop can
+    # grow back into the memory idle sessions hold (B2 P1: after a 125K session the idle
+    # worker kept ~4.7 GB and the desktop went yellow). While idle, the worker checks the
+    # kernel's memory pressure this often and drops idle sessions (LRU) while it is at warn
+    # or worse; a request starting under pressure drops them first too.
+    idle_pressure_check_s: float = 5.0
     ple_threads: int = 64
     # Soft RLIMIT_NOFILE the gateway and worker raise themselves to. launchd's default is 256;
     # the external PLE table alone holds 384 memmaps (128 shards x 3 tensors).

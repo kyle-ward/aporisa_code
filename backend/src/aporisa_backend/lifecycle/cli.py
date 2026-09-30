@@ -47,8 +47,14 @@ def doctor(root: Path) -> bool:
 
 
 def prepare(root: Path) -> None:
-    from .artifacts import select, verify_assets, write_assets_receipt, write_source_receipt
-    from .assets import Layout, asset_lock
+    from .artifacts import (
+        leases,
+        select,
+        verify_assets,
+        write_assets_receipt,
+        write_source_receipt,
+    )
+    from .assets import Layout
     from .checks import inspect
     from .service_guard import guard_service
 
@@ -61,12 +67,14 @@ def prepare(root: Path) -> None:
         except ValueError:
             emit(
                 "MANUAL",
-                "The pointed identity has no unique completed local weights. Check "
-                "./model_weights.sh list; prepare never downloads or converts weights.",
+                "The pointed identity or its draft identity has no unique completed local "
+                "weights. Check ./model_weights.sh list; prepare never downloads or converts "
+                "weights.",
             )
             raise CheckFailed() from None
-        with asset_lock(layout, selection.record["directory"]):
-            emit("WAIT", f"Verifying every checksum of {selection.identity} (read-only)...")
+        with leases(layout, selection):
+            names = " and ".join(c.identity for c in selection.components())
+            emit("WAIT", f"Verifying every checksum of {names} (read-only)...")
             try:
                 verify_assets(layout, selection, full=True)
             except (ValueError, OSError):
@@ -95,8 +103,8 @@ def run(root: Path) -> None:
     from ..gateway.runtime import Runtime
     from ..logging_config import setup_logging
     from ..process_limits import raise_open_files
-    from .artifacts import select
-    from .assets import Layout, asset_lock
+    from .artifacts import leases, select
+    from .assets import Layout
     from .checks import inspect
     from .service_guard import guard_service
 
@@ -110,9 +118,9 @@ def run(root: Path) -> None:
         settings = Settings.read(env_file=root / "backend" / ".env", root=root)
         layout = Layout(root)
         selection = select(layout)
-        # Shared lease for the whole service life: download/convert/delete of this directory
-        # are refused while it is in use.
-        with asset_lock(layout, selection.record["directory"]):
+        # Shared leases for the whole service life: download/convert/delete of the served and
+        # draft directories are refused while they are in use.
+        with leases(layout, selection):
             setup_logging(root / "backend" / "logs")
             model = public_model(selection.alias, selection.profile)
             runtime = Runtime(
@@ -122,6 +130,7 @@ def run(root: Path) -> None:
                     selection.directory,
                     model,
                     selection.profile,
+                    draft_dir=selection.draft.directory if selection.draft else None,
                     stop_timeout_s=LIMITS.worker_stop_s,
                 ),
                 LIMITS,

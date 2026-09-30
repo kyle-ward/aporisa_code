@@ -170,6 +170,14 @@ def tiny_fp8_dir(tmp_path_factory):
     return tiny_model.build_fp8(MODEL_DIR, tmp_path_factory.mktemp("tiny-fp8") / "checkpoint")
 
 
+@pytest.fixture(scope="session")
+def tiny_draft_dir(tiny_model_dir):
+    """A tiny random MTP draft model matching tiny_model_dir (tests/tiny_model.py)."""
+    import tiny_model
+
+    return tiny_model.build_mtp(tiny_model_dir, tiny_model_dir.parent / "mtp")
+
+
 def worker_init(model_dir, **overrides) -> dict:
     """The init frame the gateway sends a worker, for in-process engine tests."""
     from aporisa_backend.configs.engine import ENGINE
@@ -181,6 +189,9 @@ def worker_init(model_dir, **overrides) -> dict:
         "model": public_model(ALIAS, PROFILE),
         "adapter": PROFILE.adapter,
         "kv_bytes_per_token": PROFILE.kv_bytes_per_token,
+        "draft_dir": None,
+        "draft_schedule": [list(step) for step in PROFILE.draft_schedule],
+        "draft_kv_bytes_per_token": PROFILE.draft_kv_bytes_per_token,
         "snapshot_budget_bytes": 2 * 1024**3,
         "engine": ENGINE.as_dict(),
         **overrides,

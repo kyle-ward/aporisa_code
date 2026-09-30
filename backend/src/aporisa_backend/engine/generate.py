@@ -3,7 +3,12 @@
 render -> context check -> session match -> accepted -> chunked prefill (2048, split at
 snapshot points, PLE pages of chunk i+1 read while the GPU runs chunk i) -> decode with the
 parser -> finished. Cancel and interrupt flags are checked between prefill chunks and
-between decoded tokens. Every forward call passes explicit text positions.
+between decode rounds. Every forward call passes explicit text positions.
+
+Decoding runs in rounds (B2-2, speculative.py): the bonus token b is sampled, the drafter
+proposes up to n tokens, one target forward verifies [b, d1..dn], and the target's own
+samples are emitted until one differs from its draft. Without a drafter (or when drafting
+is off for a session) a round is a single token, which is plain decoding.
 """
 
 from __future__ import annotations
@@ -79,6 +84,12 @@ class Settings:
     context_window: int
     max_output_tokens: int
     prefill_chunk: int = PREFILL_CHUNK
+    # (context length from which it applies, drafts per decode round); 0 drafts: plain decoding
+    draft_schedule: tuple[tuple[int, int], ...] = ((0, 0),)
+
+    def drafts_at(self, context: int) -> int:
+        """Drafts for a round starting with `context` tokens in the cache."""
+        return next((n for start, n in reversed(self.draft_schedule) if start <= context), 0)
 
 
 class Engine:
@@ -90,9 +101,11 @@ class Engine:
         token_map: TokenMap,
         settings: Settings,
         prefetcher=None,
+        drafter=None,
     ):
         self.lm, self.adapter, self.sessions = lm, adapter, sessions
         self.token_map, self.settings, self.prefetcher = token_map, settings, prefetcher
+        self.drafter = drafter
         self.vocab_rows = int(lm.args.vocab_size)
         self.metrics: dict = {}
         self.info: dict = {}
@@ -103,15 +116,42 @@ class Engine:
 
     # --- model calls ----------------------------------------------------------------------
 
-    def _forward(self, cache: list, tokens: list[int]) -> mx.array:
+    def _forward(self, cache: list, tokens: list[int], hidden: bool = False):
+        """Prefill forward: (logits after the last token, pre-mixer hidden states or None).
+
+        The model returns only the pre-mixer hidden states; the final mixer and lm_head run
+        on the last position alone. Projecting the whole chunk would materialize logits for
+        every position (2048 x 248,320 in bf16, ~1 GB) only to keep one row, and an MLX slice
+        shares its parent's buffer, so the kept row pinned the whole gigabyte for as long as
+        the session or a snapshot held it (unaccounted in session_bytes).
+        """
         offset = cache_offset(cache)
         out = self.lm(
             mx.array([tokens], dtype=mx.int32),
             cache=cache,
             position_ids=text_positions(offset, len(tokens)),
-            logits_to_keep=1,
+            return_hidden=True,
+            skip_logits=True,
         )
-        return out.logits[0, -1]
+        states = out.hidden_states[0]
+        last = self.lm.model.hyper_connection_mixer(states[:, -1:])
+        logits = self.lm.lm_head(last)[0, -1]
+        return logits, (states if hidden else None)
+
+    def _verify(self, cache: list, tokens: list[int]):
+        """Decode forward over [bonus, drafts...]: every position's logits and hidden state.
+
+        Single-token decoding already takes this batch-invariant path inside the model, so a
+        round with drafts computes exactly what the same tokens would one at a time (bit-equal
+        on the tiny model; B0-8 found no chunking noise on the real one).
+        """
+        offset = cache_offset(cache)
+        out = self.lm._batch_invariant_decode(
+            mx.array([tokens], dtype=mx.int32),
+            cache=cache,
+            position_ids=text_positions(offset, len(tokens)),
+        )
+        return out.logits[0], out.hidden_states[-1]
 
     def _prefill(
         self, session: Session, tokens: list[int], stops: list[int], flags: JobFlags, limit: int
@@ -138,18 +178,28 @@ class Engine:
             if prefetch is not None and not self._wait(prefetch, flags):
                 return False
             chunk_started = time.monotonic()
-            logits = self._forward(session.cache, tokens[begin:end])
+            draft = session.draft
+            logits, hidden = self._forward(
+                session.cache, tokens[begin:end], hidden=draft is not None
+            )
+            if draft is not None:
+                self.drafter.observe(draft, tokens[begin:end], hidden, begin)
+                self.drafter.flush(draft)
             prefetch = (
                 self._prefetch(tokens, *pieces[index + 1]) if index + 1 < len(pieces) else None
             )
-            mx.eval(logits, [entry.state for entry in session.cache])
+            mx.eval(
+                logits,
+                [entry.state for entry in session.cache],
+                draft.arrays() if draft is not None else [],
+            )
             # One chunk (PLE lookup + GPU) cannot be interrupted; its duration bounds how
             # fast a cancel is confirmed.
             self._max_chunk_s = max(self._max_chunk_s, time.monotonic() - chunk_started)
             session.tokens.extend(tokens[begin:end])
             session.logits = logits
             if end in cuts:
-                session.snapshot(limit)
+                session.snapshot(limit, self.drafter.snapshot(draft) if draft else None)
             mx.clear_cache()
         return True
 
@@ -228,51 +278,101 @@ class Engine:
     def _decode(self, plan, session, emit, flags, usage_base, match, prefill_s, started) -> None:
         parser = self.adapter.parser(plan)
         sampler = Sampler(plan, self.vocab_rows, self.adapter.codec.vocab_size)
-        logits = session.logits
         generated: list[int] = []
         first_token_s = None
+        drafted = accepted = 0
         decode_started = time.monotonic()
         if self.prefetcher is not None:
             self.prefetcher.touch_before_read = True
         status, reason = "completed", None
+
+        def take(token: int) -> bool:
+            """Emits one sampled token; True when generation ends with it."""
+            nonlocal first_token_s, status, reason
+            generated.append(token)
+            if first_token_s is None:
+                first_token_s = time.monotonic() - started
+            if token in STOP_IDS:
+                for message in parser.finish():
+                    emit(message)
+                return True
+            for message in parser.feed(token):
+                emit(message)
+            if parser.failed:
+                return True
+            if plan.stop_after_call and token == CALL_CLOSE:
+                for message in parser.finish():
+                    emit(message)
+                return True
+            if len(generated) >= plan.max_output_tokens:
+                status, reason = "incomplete", "max_output_tokens"
+                return True
+            return False
+
+        draft = session.draft
         try:
-            while True:
+            token = sampler(session.logits)
+            done = take(token)
+            while not done:
                 if flags.cancel.is_set():
                     raise Cancelled
                 if flags.interrupt.is_set():
                     status, reason = "incomplete", "interrupted"
                     break
-                token = sampler(logits)
-                generated.append(token)
-                if first_token_s is None:
-                    first_token_s = time.monotonic() - started
-                if token in STOP_IDS:
-                    for message in parser.finish():
-                        emit(message)
-                    break
-                for message in parser.feed(token):
-                    emit(message)
-                if parser.failed:
-                    break
-                if plan.stop_after_call and token == CALL_CLOSE:
-                    for message in parser.finish():
-                        emit(message)
-                    break
-                if len(generated) >= plan.max_output_tokens:
-                    status, reason = "incomplete", "max_output_tokens"
-                    break
-                logits = self._forward(session.cache, [token])
-                mx.eval(logits)
-                session.tokens.append(token)
-                session.logits = logits
+                # [token, drafts...] never runs past max_output_tokens: the last position
+                # verified is the last one that could still be emitted.
+                room = plan.max_output_tokens - len(generated) - 1
+                drafts = (
+                    self.drafter.propose(
+                        draft, token, min(self.settings.drafts_at(len(session.tokens)), room)
+                    )
+                    if draft is not None
+                    else []
+                )
+                inputs = [token, *drafts]
+                transaction = None
+                if drafts:
+                    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+                    transaction = start_speculative_cache(session.cache, len(inputs))
+                try:
+                    logits, hidden = self._verify(session.cache, inputs)
+                    mx.eval(logits)
+                    keep = 0
+                    while True:
+                        sampled = sampler(logits[keep])
+                        done = take(sampled)
+                        keep += 1
+                        if done or keep > len(drafts) or sampled != drafts[keep - 1]:
+                            break
+                    if transaction is not None:
+                        transaction.commit(keep)
+                except BaseException:
+                    if transaction is not None:
+                        transaction.abort()
+                    raise
+                drafted += len(drafts)
+                accepted += keep - 1
+                session.tokens.extend(inputs[:keep])
+                session.logits = logits[keep - 1]
+                if draft is not None:
+                    self.drafter.observe(
+                        draft, inputs[:keep], hidden[:, :keep], len(session.tokens) - keep
+                    )
+                token = sampled
         finally:
             if self.prefetcher is not None:
                 self.prefetcher.touch_before_read = False
+        if draft is not None:
+            self.drafter.flush(draft)
+            mx.eval(draft.arrays())
         decode_s = time.monotonic() - decode_started
         self.metrics = self._metrics(
             match, usage_base["input_tokens"], prefill_s, len(generated), decode_s, started
         )
         self.metrics["first_token_ms"] = round(first_token_s * 1000) if first_token_s else None
+        if self.drafter is not None:
+            self.metrics["mtp_accept_rate"] = round(accepted / drafted, 3) if drafted else None
         if parser.failed:
             emit({"type": "failed", "code": "tool_call_invalid", "detail": parser.failed})
             return

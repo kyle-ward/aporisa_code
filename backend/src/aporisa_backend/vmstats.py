@@ -74,6 +74,21 @@ _HOST = _libc.mach_host_self()
 COUNTERS = ("pageins", "pageouts", "compressions", "decompressions", "swapins", "swapouts")
 
 
+# kern.memorystatus_vm_pressure_level: what Activity Monitor's memory pressure graph shows.
+PRESSURE_NORMAL, PRESSURE_WARN, PRESSURE_CRITICAL = 1, 2, 4
+
+
+def pressure_level() -> int:
+    """The kernel's memory pressure level: 1 normal (green), 2 warn (yellow), 4 critical."""
+    level = ctypes.c_int(0)
+    size = ctypes.c_size_t(ctypes.sizeof(level))
+    if _libc.sysctlbyname(
+        b"kern.memorystatus_vm_pressure_level", ctypes.byref(level), ctypes.byref(size), None, 0
+    ):
+        raise OSError("sysctlbyname kern.memorystatus_vm_pressure_level failed")
+    return int(level.value)
+
+
 def sample() -> dict:
     """Current counters: cumulative events plus instantaneous compressor and swap usage."""
     stats = _VMStatistics64()
@@ -91,6 +106,7 @@ def sample() -> dict:
         compressor_bytes=stats.compressor_page_count * PAGE,
         swap_used_bytes=int(swap.used),
         major_faults=resource.getrusage(resource.RUSAGE_SELF).ru_majflt,
+        pressure_level=pressure_level(),
     )
     return result
 
