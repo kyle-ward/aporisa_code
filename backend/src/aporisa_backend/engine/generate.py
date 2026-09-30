@@ -24,6 +24,7 @@ import mlx.core as mx
 from .. import vmstats
 from .adapters.qwen38 import CALL_CLOSE, STOP_IDS, Qwen38Adapter, RenderPlan, TokenMap
 from .sessions import Session, SessionStore, cache_offset
+from .speculative import lookup_drafts
 
 PREFILL_CHUNK = 2048
 
@@ -86,10 +87,25 @@ class Settings:
     prefill_chunk: int = PREFILL_CHUNK
     # (context length from which it applies, drafts per decode round); 0 drafts: plain decoding
     draft_schedule: tuple[tuple[int, int], ...] = ((0, 0),)
+    # (context length from which it applies, most prompt-lookup drafts per round)
+    lookup_schedule: tuple[tuple[int, int], ...] = ((0, 0),)
+    lookup_min_match: int = 3
+    lookup_max_match: int = 8
+    lookup_cooldown: int = 2
+    # (context length from which it applies, fewest tokens verified via the prefill path)
+    verify_prefill_schedule: tuple[tuple[int, int], ...] = ((0, 0),)
 
     def drafts_at(self, context: int) -> int:
-        """Drafts for a round starting with `context` tokens in the cache."""
-        return next((n for start, n in reversed(self.draft_schedule) if start <= context), 0)
+        """MTP drafts for a round starting with `context` tokens in the cache."""
+        return _at(self.draft_schedule, context)
+
+    def lookups_at(self, context: int) -> int:
+        """Most prompt-lookup drafts for a round starting with `context` tokens cached."""
+        return _at(self.lookup_schedule, context)
+
+
+def _at(schedule: tuple[tuple[int, int], ...], context: int) -> int:
+    return next((n for start, n in reversed(schedule) if start <= context), 0)
 
 
 class Engine:
@@ -139,18 +155,27 @@ class Engine:
         return logits, (states if hidden else None)
 
     def _verify(self, cache: list, tokens: list[int]):
-        """Decode forward over [bonus, drafts...]: every position's logits and hidden state.
+        """Forward over [bonus, drafts...]: every position's logits and hidden state.
 
-        Single-token decoding already takes this batch-invariant path inside the model, so a
-        round with drafts computes exactly what the same tokens would one at a time (bit-equal
-        on the tiny model; B0-8 found no chunking noise on the real one).
+        Short rounds take the model's batch-invariant decode path, the one single-token
+        decoding takes. mlx-vlm computes wider blocks there as consecutive pairs, which at
+        long context costs ~60 ms per extra token (P2 profile: 16 tokens take 964 ms at
+        111K), so wide rounds take the prefill path instead, as a prompt chunk would
+        (`verify_prefill_schedule`). Both are the model's own inference paths; they differ
+        only in kernel rounding.
         """
         offset = cache_offset(cache)
-        out = self.lm._batch_invariant_decode(
-            mx.array([tokens], dtype=mx.int32),
-            cache=cache,
-            position_ids=text_positions(offset, len(tokens)),
-        )
+        ids = mx.array([tokens], dtype=mx.int32)
+        positions = text_positions(offset, len(tokens))
+        wide = _at(self.settings.verify_prefill_schedule, offset)
+        if wide and len(tokens) >= wide:
+            out = self.lm(
+                ids, cache=cache, position_ids=positions, return_hidden=True, skip_logits=True
+            )
+            hidden = out.hidden_states[0]
+            logits = self.lm.lm_head(self.lm.model.hyper_connection_mixer(hidden))[0]
+            return logits, hidden
+        out = self.lm._batch_invariant_decode(ids, cache=cache, position_ids=positions)
         return out.logits[0], out.hidden_states[-1]
 
     def _prefill(
@@ -196,7 +221,7 @@ class Engine:
             # One chunk (PLE lookup + GPU) cannot be interrupted; its duration bounds how
             # fast a cancel is confirmed.
             self._max_chunk_s = max(self._max_chunk_s, time.monotonic() - chunk_started)
-            session.tokens.extend(tokens[begin:end])
+            session.extend(tokens[begin:end])
             session.logits = logits
             if end in cuts:
                 session.snapshot(limit, self.drafter.snapshot(draft) if draft else None)
@@ -280,7 +305,9 @@ class Engine:
         sampler = Sampler(plan, self.vocab_rows, self.adapter.codec.vocab_size)
         generated: list[int] = []
         first_token_s = None
-        drafted = accepted = 0
+        # per draft source: [drafts verified, drafts accepted, rounds]
+        stats = {"mtp": [0, 0, 0], "lookup": [0, 0, 0]}
+        cooldown = 0
         decode_started = time.monotonic()
         if self.prefetcher is not None:
             self.prefetcher.touch_before_read = True
@@ -322,13 +349,7 @@ class Engine:
                 # [token, drafts...] never runs past max_output_tokens: the last position
                 # verified is the last one that could still be emitted.
                 room = plan.max_output_tokens - len(generated) - 1
-                drafts = (
-                    self.drafter.propose(
-                        draft, token, min(self.settings.drafts_at(len(session.tokens)), room)
-                    )
-                    if draft is not None
-                    else []
-                )
+                drafts, source = self._drafts(session, token, room, cooldown)
                 inputs = [token, *drafts]
                 transaction = None
                 if drafts:
@@ -351,9 +372,15 @@ class Engine:
                     if transaction is not None:
                         transaction.abort()
                     raise
-                drafted += len(drafts)
-                accepted += keep - 1
-                session.tokens.extend(inputs[:keep])
+                if source is not None:
+                    stats[source][0] += len(drafts)
+                    stats[source][1] += keep - 1
+                    stats[source][2] += 1
+                if source == "lookup" and keep == 1:
+                    cooldown = self.settings.lookup_cooldown
+                elif cooldown:
+                    cooldown -= 1
+                session.extend(inputs[:keep])
                 session.logits = logits[keep - 1]
                 if draft is not None:
                     self.drafter.observe(
@@ -371,8 +398,11 @@ class Engine:
             match, usage_base["input_tokens"], prefill_s, len(generated), decode_s, started
         )
         self.metrics["first_token_ms"] = round(first_token_s * 1000) if first_token_s else None
-        if self.drafter is not None:
-            self.metrics["mtp_accept_rate"] = round(accepted / drafted, 3) if drafted else None
+        for source, (count, kept, rounds) in stats.items():
+            if count:
+                self.metrics[f"{source}_accept_rate"] = round(kept / count, 3)
+            if source == "lookup" and rounds:
+                self.metrics["lookup_rounds"] = rounds
         if parser.failed:
             emit({"type": "failed", "code": "tool_call_invalid", "detail": parser.failed})
             return
@@ -380,6 +410,27 @@ class Engine:
             self.adapter.record(self.token_map, plan, parser.items, generated)
         reasoning = parser.reasoning_tokens if plan.thinking else 0
         emit(self._finished(status, reason, usage_base, len(generated), reasoning, self.metrics))
+
+    def _drafts(self, session, token: int, room: int, cooldown: int):
+        """(drafts, source) for the next round: a prompt-lookup copy when the context's tail
+        recurs (and lookup is not cooling down after a miss), else MTP drafts, else none."""
+        context = len(session.tokens)
+        settings = self.settings
+        lookups = min(settings.lookups_at(context), room)
+        if lookups > 0 and not cooldown:
+            drafts = lookup_drafts(
+                session.token_array(),
+                token,
+                lookups,
+                settings.lookup_min_match,
+                settings.lookup_max_match,
+            )
+            if drafts:
+                return drafts, "lookup"
+        count = min(settings.drafts_at(context), room)
+        if session.draft is not None and count > 0:
+            return self.drafter.propose(session.draft, token, count), "mtp"
+        return [], None
 
     @staticmethod
     def _finished(status, reason, base, output_tokens, reasoning_tokens, metrics) -> dict:

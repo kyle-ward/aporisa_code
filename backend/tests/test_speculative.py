@@ -17,10 +17,12 @@ real drafter still runs and keeps its state.
 from __future__ import annotations
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from conftest import ALIAS, request, user, worker_init
 
 from aporisa_backend.engine import generate as gen
+from aporisa_backend.engine.sessions import cache_offset
 from aporisa_backend.engine.speculative import MtpDrafter
 
 DRAFTS = 2
@@ -37,9 +39,11 @@ def engine(tiny_model_dir, tiny_draft_dir):
     return engine
 
 
-def run(engine, body, session=None, drafts=DRAFTS, seed=7):
-    """Messages without metrics, plus the metrics; sampling starts from a fixed seed."""
+def run(engine, body, session=None, drafts=DRAFTS, seed=7, lookups=0):
+    """Messages without metrics, plus the metrics; sampling starts from a fixed seed.
+    Prompt lookup is off unless `lookups` asks for it."""
     engine.settings.draft_schedule = ((0, drafts),)
+    engine.settings.lookup_schedule = ((0, lookups),)
     mx.random.seed(seed)
     messages: list[dict] = []
     try:
@@ -48,6 +52,7 @@ def run(engine, body, session=None, drafts=DRAFTS, seed=7):
         )
     finally:
         engine.settings.draft_schedule = ((0, DRAFTS),)
+        engine.settings.lookup_schedule = ((0, 0),)
     metrics = messages[-1].get("metrics", {})
     return [{k: v for k, v in m.items() if k != "metrics"} for m in messages], metrics
 
@@ -145,6 +150,7 @@ def test_output_limit_and_drafter_state_across_requests(engine, greedy, recorded
     session = engine.sessions.sessions["spec"]
     # At rest the drafter holds the pairs for positions 0..T-2 and the hidden state at T-1.
     assert session.draft.offset() == len(session.tokens) - 1
+    assert session.token_array().tolist() == session.tokens
     assert session.draft.pending == [] and session.draft.appended == 0
 
     retry, metrics = run(engine, body, session="spec")
@@ -156,6 +162,7 @@ def test_output_limit_and_drafter_state_across_requests(engine, greedy, recorded
     follow = {**body, "input": [*body["input"], user("and more")]}
     run(engine, follow, session="spec")
     assert session.draft.offset() == len(session.tokens) - 1
+    assert session.token_array().tolist() == session.tokens  # through restore and extend
     engine.sessions.release("spec")
 
 
@@ -167,7 +174,7 @@ def test_snapshot_without_drafter_state_disables_drafting(engine, greedy):
         snap.draft = None
     retry, metrics = run(engine, body, session="nodraft")
     assert retry[0]["restore_path"] == "snapshot"
-    assert session.draft is None and metrics["mtp_accept_rate"] is None
+    assert session.draft is None and metrics.get("mtp_accept_rate") is None
     plain, _ = run(engine, body, drafts=0)
 
     def content(messages):
@@ -204,3 +211,95 @@ def test_draft_schedule_follows_context_length():
     assert settings.drafts_at(500) == 0
     settings.draft_schedule = ((0, 2), (32_768, 1))
     assert [settings.drafts_at(n) for n in (0, 32_767, 32_768, 200_000)] == [2, 2, 1, 1]
+
+
+# --- prompt lookup (B2-3) ---------------------------------------------------------------------
+
+
+def test_lookup_prefers_the_longest_then_the_latest_match():
+    from aporisa_backend.engine.speculative import lookup_drafts
+
+    def drafts(history, bonus, count=4, low=3, high=8):
+        return lookup_drafts(np.array(history, dtype=np.int32), bonus, count, low, high)
+
+    # tail (.., 2, 3) + bonus 4: "2 3 4" occurs twice; the later one wins
+    assert drafts([2, 3, 4, 10, 11, 2, 3, 4, 20, 21, 22, 2, 3], 4) == [20, 21]
+    # a longer match (1 2 3 4) beats a later shorter one (2 3 4), and drafts more
+    assert drafts([1, 2, 3, 4, 30, 9, 8, 7, 2, 3, 4, 40, 1, 2, 3], 4) == [30, 9, 8, 7]
+    assert drafts([7, 8, 9, 5, 7, 8], 9, count=1) == [5]  # capped by count
+    assert drafts([7, 8, 9, 5, 1, 8], 9) == []  # tail "1 8 9" never occurred
+    assert drafts([7, 8, 9, 5, 1, 8], 9, low=2) == [5, 1]  # "8 9" is enough at 2
+    assert drafts([], 9) == [] and drafts([7, 8, 9], 9, count=0) == []
+
+
+def test_lookup_drafts_more_the_longer_the_match():
+    from aporisa_backend.engine.speculative import lookup_drafts
+
+    span = list(range(100, 140))
+    for matched, expected in ((3, 2), (4, 4), (5, 8), (6, 16), (7, 32), (8, 32)):
+        # the context ends with span[:matched]: the bonus is span[matched - 1]
+        context = np.array([*span, 1, 2, *span[: matched - 1]], dtype=np.int32)
+        got = lookup_drafts(context, span[matched - 1], 32, 3, 8)
+        assert got == span[matched : matched + expected], matched
+
+
+@pytest.fixture
+def script(monkeypatch, engine):
+    """script(text): generations sample exactly these tokens (whatever the logits say)."""
+
+    def use(text: str):
+        tokens = engine.adapter.codec.encode(text)
+        state = {"index": 0}
+
+        def sample(self, logits):
+            token = tokens[min(state["index"], len(tokens) - 1)]
+            state["index"] += 1
+            return token
+
+        monkeypatch.setattr(gen.Sampler, "__call__", sample)
+        return tokens
+
+    return use
+
+
+PASSAGE = (
+    "def resolve(layout, identity):\n"
+    "    records = [read(path) for path in layout.records.glob('*.json')]\n"
+    "    matches = [r for r in records if r['identity'] == identity]\n"
+    "    if len(matches) != 1:\n"
+    "        raise ValueError('the identity has no unique record')\n"
+    "    return matches[0]\n"
+)
+
+
+def test_lookup_drafts_copy_from_the_context(engine, script):
+    body = request(
+        "Repeat this function exactly:\n\n" + PASSAGE,
+        max_output_tokens=200,
+        reasoning={"effort": "none"},
+    )
+    reply = PASSAGE + "<|im_end|>"
+    script(reply)
+    plain, _ = run(engine, body, drafts=0)
+    script(reply)
+    copied, metrics = run(engine, body, drafts=0, lookups=8)
+    assert copied == plain  # the sampler decides every token; lookup only batches them
+    assert metrics["lookup_rounds"] > 0 and metrics["lookup_accept_rate"] > 0.6
+    assert copied[-1]["usage"]["output_tokens"] == len(engine.adapter.codec.encode(reply))
+    # with MTP too: lookup wins where the context repeats, MTP drafts elsewhere
+    script(reply)
+    combined, metrics = run(engine, body, lookups=8)
+    assert combined == plain and metrics["lookup_rounds"] > 0
+
+    # wide rounds through the prefill path: same tokens, caches still aligned
+    engine.settings.verify_prefill_schedule = ((0, 3),)
+    try:
+        script(reply)
+        wide, metrics = run(engine, body, session="wide", lookups=8)
+    finally:
+        engine.settings.verify_prefill_schedule = ((0, 0),)
+    assert wide[1:] == plain[1:] and metrics["lookup_rounds"] > 0
+    session = engine.sessions.sessions["wide"]
+    assert session.draft.offset() == len(session.tokens) - 1
+    assert cache_offset(session.cache) == len(session.tokens)
+    engine.sessions.release("wide")

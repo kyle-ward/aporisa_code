@@ -15,12 +15,16 @@ with the key and port from backend/.env. Default checks take a few minutes:
   effort switch a trailing configuration_update to none produces no reasoning
   speculative   MTP (B2-2): decode speed with drafts against B0-10's plain decoding, and
                 the draft acceptance rate, in effort none and medium
+  lookup        prompt lookup (B2-3): a code edit that copies a file, decoding at least
+                twice B0-10's plain speed with lookup drafts in use
   runtime       /health/runtime includes the worker's view
 
 --long TOKENS adds the B1-10 acceptance: one cold prefill of about TOKENS tokens (server
 prefill speed against B0-5's compute-only speed) and a continuation on top of it, with
 swap usage required not to grow; then a longer answer on the same context, whose decode
-speed (with MTP) must not fall below B0-5's plain decoding at that length. System memory
+speed (with MTP) must not fall below B0-5's plain decoding at that length, and a code edit
+on that context whose decode speed (with prompt lookup) must be at least twice B0-5's plain
+decoding. System memory
 (compressor, swap, free) is sampled every second and each check records the memory pressure
 it caused. Results (numbers only, never text) are appended to
 .runtime/validation/validate_<time>.jsonl.
@@ -62,6 +66,10 @@ PREFILL_RATIO_REQUIRED = 0.8
 B0_PLAIN_DECODE_TOK_S = 30.7
 MTP_SPEEDUP_REQUIRED = 1.3
 MTP_MIN_OUTPUT_TOKENS = 128
+# B2-3: copying a file with prompt-lookup drafts (P2 profile: 4.5-5.5x plain decoding).
+LOOKUP_SPEEDUP_REQUIRED = 2.0
+LOOKUP_MIN_OUTPUT_TOKENS = 400
+EDIT_FILE = ROOT / "backend" / "src" / "aporisa_backend" / "engine" / "tokens.py"
 SWAP_GROWTH_ALLOWED = 256 * 1024**2
 
 TOOLS = [
@@ -372,6 +380,54 @@ class Validator:
             f"B0-10 plain {B0_PLAIN_DECODE_TOK_S} tok/s.",
         )
 
+    def edit_request(self, history: list[dict]) -> dict:
+        source = EDIT_FILE.read_text()
+        instruction = (
+            "Here is a Python file:\n\n```python\n" + source + "```\n\n"
+            "Rewrite the complete file with the class `Codec` renamed to `TokenCodec` "
+            "everywhere and nothing else changed. Output only the complete file in one "
+            "code block."
+        )
+        return self.request(
+            [*history, user(instruction)], reasoning={"effort": "none"}, max_output_tokens=1200
+        )
+
+    async def edit(self, client, body: dict) -> dict:
+        """Streams a code edit; returns the worker's metrics for it plus the output length."""
+        response, _ = await self.stream(client, body)
+        status = response["status"]
+        check(status in ("completed", "incomplete"), f"status {status}")
+        last = (await self.runtime(client))["worker"]["last"]
+        return {
+            "output_tokens": response["usage"]["output_tokens"],
+            "decode_tok_s": last.get("decode_tok_s") or 0,
+            "lookup_rounds": last.get("lookup_rounds") or 0,
+            "lookup_accept_rate": last.get("lookup_accept_rate"),
+            "mtp_accept_rate": last.get("mtp_accept_rate"),
+        }
+
+    async def lookup(self, client):
+        result = await self.edit(client, self.edit_request([]))
+        required = B0_PLAIN_DECODE_TOK_S * LOOKUP_SPEEDUP_REQUIRED
+        self.record("lookup.edit", **result)
+        check(result["lookup_rounds"] > 0, "no prompt-lookup drafts were verified")
+        check(
+            result["output_tokens"] >= LOOKUP_MIN_OUTPUT_TOKENS,
+            f"only {result['output_tokens']} tokens",
+        )
+        check(
+            result["decode_tok_s"] >= required,
+            f"decode {result['decode_tok_s']:.1f} tok/s < {required:.1f} "
+            f"({LOOKUP_SPEEDUP_REQUIRED}x B0-10 plain)",
+        )
+        self.record("lookup", passed=True)
+        emit(
+            "READY",
+            f"Prompt lookup passed: code edit at {result['decode_tok_s']:.1f} tok/s "
+            f"({result['lookup_rounds']} lookup rounds, accept "
+            f"{result['lookup_accept_rate']}); B0-10 plain {B0_PLAIN_DECODE_TOK_S} tok/s.",
+        )
+
     async def runtime_status(self, client):
         status = await self.runtime(client)
         worker = status.get("worker")
@@ -439,13 +495,19 @@ class Validator:
         decode_speed = decoded.get("decode_tok_s") or 0
         decode_reference = _reference(count, B0_DECODE)
         long_output = third["usage"]["output_tokens"]
+        # A code edit on the same context: prompt lookup at long context (B2-3).
+        edit_history = [*answer["input"], *as_input(third["output"])]
+        edited = await self.edit(client, self.edit_request(edit_history))
+        edit_required = decode_reference * LOOKUP_SPEEDUP_REQUIRED
         self.record(
             "long_context",
             passed=ratio >= PREFILL_RATIO_REQUIRED
             and cached >= first["usage"]["input_tokens"]
             and swap_growth < SWAP_GROWTH_ALLOWED
             and long_output >= LONG_DECODE_MIN_TOKENS
-            and decode_speed >= decode_reference,
+            and decode_speed >= decode_reference
+            and edited["lookup_rounds"] > 0
+            and edited["decode_tok_s"] >= edit_required,
             input_tokens=first["usage"]["input_tokens"],
             prefill_tok_s=speed,
             b0_compute_tok_s=round(reference),
@@ -461,6 +523,10 @@ class Validator:
             decode_tok_s=decode_speed,
             b0_plain_decode_tok_s=round(decode_reference, 1),
             mtp_accept_rate=decoded.get("mtp_accept_rate"),
+            edit_output_tokens=edited["output_tokens"],
+            edit_decode_tok_s=edited["decode_tok_s"],
+            edit_lookup_rounds=edited["lookup_rounds"],
+            edit_lookup_accept_rate=edited["lookup_accept_rate"],
         )
         check(
             ratio >= PREFILL_RATIO_REQUIRED,
@@ -474,11 +540,17 @@ class Validator:
             f"decode {decode_speed:.1f} tok/s at {count} tokens is below B0-5 plain "
             f"{decode_reference:.1f}",
         )
+        check(edited["lookup_rounds"] > 0, "long-context code edit used no lookup drafts")
+        check(
+            edited["decode_tok_s"] >= edit_required,
+            f"long-context code edit {edited['decode_tok_s']:.1f} tok/s < {edit_required:.1f}",
+        )
         emit(
             "READY",
             f"Long context passed: {count} tokens at {speed:.0f} tok/s ({ratio:.0%} of B0-5 "
             f"compute-only {reference:.0f}); continuation TTFT {ttft_warm or 0:.2f}s; "
             f"decode {decode_speed:.1f} tok/s (B0-5 plain {decode_reference:.1f}); "
+            f"code edit {edited['decode_tok_s']:.1f} tok/s with lookup; "
             f"swap growth {swap_growth / 1024**2:.0f} MiB.",
         )
 
@@ -541,6 +613,7 @@ async def main() -> int:
             ("websocket", validator.websocket(client)),
             ("effort_switch", validator.effort_switch(client)),
             ("speculative", validator.speculative(client)),
+            ("lookup", validator.lookup(client)),
             ("runtime", validator.runtime_status(client)),
         ]
         for name, coroutine in checks:

@@ -43,6 +43,17 @@ class ModelProfile:
     # from 16K on a round drafts one token; below, two (B0-10's short-context winner).
     draft_identity: str | None = None
     draft_schedule: tuple[tuple[int, int], ...] = ()
+    # Prompt lookup (B2-3): (context length from which it applies, most lookup drafts one
+    # round verifies). Copies from the context are long when they hit, but how many tokens
+    # one verify can cover cheaply depends on the model (P1: 3 tokens cost ~200 ms at 111K).
+    # An empty schedule or 0 turns lookup off at that length; MTP drafts then apply.
+    lookup_schedule: tuple[tuple[int, int], ...] = ()
+    # (context length from which it applies, fewest tokens a round verifies through the
+    # prefill path instead of the decode path; 0: never). P2 profile on affine4g64: the
+    # decode path computes wider blocks as consecutive pairs, 3/8/16 tokens cost 205/572/
+    # 1000 ms at 111K against 67/86/107 ms through the prefill path; below 16K the decode
+    # path is 5-6 ms faster for 3-4 tokens (MTP's two-draft rounds) and even from 8 on.
+    verify_prefill_schedule: tuple[tuple[int, int], ...] = ()
     # KV bytes per context token the draft model adds: its one attention layer against the
     # target's 12 (28,560 / 12). Only feeds the session estimate.
     draft_kv_bytes_per_token: int = 0
@@ -66,6 +77,14 @@ class ModelProfile:
             or any(count < 1 for _, count in schedule)
         ):
             raise ValueError("draft_schedule starts at 0, ascends and drafts at least one")
+        for name in ("lookup_schedule", "verify_prefill_schedule"):
+            steps = getattr(self, name)
+            if steps and (
+                steps[0][0] != 0
+                or any(a[0] >= b[0] for a, b in zip(steps, steps[1:], strict=False))
+                or any(count < 0 for _, count in steps)
+            ):
+                raise ValueError(f"{name} starts at 0 and ascends")
 
 
 CAPABILITY_NAMES = (
@@ -113,6 +132,10 @@ PROFILES: dict[str, ModelProfile] = {
         wired_limit_mb=87_040,
         draft_identity="Qwen3.8-Flash-Next-affine4g64-mtp",
         draft_schedule=((0, 2), (16_384, 1)),
+        # P2 profile (code edit, ~730 copied tokens): at most 32 lookup drafts beat 16 by
+        # ~12% at every length (138/129/116 tok/s at short/16K/111K context).
+        lookup_schedule=((0, 32),),
+        verify_prefill_schedule=((0, 8), (16_384, 3)),
         draft_kv_bytes_per_token=2_380,
     )
     for identity in ("Qwen3.8-Flash-Next-affine4g64",)

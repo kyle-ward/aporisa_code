@@ -71,6 +71,15 @@ def load(init: dict) -> Engine:
             draft_schedule=tuple(tuple(step) for step in init.get("draft_schedule") or ())
             if drafter is not None
             else ((0, 0),),
+            lookup_schedule=tuple(tuple(step) for step in init.get("lookup_schedule") or ())
+            or ((0, 0),),
+            verify_prefill_schedule=tuple(
+                tuple(step) for step in init.get("verify_prefill_schedule") or ()
+            )
+            or ((0, 0),),
+            lookup_min_match=config.lookup_min_match,
+            lookup_max_match=config.lookup_max_match,
+            lookup_cooldown=config.lookup_cooldown,
         ),
         prefetcher,
         drafter,
@@ -81,6 +90,7 @@ def load(init: dict) -> Engine:
         "snapshot_budget_bytes": sessions.budget_bytes,
         "ple_prefetch": prefetcher is not None,
         "draft_schedule": [list(step) for step in engine.settings.draft_schedule],
+        "lookup_schedule": [list(step) for step in engine.settings.lookup_schedule],
         "released_cache_bytes": released,
     }
     engine.model_ref = model  # keeps the vision tower and config alive with the process
@@ -241,6 +251,7 @@ def warmup(engine: Engine, alias: str) -> None:
         and text["type"] == "finished"
         and text["usage"]["output_tokens"] > 1
         and engine.metrics.get("mtp_accept_rate") is None
+        and engine.metrics.get("lookup_accept_rate") is None
     ):
         raise WarmupError("speculative decoding: no drafts were verified")
     tools = [

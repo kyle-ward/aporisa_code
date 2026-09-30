@@ -105,6 +105,10 @@ class ProcessWorker(WorkerClient):
                 "kv_bytes_per_token": self.profile.kv_bytes_per_token,
                 "draft_dir": str(self.draft_dir) if self.draft_dir is not None else None,
                 "draft_schedule": [list(step) for step in self.profile.draft_schedule],
+                "lookup_schedule": [list(step) for step in self.profile.lookup_schedule],
+                "verify_prefill_schedule": [
+                    list(step) for step in self.profile.verify_prefill_schedule
+                ],
                 "draft_kv_bytes_per_token": self.profile.draft_kv_bytes_per_token,
                 "snapshot_budget_bytes": self.snapshot_budget_bytes,
                 "engine": self.engine.as_dict(),

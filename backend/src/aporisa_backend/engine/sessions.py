@@ -27,6 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import mlx.core as mx
+import numpy as np
 
 GIB = 1024**3
 
@@ -76,6 +77,22 @@ class Session:
     last_used: float = field(default_factory=time.monotonic)
     busy: bool = False
     draft: object | None = None  # speculative.DraftState when the drafter can follow
+    # tokens as int32 for prompt lookup (speculative.lookup_drafts). Valid up to
+    # len(tokens): restore and cold starts only shorten `tokens`, and every append goes
+    # through extend(), which writes at len(tokens).
+    ids: np.ndarray = field(default_factory=lambda: np.zeros(4096, dtype=np.int32))
+
+    def extend(self, tokens: list[int]) -> None:
+        start, end = len(self.tokens), len(self.tokens) + len(tokens)
+        if end > self.ids.size:
+            grown = np.zeros(max(end, 2 * self.ids.size), dtype=np.int32)
+            grown[:start] = self.ids[:start]
+            self.ids = grown
+        self.ids[start:end] = tokens
+        self.tokens.extend(tokens)
+
+    def token_array(self) -> np.ndarray:
+        return self.ids[: len(self.tokens)]
 
     def nbytes(self) -> int:
         draft = self.draft.nbytes() if self.draft is not None else 0

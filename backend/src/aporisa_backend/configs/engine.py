@@ -32,6 +32,13 @@ class EngineConfig:
     # kernel's memory pressure this often and drops idle sessions (LRU) while it is at warn
     # or worse; a request starting under pressure drops them first too.
     idle_pressure_check_s: float = 5.0
+    # Prompt lookup (B2-3): the context's tail must match an earlier span over at least
+    # lookup_min_match tokens (3: shorter tails such as "    return" recur everywhere);
+    # matching compares up to lookup_max_match. After a lookup round accepts nothing, the
+    # next lookup_cooldown rounds use MTP drafts instead.
+    lookup_min_match: int = 3
+    lookup_max_match: int = 8
+    lookup_cooldown: int = 2
     ple_threads: int = 64
     # Soft RLIMIT_NOFILE the gateway and worker raise themselves to. launchd's default is 256;
     # the external PLE table alone holds 384 memmaps (128 shards x 3 tensors).

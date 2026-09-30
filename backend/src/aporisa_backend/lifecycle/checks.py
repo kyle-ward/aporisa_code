@@ -106,6 +106,10 @@ def wired_limit_mb() -> int | None:
         return None
 
 
+def _schedule(steps) -> str:
+    return ", ".join(f"{count} from {start}" for start, count in steps) or "none"
+
+
 def model_check(root: Path, report: Report, *, full: bool, progress: bool = False):
     """Pointer -> identity -> record -> inventory. Returns the Selection when usable."""
     from .artifacts import select, verify_assets
@@ -136,9 +140,9 @@ def model_check(root: Path, report: Report, *, full: bool, progress: bool = Fals
             f"MTP draft model: {selection.draft.identity} "
             f"({selection.draft.record['directory']}/{selection.draft.record['version']}), "
             "drafts per decode round by context length: "
-            + ", ".join(
-                f"{count} from {start}" for start, count in selection.profile.draft_schedule
-            )
+            + _schedule(selection.profile.draft_schedule)
+            + "; prompt-lookup drafts at most "
+            + _schedule(selection.profile.lookup_schedule)
             + ".",
         )
     limit = wired_limit_mb()

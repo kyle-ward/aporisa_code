@@ -1,4 +1,4 @@
-"""MTP speculative decoding: the draft side (B2-2, DEVELOPMENT_PLAN.md 7).
+"""Speculative decoding, the draft side: the MTP head (B2-2) and prompt lookup (B2-3).
 
 The model's native MTP head is a one-layer model that predicts the token after next from
 (embedding of token t+1, target hidden state at t). It keeps its own small KV cache, one
@@ -24,6 +24,52 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import mlx.core as mx
+import numpy as np
+
+
+def lookup_drafts(
+    history: np.ndarray, bonus: int, count: int, min_match: int, max_match: int
+) -> list[int]:
+    """Prompt lookup (B2-3): drafts copied from the context.
+
+    The context is `history` (the tokens in the cache) followed by `bonus` (sampled, not
+    yet in the cache). Finds the earlier position whose preceding tokens match the context's
+    tail longest (at least `min_match`, at most `max_match` tokens; the most recent among
+    equals) and returns the tokens that followed it. Editing and quoting code repeat long
+    spans of files already in the context, which the target then accepts in a single verify.
+
+    How many: 2 for a match of `min_match` tokens, doubling with each further matched token,
+    at most `count`. Ordinary text repeats short phrases too; such false hits matched 3-4
+    tokens and were almost never accepted (P2 validation: 0-9%), yet each one verified up to
+    32 tokens instead of an MTP round. A real copy reaches the longest match within a few
+    tokens, so it still drafts `count` per round. Vectorized over the whole context: well
+    under a millisecond at 262K.
+    """
+    size = history.size
+    if count <= 0 or size + 1 < min_match:
+        return []
+    ends = np.flatnonzero(history == bonus)  # candidate windows end here, like the tail
+    if ends.size == 0:
+        return []
+    length = np.ones(ends.size, dtype=np.int32)
+    alive = np.ones(ends.size, dtype=bool)
+    for back in range(1, max_match):
+        if back > size:
+            break
+        index = ends - back
+        alive &= (index >= 0) & (history[np.maximum(index, 0)] == history[size - back])
+        if not alive.any():
+            break
+        length += alive
+    best = int(length.max())
+    if best < min_match:
+        return []
+    end = int(ends[np.flatnonzero(length == best)[-1]])
+    count = min(count, 2 ** (best - min_match + 1))
+    follow = history[end + 1 : end + 1 + count].tolist()
+    if len(follow) < count and end + 1 + len(follow) == size:
+        follow.append(bonus)  # the window ends right before the tail: it repeats itself
+    return [int(t) for t in follow]
 
 
 @dataclass

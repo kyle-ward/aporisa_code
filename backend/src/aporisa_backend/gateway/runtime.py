@@ -393,6 +393,8 @@ class ResponseRun:
             prefill_tok_s=metrics.get("prefill_tok_s"),
             decode_tok_s=metrics.get("decode_tok_s"),
             mtp_accept_rate=metrics.get("mtp_accept_rate"),
+            lookup_accept_rate=metrics.get("lookup_accept_rate"),
+            lookup_rounds=metrics.get("lookup_rounds"),
             peak_memory_gb=round(peak / 1024**3, 1) if peak else None,
             queue_ms=self.queue_ms,
             **{

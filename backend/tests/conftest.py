@@ -191,6 +191,8 @@ def worker_init(model_dir, **overrides) -> dict:
         "kv_bytes_per_token": PROFILE.kv_bytes_per_token,
         "draft_dir": None,
         "draft_schedule": [list(step) for step in PROFILE.draft_schedule],
+        "lookup_schedule": [list(step) for step in PROFILE.lookup_schedule],
+        "verify_prefill_schedule": [list(step) for step in PROFILE.verify_prefill_schedule],
         "draft_kv_bytes_per_token": PROFILE.draft_kv_bytes_per_token,
         "snapshot_budget_bytes": 2 * 1024**3,
         "engine": ENGINE.as_dict(),
