@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__LABEL__</string>
+	<key>Disabled</key>
+	<false/>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>UserName</key>
+	<string>__RUN_USER__</string>
+	<key>GroupName</key>
+	<string>__RUN_GROUP__</string>
+	<key>WorkingDirectory</key>
+	<string>__PROJECT_ROOT__</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__ENTRYPOINT__</string>
+		<string>backend</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>__SERVICE_PATH__</string>
+		<key>HOME</key>
+		<string>__RUN_HOME__</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<key>ExitTimeOut</key>
+	<integer>90</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>Umask</key>
+	<integer>63</integer>
+</dict>
+</plist>

@@ -73,6 +73,64 @@ def _quant_predicate(path: str, _module):
     return True
 
 
+def _bf16_model(config: dict):
+    import mlx.core as mx
+    from mlx.utils import tree_map
+    from mlx_vlm.models.qwen4_exp import Model, ModelConfig
+
+    mx.random.seed(0)
+    model = Model(ModelConfig.from_dict(config))
+    model.update(
+        tree_map(
+            lambda v: v.astype(mx.bfloat16) if mx.issubdtype(v.dtype, mx.floating) else v,
+            model.parameters(),
+        )
+    )
+    return model
+
+
+def build_fp8(source: Path, target: Path) -> Path:
+    """A tiny checkpoint in the official FP8 layout: per-expert E4M3 weights with 128x128
+    `weight_scale_inv` blocks, as in Qwen/Qwen3.8-Flash-Next-FP8, plus a LICENSE."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    config = tiny_config(source)
+    weights = dict(tree_flatten(_bf16_model(config).parameters()))
+    block = 128
+    for key in [k for k in weights if ".mlp.switch_mlp." in k and k.endswith(".weight")]:
+        stacked = weights.pop(key).astype(mx.float32)
+        layer = key.split(".layers.")[1].split(".")[0]
+        projection = key.split(".switch_mlp.")[1].split(".")[0]
+        for expert in range(stacked.shape[0]):
+            w = stacked[expert]
+            rows, cols = w.shape
+            br, bc = -(-rows // block), -(-cols // block)
+            padded = mx.pad(w, ((0, br * block - rows), (0, bc * block - cols)))
+            blocks = padded.reshape(br, block, bc, block)
+            scale = mx.maximum(mx.abs(blocks).max(axis=(1, 3)), 1e-8) / 448.0
+            q = (blocks / scale[:, None, :, None]).reshape(br * block, bc * block)[:rows, :cols]
+            name = f"model.language_model.layers.{layer}.mlp.experts.{expert}.{projection}.weight"
+            weights[name] = mx.to_fp8(q)
+            weights[name + "_scale_inv"] = scale
+    target.mkdir(parents=True)
+    mx.save_safetensors(str(target / "model.safetensors"), weights, metadata={"format": "pt"})
+    (target / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": {k: "model.safetensors" for k in weights}})
+    )
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    (target / "config.json").write_text(json.dumps(config, indent=1))
+    for name in TOKENIZER_FILES:
+        if (source / name).is_file():
+            shutil.copy2(source / name, target / name)
+    (target / "LICENSE").write_text("Tiny test checkpoint; stands in for the upstream notice.\n")
+    return target
+
+
 def build(source: Path, root: Path) -> Path:
     """Writes <root>/bf16, <root>/q4 and returns the external-PLE view <root>/q4-extple."""
     import mlx.core as mx

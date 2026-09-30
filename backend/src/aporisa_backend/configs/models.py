@@ -28,6 +28,9 @@ class ModelProfile:
     wired_limit_mb: int
     # KV bytes per context token, for the snapshot budget (B0-8 measured 28,560 on affine4g64).
     kv_bytes_per_token: int = 28_560
+    # Startup waits (WAIT) below this much available memory: resident weights (66.8 GiB for
+    # affine4g64) plus room for activations and a working context.
+    min_available_memory_gib: int = 72
     effective_context_window_percent: int = 95
     auto_compact_token_limit: int | None = None
     truncation_policy: dict = field(default_factory=lambda: {"mode": "bytes", "limit": 10_000})
@@ -66,7 +69,8 @@ _FLASH_NEXT_CAPABILITIES = {
 
 MODEL_LIST: tuple[str, ...] = (
     "Qwen3.8-Flash-Next-affine4g64",
-    "Qwen3.8-Flash-Next-mxfp4",
+    # MTP draft model converted with the same recipe; used by B2-2, never served on its own.
+    "Qwen3.8-Flash-Next-affine4g64-mtp",
 )
 
 POINTERS: dict[str, str | None] = {
@@ -83,7 +87,7 @@ PROFILES: dict[str, ModelProfile] = {
         capabilities=dict(_FLASH_NEXT_CAPABILITIES),
         wired_limit_mb=87_040,
     )
-    for identity in MODEL_LIST
+    for identity in ("Qwen3.8-Flash-Next-affine4g64",)
 }
 
 

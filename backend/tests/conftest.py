@@ -158,6 +158,18 @@ def tiny_model_dir(tmp_path_factory):
     return tiny_model.build(MODEL_DIR, tmp_path_factory.mktemp("tiny"))
 
 
+@pytest.fixture(scope="session")
+def tiny_fp8_dir(tmp_path_factory):
+    """A tiny checkpoint in the official FP8 layout (tests/tiny_model.py)."""
+    from assets import MODEL_DIR
+
+    if not (MODEL_DIR / "tokenizer.json").is_file():
+        pytest.skip(f"local model files not found under {MODEL_DIR}")
+    import tiny_model
+
+    return tiny_model.build_fp8(MODEL_DIR, tmp_path_factory.mktemp("tiny-fp8") / "checkpoint")
+
+
 def worker_init(model_dir, **overrides) -> dict:
     """The init frame the gateway sends a worker, for in-process engine tests."""
     from aporisa_backend.configs.engine import ENGINE

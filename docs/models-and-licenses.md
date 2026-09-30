@@ -1,8 +1,8 @@
 # 模型、上游来源与许可证
 
-本文记录后端使用的模型、上游来源、本地派生产物和许可证要点。模型配置指针（`MODEL_LIST` / `POINTERS` / `PROFILES`）和权重维护入口在 B1-2 实现后，由 `docs/model-management.md` 描述；在那之前，下表就是唯一的记录。
+本文记录后端使用的模型、上游来源、本地派生产物和许可证要点。模型配置指针（`MODEL_LIST` / `POINTERS` / `PROFILES`）和权重维护入口见 [model-management.md](model-management.md)；本地权重的唯一记录是 `.runtime/model-assets/` 下的身份记录。
 
-> **当前状态（2026-09-30）**：后端处于 B0 探路阶段，还没有服务在运行。下面的派生产物由 B0 的一次性脚本生成，尚未登记为正式的模型身份（B1-2）。
+> **当前状态（2026-09-30）**：下面的派生产物由 B0 的一次性脚本生成。B1 P3 提供了迁移脚本 `scripts/migrate_b0_artifacts.py`，把服务使用的产物和 MTP 登记为正式身份（`Qwen3.8-Flash-Next-affine4g64`、`Qwen3.8-Flash-Next-affine4g64-mtp`）；以后的转换使用 `model_weights.sh convert`，配方相同。mxfp4 产物、B0 的旧目录和官方 FP8 checkpoint 都已于 2026-09-30 删除；需要重新转换时，按身份记录中的仓库和 revision 重新下载 FP8。
 
 ## 模型
 

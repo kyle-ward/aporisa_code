@@ -12,4 +12,4 @@ def emit(tag: str, message: str) -> None:
         raise ValueError(f"unknown console tag {tag!r}")
     prefix = "ERROR:" if tag == "ERROR" else f"[{tag}]"
     stream = sys.stderr if tag in {"SYSTEM", "MANUAL", "REPAIRABLE", "ERROR"} else sys.stdout
-    print(f"[Aporisa] {prefix} {message}", file=stream, flush=True)
+    print(f"[Aporisa Code] {prefix} {message}", file=stream, flush=True)

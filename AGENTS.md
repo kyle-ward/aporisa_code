@@ -32,7 +32,7 @@
 ## 当前阶段
 
 - 前端：F0（合同 v0）和 F1（SDK、mock、一致性测试）已经完成，下一阶段是 F2（OpenRouter 兼容 driver）。
-- 后端：B0（探路与实测）已经完成，B1（协议核心）实现中，设计见 `backend/DEVELOPMENT_PLAN.md` 第 14 节。
+- 后端：B0（探路与实测）已经完成，B1（协议核心）实现中：P1、P2、P3 已完成，下一步是 P4（可观测性、`validate_runtime.py`）。设计见 `backend/DEVELOPMENT_PLAN.md` 第 14 节。
 - 已验证的范围见 `docs/validation.md`。
 - 新能力在实现并验收之前，一律不得声称已经实现。文档中「目标规范」和「当前实现状态」必须分开写。
 
@@ -130,7 +130,7 @@
 - `.env` 只放部署差异。稳定、非敏感的策略按主题拆分到各自的 `configs/` 模块，随代码一起评审。
 - 新增环境变量前，先证明它确实是部署差异而不是工程调参，并同步更新 `.env.example`、脚本、测试和文档。
 - 文件日志使用 JSONL，字段走固定的白名单。不记录提示词、生成正文、思考内容、工具输出、文件内容、密钥、请求头或原始 URL。
-- 控制台输出使用分类标签，不输出 JSON：`[Aporisa] [READY] / [INFO] / [WAIT] / [REPAIRABLE] / [SYSTEM] / [MANUAL]` 以及 `ERROR:`。
+- 控制台输出使用分类标签，不输出 JSON：`[Aporisa Code] [READY] / [INFO] / [WAIT] / [REPAIRABLE] / [SYSTEM] / [MANUAL]` 以及 `ERROR:`。
 - 开发期经 OpenRouter 发出的内容会离开本机，只使用测试内容。
 
 ## 工具链

@@ -49,7 +49,7 @@ check_backend() {
   cd "$APORISA_ROOT/backend"
   export PYTHONDONTWRITEBYTECODE=1
   aporisa_log INFO "Backend: lint"
-  "$python" -m ruff check --config pyproject.toml .
+  "$python" -m ruff check --config pyproject.toml . ../scripts
   if compgen -G "tests/test_*.py" >/dev/null; then
     aporisa_log INFO "Backend: tests"
     "$python" -m pytest -q

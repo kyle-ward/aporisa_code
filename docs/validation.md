@@ -2,6 +2,32 @@
 
 本文只记录已经实际运行过的检查，以及明确尚未验证的事项。预期不写成结果，替身测试也不代替真实验收。
 
+## B1 P3：生命周期与权重维护（2026-09-30，Mac Studio）
+
+范围：`backend_service.sh`（`scripts/backend_service.sh`、`macos_service.sh`、`service_entrypoint.sh`、`backend.sh`、`lifecycle.py`、plist 模板）、`model_weights.sh`（`lifecycle/weights.py`、`recipes.py`、`assets.py`）、共用检查与收据（`lifecycle/checks.py`、`artifacts.py`、`dependencies.py`、`service_guard.py`、`cli.py`）、B0 产物迁移脚本、`backend/.env.example`；删除了 `dev_serve.py`。设计见 DEVELOPMENT_PLAN 第 14.6 节（用户确认的 6 项决策）。
+
+**agent 已验证（开发期运行单个测试文件，不是 CI 门禁）**
+- 后端全部 93 个测试通过，ruff 通过（`check.sh backend` 现在也检查 `scripts/*.py`）。新增：
+  - 权重 8 个：身份记录的校验（版本与来源一致、路径穿越、转换来源必须带上游仓库和 revision）、目录命名、共享与独占租约、快速校验与完整校验的区别（同大小改一个字节只有完整校验能发现）；用本地假 Hub 测下载的发布、离线复用、换源拒绝、租约冲突、删除、以及登记已存在的目录；用很小的 FP8 checkpoint 走完 `convert`（产物自包含、删除源身份后仍能加载并预热、重复转换直接跳过）；用同样的小模型模拟 B0 布局跑迁移脚本（dry-run 不改任何东西、登记两个身份、B0 目录原样保留、硬链接不复制、重复运行幂等、删除 B0 目录后仍能加载并预热）。
+  - 生命周期 8 个：`.env` 检查、源码收据过期、模型检查的分级（未 prepare 为 REPAIRABLE、改动小文件为 MANUAL、wired 上限不足为 MANUAL、没有记录为 MANUAL）、服务标签、入口脚本的 help 和参数错误、plist 模板合法。
+- 在真实 checkout 上只读运行：
+  - `./model_weights.sh list`：B0 的 4 个目录显示为 unmanaged（尚未迁移）。
+  - `./scripts/backend.sh doctor`：平台、存储、依赖 READY；缺少 `backend/.env`（MANUAL）、没有 prepare 收据（REPAIRABLE）、指针引用的身份没有记录（MANUAL），分类符合预期。
+  - `./backend_service.sh status`：`UNINSTALLED`。
+  - 迁移脚本 `--dry-run`：真实 B0 checkpoint 的配方、工具版本和张量布局都核对通过。
+
+**用户验收（进行中）**
+- `./scripts/check.sh backend` 通过（93 个测试）。
+- 迁移脚本：dry-run 与正式运行都成功，登记了 `Qwen3.8-Flash-Next-affine4g64`（35 个文件）和 `Qwen3.8-Flash-Next-affine4g64-mtp`（7 个文件）；`list` 显示两个身份，B0 的 4 个目录仍为 unmanaged。
+- `prepare`（完整 SHA256 校验通过）、`doctor`、`install`（`REGISTERED_IDLE`）都成功。
+- **首次 `start` 失败**：worker 加载外置 PLE 表时报 `Too many open files`。原因是 launchd 给守护进程的文件描述符软上限只有 256，而 PLE 表有 128 个分片 × 3 个张量 = 384 个 memmap，每个都占一个描述符；终端里的上限是 1048576，所以用 `dev_serve` 在终端启动时没有暴露。修复：网关的 `run` 和 worker 启动时把软上限提高到 65536（不超过 hard limit，不需要特权）。agent 在真实 PLE 清单上复现：软上限 256 时打开失败，提高后 128 个分片全部打开；新增 1 个测试，后端 94 个测试通过。
+- 修复后：用户再次运行 `check.sh backend`（94 个测试）通过；`stop` 把 FAILED 的 job 清理为 `STOPPED`；`prepare` 重新完整校验并写入收据；**`start` 就绪**（`READY`，worker 加载加预热 21.0 秒，权重在页缓存中）。
+- 对**系统服务**运行一致性测试 **W01–W24 全部通过**。服务日志中：峰值内存 67.9–68.7 GiB，短 prompt 下解码约 31.5 tok/s、首 token 约 145 ms。
+- `stop`：job 和进程树（含 worker）全部退出，状态 `STOPPED`，plist 保留；`uninstall` 后为 `UNINSTALLED`，模型、配置和日志保留；agent 复查没有残留的后端进程。
+- 按实测把 start 的等待上限从 900 秒改为 300 秒（给开机冷启动读盘留余量）。
+- 用户随后用 `model_weights.sh delete` 删除了 B0 的 3 个旧目录和官方 FP8 checkpoint（约 173 GiB）；`list` 只剩两个已登记的身份。
+- **P3 验收完成。**尚未验证：开机自启（重启机器后自动就绪）、开机冷启动的实际耗时、长时间运行。
+
 ## B1 P2：真实 worker（2026-09-30，Mac Studio）
 
 范围：`ipc/`（socketpair 加 JSON 帧）、`gateway/process_worker.py`（启动、环境变量白名单、取消确认、进程组停止）、`engine/`（加载与预热、Qwen 适配层的渲染与增量解析、token 映射、会话与快照、预填充与解码、PLE 页预取）、`dev_serve.py`，以及合同修订「`strict: true` 需要 `structured_output`」。

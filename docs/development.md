@@ -27,9 +27,9 @@
 cd aporisa_code && PATH="$PWD/.tools/node/bin:$PATH" npm install --save-exact <package>@<version>
 ```
 
-## 后端工具链（B0 阶段）
+## 后端工具链
 
-后端（`backend/`）只在 Mac Studio 上开发，Air 无法调试后端；前端两台机器都可以开发（见 AGENTS.md）。正式的 `backend_service.sh prepare` 要到 B1-2 才实现；在那之前，环境按下面的方式手动准备。它和将来 prepare 要做的事一致，只是还没有收进脚本：
+后端（`backend/`）只在 Mac Studio 上开发，Air 无法调试后端；前端两台机器都可以开发（见 AGENTS.md）。环境由 `./backend_service.sh prepare` 准备（`scripts/lifecycle.py`，只用标准库引导），它是服务生命周期中唯一联网的模式：
 
 | 工具 | 版本 | 位置 |
 | --- | --- | --- |
@@ -37,14 +37,32 @@ cd aporisa_code && PATH="$PWD/.tools/node/bin:$PATH" npm install --save-exact <p
 | Python | 3.12.12 | `.runtime/python/`，由 uv 管理 |
 | 依赖 | 由 `backend/uv.lock` 锁定；mlx-vlm 锁定到 git commit | `backend/.venv/` |
 
-uv 调用时固定使用项目内的目录，不使用全局缓存或系统 Python：
+prepare 还会对指针引用的模型计算完整 SHA256，并写入源码收据和模型收据；源码、脚本或依赖改动之后，doctor 会提示重新 prepare。服务的运维见 [macos.md](macos.md)，权重见 [model-management.md](model-management.md)。
+
+修改依赖属于开发行为：先改 `backend/pyproject.toml`，再用项目内的 uv 和目录执行 `uv lock`，然后运行 `prepare`，把 `uv.lock` 一起提交：
 
 ```bash
 cd backend && UV_CACHE_DIR=../.cache/uv UV_PYTHON_INSTALL_DIR=../.runtime/python UV_PYTHON_PREFERENCE=only-managed \
-  ../.tools/uv/uv sync --frozen --all-groups --python 3.12.12
+  ../.tools/uv/uv lock
 ```
 
-修改依赖时，先改 `backend/pyproject.toml`，用同样的环境变量执行 `uv lock`，再执行 `uv sync`，然后把 `uv.lock` 一起提交。
+### 后端代码结构
+
+| 目录 | 职责 |
+| --- | --- |
+| `protocol/` | 合同的 Python 侧：严格 JSON、按已提交的 schema 校验、语义规则、错误码 |
+| `gateway/` | ASGI 网关：准入、HTTP/SSE、WebSocket、事件组装、worker 客户端与恢复 |
+| `ipc/` | 网关与 worker 之间的帧格式 |
+| `engine/` | worker 进程：加载与预热、模型适配层、会话与快照、生成、PLE 预取 |
+| `lifecycle/` | doctor/prepare/run、共用检查、收据、身份记录与目录租约、权重维护、转换配方 |
+| `configs/` | 随代码评审的策略：模型指针、资源上限、引擎、部署、服务超时 |
+| `fake/` | 测试用的进程内假 worker |
+
+开发期可以在前台运行服务（不经过 launchd，检查与正式服务相同），Ctrl+C 停止：
+
+```bash
+./scripts/backend.sh run
+```
 
 ## 前端代码结构
 

@@ -67,7 +67,7 @@ for (const file of walk(srcRoot)) {
 }
 
 if (violations.length > 0) {
-  for (const violation of violations) console.error(`[Aporisa] ERROR: ${violation}`);
+  for (const violation of violations) console.error(`[Aporisa Code] ERROR: ${violation}`);
   process.exit(1);
 }
-console.log("[Aporisa] [READY] Import boundaries respected.");
+console.log("[Aporisa Code] [READY] Import boundaries respected.");

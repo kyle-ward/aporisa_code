@@ -13,11 +13,11 @@ APORISA_NPM_MAJOR="11"
 aporisa_log() {
   local label="$1"
   shift
-  printf '[Aporisa] [%s] %s\n' "$label" "$*"
+  printf '[Aporisa Code] [%s] %s\n' "$label" "$*"
 }
 
 aporisa_error() {
-  printf '[Aporisa] ERROR: %s\n' "$*" >&2
+  printf '[Aporisa Code] ERROR: %s\n' "$*" >&2
 }
 
 # Put the project-local Node first on PATH; never fall back to a global Node.

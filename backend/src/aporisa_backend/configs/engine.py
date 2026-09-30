@@ -19,6 +19,9 @@ class EngineConfig:
     # Same allocator cache bound local_llm uses on the Mac.
     cache_limit_bytes: int = 2 * GIB
     ple_threads: int = 64
+    # Soft RLIMIT_NOFILE the gateway and worker raise themselves to. launchd's default is 256;
+    # the external PLE table alone holds 384 memmaps (128 shards x 3 tensors).
+    open_files: int = 65536
     # How long the gateway waits for the worker to confirm a cancel before killing it. One
     # prefill chunk at 260K context takes several seconds.
     cancel_timeout_s: float = 30

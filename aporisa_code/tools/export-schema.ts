@@ -8,4 +8,4 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const target = resolve(packageRoot, SCHEMA_RELATIVE_PATH);
 mkdirSync(dirname(target), { recursive: true });
 writeFileSync(target, renderProtocolSchema());
-console.log(`[Aporisa] [READY] Protocol schema written: ${target}`);
+console.log(`[Aporisa Code] [READY] Protocol schema written: ${target}`);

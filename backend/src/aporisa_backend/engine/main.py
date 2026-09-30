@@ -28,6 +28,7 @@ import traceback
 from pathlib import Path
 
 from ..ipc.frames import Channel, FrameError
+from ..process_limits import raise_open_files
 from .generate import Cancelled, JobFlags
 from .tokens import Codec
 
@@ -181,6 +182,7 @@ def main() -> None:
     init = channel.recv()
     if not init or init.get("op") != "init":
         sys.exit(2)
+    raise_open_files(init["engine"]["open_files"])
     worker = Worker(channel, init)
     worker.run()
     channel.close()

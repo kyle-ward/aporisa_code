@@ -18,6 +18,10 @@ dependencies = [
   "jsonschema==4.26.0",
   "python-dotenv==1.2.3",
   "psutil==7.2.2",
+  # Weight maintenance (model_weights.sh) and dependency checks import these directly.
+  "huggingface-hub==1.33.0",
+  "hf-xet==1.6.0",
+  "packaging==26.3",
 ]
 
 [dependency-groups]

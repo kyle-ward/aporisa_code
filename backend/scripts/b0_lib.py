@@ -23,7 +23,7 @@ CACHE_LIMIT_BYTES = 2 * 1024**3
 
 def emit(tag: str, message: str) -> None:
     prefix = "ERROR:" if tag == "ERROR" else f"[{tag}]"
-    print(f"[Aporisa] {prefix} {message}", flush=True)
+    print(f"[Aporisa Code] {prefix} {message}", flush=True)
 
 
 def gib(value: float) -> float:

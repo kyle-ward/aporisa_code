@@ -38,9 +38,12 @@ name = "aporisa-backend"
 version = "0.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "hf-xet" },
+    { name = "huggingface-hub" },
     { name = "jsonschema" },
     { name = "mlx" },
     { name = "mlx-vlm" },
+    { name = "packaging" },
     { name = "psutil" },
     { name = "python-dotenv" },
     { name = "starlette" },
@@ -58,9 +61,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "hf-xet", specifier = "==1.6.0" },
+    { name = "huggingface-hub", specifier = "==1.33.0" },
     { name = "jsonschema", specifier = "==4.26.0" },
     { name = "mlx", specifier = "==0.32.3" },
     { name = "mlx-vlm", git = "https://github.com/Blaizzy/mlx-vlm.git?rev=00093678a1f6bd513212d94778ffc381d6d731bf" },
+    { name = "packaging", specifier = "==26.3" },
     { name = "psutil", specifier = "==7.2.2" },
     { name = "python-dotenv", specifier = "==1.2.3" },
     { name = "starlette", specifier = "==1.7.0" },

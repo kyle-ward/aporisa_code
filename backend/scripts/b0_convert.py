@@ -37,7 +37,7 @@ MIN_FREE_BYTES = 130 * 1024**3
 
 def emit(tag: str, message: str) -> None:
     prefix = "ERROR:" if tag == "ERROR" else f"[{tag}]"
-    print(f"[Aporisa] {prefix} {message}", flush=True)
+    print(f"[Aporisa Code] {prefix} {message}", flush=True)
 
 
 def quant_predicate(path: str, module) -> bool | dict:

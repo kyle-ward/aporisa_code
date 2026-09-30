@@ -379,7 +379,7 @@
   - 端口。
 - **`start`**：完全离线；加载模型 → 运行预热（纯文本、工具调用、预热 + 续接、上下文超长的拒绝路径）→ 就绪。
 - **`.env`**，放在 `backend/.env`，只放部署差异：API key、公共端口。公开模型别名在 configs 的 `POINTERS` 中（D-15）。
-- **日志**：JSONL，字段走白名单，不记录任何正文、思考内容或工具参数。控制台使用 `[Aporisa]` 标签。
+- **日志**：JSONL，字段走白名单，不记录任何正文、思考内容或工具参数。控制台使用 `[Aporisa Code]` 标签。
 
 ---
 
@@ -662,6 +662,17 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
   - 身份记录在 `.runtime/model-assets/<目录>.json`；逐目录加锁，模型使用中时拒绝写操作。
   - 相对 local_llm 唯一的扩展是 `convert`：从已登记的源身份，按包内的配方（由 `b0_convert.py` 迁入）生成产物，发布到 `.runtime/models/<目录>/<配方摘要>/`，并登记为新的身份。B0 已有的两个产物在 P3 时移入这个布局：同一磁盘内的重命名，不需要重新转换。
 
+**P3 定稿（2026-09-30，用户确认的 6 项决策）**：
+
+1. **对外服务的产物是一个自包含目录**：外置 PLE 视图的全部文件，加上它读取的 PLE 分片文件，`ple-store.json` 的 `source_root` 指向本目录。一个身份只对应一个目录，校验、加锁、删除都只针对这一个目录。PLE 常驻内存的完整 checkpoint 不再单独保留：服务从不使用它，需要时可以从 FP8 重新转换。
+2. **B0 产物用一次性迁移脚本登记**（`scripts/migrate_b0_artifacts.py`，先例是 local_llm 的 `migrate_weight_metadata.py`）：核对 B0 的 `recipe.json` 与包内配方一致，用硬链接组装新目录（不占额外磁盘，也不重新转换），计算 SHA256 清单，并写入身份记录，来源取自 B0 下载清单中的仓库和 revision。MTP 草稿模型同时登记。B1 收尾时删除这个脚本。
+3. **SHA256 分级校验**，沿用 local_llm：`prepare` 对全部文件完整计算 SHA256，按文件并行，通过后写入 prepare 收据；`start` 和 `run` 只核对收据、文件清单、大小，以及非 safetensors 小文件的哈希。
+4. **`convert` 保留并内化 FP8 转换逻辑**：配方、FP8 加载绕过、`check_layout`、复制 LICENSE 都迁进包里；自动测试只用一个很小的 FP8 checkpoint。真实转换不在 P3 中复跑。原始 FP8 权重在服务不再依赖它之后删除，以后需要时重新下载。
+5. **清理**：P3 完成后删除 `dev_serve.py`（服务只有一个入口）；`MODEL_LIST` 去掉 mxfp4，加入 MTP 的身份；`backend/scripts/b0_*.py` 保留到 B1 收尾。
+6. **start 等待就绪的超时暂定 900 秒**，放在 `configs/macos_service.sh`；首次真实 start 之后按实测的加载加预热耗时调整。（已调整：实测 21 秒，改为 300 秒。）
+
+布局：`.runtime/models/<目录>/<revision 或配方摘要>/`，`.runtime/model-assets/<目录>.json`，`.runtime/model-locks/<目录>.lock`，`.runtime/weight-staging/<目录>/`。只支持 macOS，所以不再按平台分子目录（偏离 local_llm）。
+
 ### 14.7 测试
 
 | 层 | 内容 |
@@ -682,7 +693,7 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 |---|---|---|
 | P1 | `protocol/`、`configs/`、日志、网关、假 worker | 网关加假 worker 通过 W01–W24 |
 | P2 | `ipc/`、worker 主循环、适配层、会话、生成、PLE 预取 | 小模型测试通过；用户在真实模型上完成预热，一致性测试 W01–W24 全部通过（2026-09-30 完成） |
-| P3 | 生命周期脚本、权重维护、检查、LaunchDaemon | 用户手动完成 install/start/stop/uninstall 的验收 |
+| P3 | 生命周期脚本、权重维护、检查、LaunchDaemon | 用户手动完成 install/start/stop/uninstall 的验收（2026-09-30 完成） |
 | P4 | 可观测性字段、`/health/runtime`、`validate_runtime.py` | 第 10 节的字段出现在 JSONL 中 |
 
 ---
@@ -722,3 +733,6 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 - **2026-09-30**：合同修订：明确 `function_call` 的保证范围，新增 `tool_call_invalid`；已同步到协议文档、TS 类型和 schema、mock 测试、兼容文档，以及后端网关和假 worker。B1 的 P1（协议校验、网关、假 worker）完成。
 - **2026-09-30**：B1 的 P2 完成代码和小模型测试：真实 worker、IPC、Qwen 适配层、会话与快照、PLE 预取、`dev_serve`。第 14.3–14.5 节按实现补充：`init` 帧和 `cancelled` 确认、快照点收窄到最后 K−1 个边界、token 映射改为按渲染文本做键、采样与计数细节。合同修订：function 工具的 `strict: true` 需要 `structured_output` 能力（协议第 5、8.3 节，前端校验与测试、兼容文档、后端校验同步修改）；一致性测试 W19、W24 的前置请求输出预算改为 2048。
 - **2026-09-30**：P2 在真实模型上验收：W01–W24 全部通过。修复验收中发现的三处问题：uvicorn 拒绝握手时的误报日志、被拒绝请求的日志名称、prompt 末尾的快照不保存 logits（第 14.5 节已补充）。worker 计量写入 response 日志。
+- **2026-09-30**：P3 代码完成：`backend_service.sh` 与 LaunchDaemon、`model_weights.sh`（download / convert / list / delete）、身份记录与目录租约、共用检查与分级校验、B0 产物迁移脚本；第 14.6 节写入用户确认的 6 项决策。`dev_serve.py` 删除，`MODEL_LIST` 去掉 mxfp4、加入 MTP 身份。新增直接依赖 huggingface-hub、hf-xet、packaging（锁文件中原本就有，版本不变）。
+- **2026-09-30**：P3 验收中首次 `start` 失败：launchd 的文件描述符软上限 256 不够外置 PLE 表的 384 个 memmap；网关和 worker 启动时把软上限提高到 65536。控制台前缀按用户偏好统一改为 `[Aporisa Code]`（前后端的脚本、CLI 工具和 AGENTS.md 的约定）。
+- **2026-09-30**：P3 验收完成：修复文件描述符上限后，`start` 就绪（加载加预热 21 秒），对系统服务运行一致性测试 W01–W24 全部通过，`stop / uninstall` 干净退出。start 等待上限改为 300 秒。

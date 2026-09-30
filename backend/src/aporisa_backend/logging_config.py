@@ -85,7 +85,7 @@ class ConsoleFormatter(SafeFormatter):
         tag, message = EVENTS.get(data["event"], ("INFO", "Event."))
         label = "ERROR:" if tag == "ERROR" else f"[{tag}]"
         details = " ".join(f"{k}={data[k]}" for k in sorted(FIELDS) if k in data)
-        return f"[Aporisa] {label} {message}" + (f" {details}" if details else "")
+        return f"[Aporisa Code] {label} {message}" + (f" {details}" if details else "")
 
 
 class PrivateRotatingFileHandler(RotatingFileHandler):
