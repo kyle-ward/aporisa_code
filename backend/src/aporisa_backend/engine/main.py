@@ -33,6 +33,7 @@ from ..ipc.frames import Channel, FrameError
 from ..process_limits import raise_open_files
 from .generate import Cancelled, JobFlags
 from .tokens import Codec
+from .vision import ImageError
 
 EXIT_GRACE_S = 30
 
@@ -49,7 +50,9 @@ class Worker:
         # Memory pressure the whole startup (load + warmup) caused system-wide.
         self.engine.info["startup"] = vmstats.delta(before, vmstats.sample())
         adapter_class = runtime.ADAPTERS[init["adapter"]]
-        self.count_adapter = adapter_class(Codec(Path(init["model_dir"])), init["model"])
+        self.count_adapter = adapter_class(
+            Codec(Path(init["model_dir"])), init["model"], self.engine.adapter.image_policy
+        )
         self.inbox: queue.Queue[dict] = queue.Queue()
         self.lock = threading.Lock()
         self.current: tuple[str, JobFlags] | None = None
@@ -196,6 +199,9 @@ class Worker:
                 try:
                     count = self.engine.count(message["request"], self.count_adapter)
                     self.send({"id": job_id, "type": "counted", "input_tokens": count})
+                except ImageError as error:
+                    reply = {"type": "counted", "error": "invalid_image", "param": error.param}
+                    self.send({"id": job_id, **reply})
                 except Exception:
                     traceback.print_exc(file=sys.stderr)
                     self.send({"id": job_id, "type": "counted", "error": "internal_error"})

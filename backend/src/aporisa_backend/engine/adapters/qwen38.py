@@ -6,6 +6,11 @@
   `configuration_update` render as system segments. Blocks are tokenized one at a time;
   every block boundary sits right before an added token (`<|im_start|>`), so the result
   equals whole-string tokenization.
+- Images (B2-6, engine/vision.py): an input_image in a user message or tool output renders
+  as the template's `<|vision_start|><|image_pad|><|vision_end|>`, with the pad expanded to
+  the image's token count (what the model's processor does to the template text). The
+  plan carries the images' positions, M-RoPE position ids and the key sequence caches
+  compare (the image's digest in place of its first pad).
 - TokenMap: rendered assistant-turn text -> the token ids actually generated, so a
   re-rendered history reproduces the live cache exactly (6.5).
 - Parser: generated token ids -> worker item messages, incrementally.
@@ -17,11 +22,25 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from ..tokens import Codec
+from ..vision import (
+    IMAGE_PAD,
+    VISION_END,
+    VISION_IDS,
+    VISION_START,
+    ImageError,
+    ImagePolicy,
+    ImageSpec,
+    describe,
+    positions,
+)
 
 THINK_OPEN, THINK_CLOSE = 248068, 248069
 CALL_OPEN, CALL_CLOSE = 248058, 248059
@@ -101,10 +120,25 @@ class RenderPlan:
     tool_schemas: dict[str, dict] = field(default_factory=dict)
     text_format: dict | None = None  # the text.format schema (protocol 8.4)
     strict_schemas: dict[str, dict] = field(default_factory=dict)  # strict function tools
+    # Images (B2-6): (offset of the first pad, spec) in prompt order; the sequence caches
+    # compare (tokens, except each image's first pad); M-RoPE positions [3, len] and the
+    # shift that positions generated tokens (None and 0 without images).
+    images: list[tuple[int, ImageSpec]] = field(default_factory=list)
+    keys: list[int] | None = None
+    positions: np.ndarray | None = None
+    position_shift: int = 0
 
     @property
     def generation_prompt(self) -> list[int]:
         return self.tokens[self.prompt_start :]
+
+    @property
+    def cache_keys(self) -> list[int]:
+        return self.keys if self.keys is not None else self.tokens
+
+    @property
+    def image_tokens(self) -> int:
+        return sum(spec.tokens for _, spec in self.images)
 
 
 def _json(value) -> str:
@@ -116,6 +150,9 @@ def _text(parts: list[dict] | str) -> str:
     if isinstance(parts, str):
         return parts
     return "".join(part.get("text", "") for part in parts)
+
+
+IMAGE_MARK = re.compile("\ue000([0-9a-f]{16}):([0-9]+)\ue001")
 
 
 def _arguments(raw: str) -> dict:
@@ -232,8 +269,8 @@ class TokenMap:
 
 
 class Qwen38Adapter:
-    def __init__(self, codec: Codec, model: dict):
-        self.codec, self.model = codec, model
+    def __init__(self, codec: Codec, model: dict, images: ImagePolicy | None = None):
+        self.codec, self.model, self.image_policy = codec, model, images
         expected = {
             "<think>": THINK_OPEN,
             "</think>": THINK_CLOSE,
@@ -242,6 +279,9 @@ class Qwen38Adapter:
             "<|im_start|>": IM_START,
             "<|im_end|>": IM_END,
             "<|endoftext|>": END_OF_TEXT,
+            "<|vision_start|>": VISION_START,
+            "<|vision_end|>": VISION_END,
+            "<|image_pad|>": IMAGE_PAD,
         }
         for text, token in expected.items():
             if codec.token_id(text) != token:
@@ -259,14 +299,51 @@ class Qwen38Adapter:
         return baseline, effective
 
     def render(self, request: dict, token_map: TokenMap | None = None) -> RenderPlan:
+        """Raises vision.ImageError for an image that cannot be sized (invalid_image)."""
         baseline, effective = self.effort(request)
         tokens: list[int] = []
         boundaries: list[int] = []
+        images: list[tuple[int, ImageSpec]] = []
+        pending: list[ImageSpec] = []  # images of the block being rendered
+        nonce = secrets.token_hex(8)  # image marks can never come from request text
+
+        def content(parts: list[dict] | str, param: str) -> str:
+            """The template's render_content: text, and the vision placeholder per image
+            (marked here, expanded when the block is tokenized)."""
+            if isinstance(parts, str):
+                return parts
+            text = ""
+            for position, part in enumerate(parts):
+                if part["type"] != "input_image":
+                    text += part.get("text", "")
+                    continue
+                if self.image_policy is None:
+                    raise ImageError(f"{param}[{position}]")
+                pending.append(describe(part, f"{param}[{position}]", self.image_policy))
+                text += f"\ue000{nonce}:{len(pending) - 1}\ue001"
+            return text
+
+        def encode(text: str) -> list[int]:
+            ids: list[int] = []
+            cursor = 0
+            for mark in IMAGE_MARK.finditer(text):
+                if mark.group(1) != nonce:
+                    continue
+                ids.extend(self.codec.encode(text[cursor : mark.start()]))
+                spec = pending[int(mark.group(2))]
+                ids.append(VISION_START)
+                images.append((len(tokens) + len(ids), spec))
+                ids.extend([IMAGE_PAD] * spec.tokens)
+                ids.append(VISION_END)
+                cursor = mark.end()
+            ids.extend(self.codec.encode(text[cursor:]))
+            pending.clear()
+            return ids
 
         def add(text: str, ids: list[int] | tuple[int, ...] | None = None) -> None:
             if not text and ids is None:
                 return
-            tokens.extend(self.codec.encode(text) if ids is None else ids)
+            tokens.extend(encode(text) if ids is None else ids)
             boundaries.append(len(tokens))
 
         add(system_block(request, baseline))
@@ -284,13 +361,15 @@ class Qwen38Adapter:
                     add(text + "\n")
             elif group_kind == "tool":
                 body = "".join(
-                    f"\n<tool_response>\n{_text(item['output']).strip()}\n</tool_response>"
-                    for item in group
+                    f"\n<tool_response>\n{content(item['output'], param).strip()}\n</tool_response>"
+                    for param, item in group_params
                 )
                 add(f"<|im_start|>user{body}<|im_end|>\n")
             group, group_kind = [], None
+            group_params.clear()
 
-        for item in request["input"]:
+        group_params: list[tuple[str, dict]] = []
+        for index, item in enumerate(request["input"]):
             kind = item["type"]
             if kind in ("reasoning", "function_call") or (
                 kind == "message" and item["role"] == "assistant"
@@ -305,9 +384,11 @@ class Qwen38Adapter:
             if target is not None:
                 group_kind = target
                 group.append(item)
+                group_params.append((f"input[{index}].output", item))
                 continue
             if kind == "message" and item["role"] == "user":
-                add(f"<|im_start|>user\n{_text(item['content']).strip()}<|im_end|>\n")
+                text = content(item["content"], f"input[{index}].content").strip()
+                add(f"<|im_start|>user\n{text}<|im_end|>\n")
             elif kind == "message" and item["role"] == "developer":
                 add(system_segment(_text(item["content"]).strip()))
             elif kind == "configuration_update":
@@ -323,7 +404,17 @@ class Qwen38Adapter:
         prompt_start = len(tokens)
         tokens.extend(self.codec.encode(GENERATION_PROMPT[thinking]))
         # tool_choice none keeps the tool definitions (a stable prefix) and bans the call token.
-        banned = (CALL_OPEN,) if request.get("tool_choice") == "none" else ()
+        # Vision tokens are input only.
+        banned = ((CALL_OPEN,) if request.get("tool_choice") == "none" else ()) + tuple(
+            sorted(VISION_IDS)
+        )
+        extra = {}
+        if images:
+            keys = list(tokens)
+            for start, spec in images:
+                keys[start] = spec.key
+            ids, shift = positions(len(tokens), images)
+            extra = {"images": images, "keys": keys, "positions": ids, "position_shift": shift}
         return RenderPlan(
             tokens=tokens,
             boundaries=boundaries,
@@ -345,6 +436,7 @@ class Qwen38Adapter:
                 for tool in request.get("tools") or []
                 if tool["type"] == "function" and tool.get("strict") is True
             },
+            **extra,
         )
 
     def parser(self, plan: RenderPlan) -> Parser:

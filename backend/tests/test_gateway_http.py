@@ -171,3 +171,42 @@ async def test_tool_call_invalid_keeps_completed_items(harness_factory):
         "message": "Tool call markup is not closed.",
     }
     assert [item["type"] for item in response["output"]] == ["message"]
+
+
+async def test_image_limits(harness_factory):
+    """protocol 11: too many images -> invalid_request; a source too large to decode (its
+    header says so) -> invalid_image naming the part."""
+    import base64
+    import io
+    import struct
+    import zlib
+
+    from PIL import Image
+
+    harness = harness_factory(limits(max_images=2, max_image_source_pixels=10_000))
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), (1, 2, 3)).save(buffer, format="PNG")
+    small = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    header = struct.pack(">IIBBBBB", 200, 100, 8, 2, 0, 0, 0)  # claims 200x100 pixels
+    large = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IEND", b"")
+    large_url = "data:image/png;base64," + base64.b64encode(large).decode()
+
+    def body(*urls):
+        content = [{"type": "input_text", "text": "look"}]
+        content += [{"type": "input_image", "image_url": u} for u in urls]
+        return {**request(), "input": [{"type": "message", "role": "user", "content": content}]}
+
+    base = harness.server.base
+    status, events = await post_stream(base, body(small, small))
+    assert status == 200 and check_stream(events)
+    status, error = await post_stream(base, body(small, small, small))
+    assert status == 400 and error["error"]["code"] == "invalid_request"
+    assert error["error"]["param"] == "input"
+    status, error = await post_stream(base, body(small, large_url))
+    assert status == 400 and error["error"]["code"] == "invalid_image"
+    assert error["error"]["param"] == "input[0].content[2]"

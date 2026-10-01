@@ -197,6 +197,7 @@ def worker_init(model_dir, **overrides) -> dict:
     """The init frame the gateway sends a worker, for in-process engine tests."""
     from aporisa_backend.configs.engine import ENGINE
     from aporisa_backend.configs.models import public_model
+    from aporisa_backend.gateway.process_worker import image_policy
 
     return {
         "op": "init",
@@ -210,6 +211,7 @@ def worker_init(model_dir, **overrides) -> dict:
         "verify_prefill_schedule": [list(step) for step in PROFILE.verify_prefill_schedule],
         "draft_kv_bytes_per_token": PROFILE.draft_kv_bytes_per_token,
         "snapshot_budget_bytes": 2 * 1024**3,
+        "images": image_policy(PROFILE),
         "engine": ENGINE.as_dict(),
         **overrides,
     }

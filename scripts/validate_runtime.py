@@ -21,6 +21,9 @@ with the key and port from backend/.env. Default checks take a few minutes:
                 twice B0-10's plain speed with lookup drafts in use
   structured    structured output (B2-4): text.format answers in effort none and medium
                 are JSON of the schema; a strict tool call's arguments follow its schema
+  images        image input (B2-6): the model reads a word and a colour from a generated
+                picture, a picture in a tool output, and the same picture again is all
+                cached while another one of the same size is not
   runtime       /health/runtime includes the worker's view
 
 --long TOKENS adds the B1-10 acceptance: one cold prefill of about TOKENS tokens (server
@@ -510,6 +513,96 @@ class Validator:
         self.record("structured", passed=True)
         emit("READY", "Structured output passed: text.format (none, medium) and a strict call.")
 
+    async def images(self, client):
+        def picture(content: list[dict]) -> dict:
+            return {"type": "message", "role": "user", "content": content}
+
+        question = (
+            "What colour is the circle, and what word is written in the picture? "
+            "Answer with just the colour and the word."
+        )
+        key = f"validate-images-{time.time_ns()}"
+        body = self.request(
+            [
+                picture(
+                    [
+                        {"type": "input_text", "text": question},
+                        {"type": "input_image", "image_url": _picture("MANGO", (210, 30, 30))},
+                    ]
+                )
+            ],
+            reasoning={"effort": "none"},
+            max_output_tokens=64,
+            prompt_cache_key=key,
+        )
+        response, ttft = await self.stream(client, body)
+        check(response["status"] == "completed", f"status {response['status']}")
+        answer = _answer(response).lower()
+        check("red" in answer and "mango" in answer, "the colour or the word was not read")
+        first = (await self.runtime(client))["worker"]["last"]
+        again, _ = await self.stream(client, body)
+        cached = again["usage"]["input_tokens_details"]["cached_tokens"]
+        check(cached == again["usage"]["input_tokens"], f"the same picture: {cached} cached")
+        other = {
+            **body,
+            "input": [
+                picture(
+                    [
+                        {"type": "input_text", "text": question},
+                        {"type": "input_image", "image_url": _picture("LEMON", (30, 30, 210))},
+                    ]
+                )
+            ],
+        }
+        third, _ = await self.stream(client, other)
+        check(_answer(third).lower().count("lemon") > 0, "the second picture was not read")
+        other_cached = third["usage"]["input_tokens_details"]["cached_tokens"]
+        check(other_cached < third["usage"]["input_tokens"], "another picture reused the cache")
+        # a picture returned by a tool
+        call = {"type": "function_call", "call_id": "shot", "name": "screenshot", "arguments": "{}"}
+        output = {
+            "type": "function_call_output",
+            "call_id": "shot",
+            "output": [
+                {"type": "input_text", "text": "Screenshot:"},
+                {"type": "input_image", "image_url": _picture("PLUM", (40, 160, 40))},
+            ],
+        }
+        tool = {
+            "type": "function",
+            "name": "screenshot",
+            "description": "Capture the screen.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        shot, _ = await self.stream(
+            client,
+            self.request(
+                [user("Take a screenshot and tell me what word it shows."), call, output],
+                tools=[tool],
+                tool_choice="none",
+                reasoning={"effort": "none"},
+                max_output_tokens=64,
+            ),
+        )
+        check("plum" in _answer(shot).lower(), "the word in the tool's picture was not read")
+        self.record(
+            "images",
+            passed=True,
+            ttft_ms=round((ttft or 0) * 1000),
+            image_tokens=first.get("image_tokens"),
+            vision_encode_ms=first.get("vision_encode_ms"),
+            prefill_tok_s=first.get("prefill_tok_s"),
+            cached_again=cached,
+            cached_other=other_cached,
+            **_usage(response["usage"]),
+        )
+        emit(
+            "READY",
+            f"Images passed: read a picture ({first.get('image_tokens')} image tokens, encoded "
+            f"in {first.get('vision_encode_ms')} ms) and a tool's picture; the cache tells "
+            "pictures apart.",
+        )
+
     async def runtime_status(self, client):
         status = await self.runtime(client)
         worker = status.get("worker")
@@ -655,6 +748,7 @@ class Validator:
             ("speculative", self.speculative(client)),
             ("lookup", self.lookup(client)),
             ("structured", self.structured(client)),
+            ("images", self.images(client)),
             ("runtime", self.runtime_status(client)),
         ]
 
@@ -722,6 +816,31 @@ class Validator:
             f"Restart restore passed: {cached} tokens from SSD in {last.get('ssd_load_ms')} ms, "
             f"first token after {ttft:.2f}s (cold: {record['cold_ttft_ms'] / 1000:.1f}s).",
         )
+
+
+def _picture(word: str, colour: tuple[int, int, int]) -> str:
+    """A 1024x512 PNG data URL: a coloured circle and a word in large black letters."""
+    import base64
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    image = Image.new("RGB", (1024, 512), "white")
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((60, 106, 360, 406), fill=colour)
+    draw.text((440, 200), word, fill="black", font=ImageFont.load_default(size=120))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def _answer(response: dict) -> str:
+    return "".join(
+        part.get("text", "")
+        for item in response["output"]
+        if item["type"] == "message"
+        for part in item["content"]
+    )
 
 
 def _digest(body: dict) -> str:

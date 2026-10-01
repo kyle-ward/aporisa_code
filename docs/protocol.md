@@ -2,7 +2,7 @@
 
 > **状态：v0 已定稿。** 前端的 SDK（native driver）和 mock server 已按本文实现，并通过了 wire 层一致性测试；后端已实现，对真实服务的一致性测试见 [validation.md](validation.md)。本文是 harness（Aporisa SDK）和推理后端之间的唯一合同。任何代码、schema 或 mock 与本文不一致时，以本文为准，并按第 13 节的流程同步。
 >
-> 修订日期：2026-09-30（v0 修订：2026-09-29 新增 `configuration_update` 输入 item 和 `reasoning_effort_updates` 能力，见第 6.1 节；2026-09-30 明确 `function_call` 的保证范围，新增流中错误码 `tool_call_invalid`，见第 7.1、9.2 节；同日明确 function 工具的 `strict: true` 需要 `structured_output` 能力，见第 5、8.3 节；2026-10-01 新增第 8.4 节，明确结构化输出的约束范围、与工具调用的关系和未完成时的处理）。协议路径版本：`/v1`。
+> 修订日期：2026-09-30（v0 修订：2026-09-29 新增 `configuration_update` 输入 item 和 `reasoning_effort_updates` 能力，见第 6.1 节；2026-09-30 明确 `function_call` 的保证范围，新增流中错误码 `tool_call_invalid`，见第 7.1、9.2 节；同日明确 function 工具的 `strict: true` 需要 `structured_output` 能力，见第 5、8.3 节；2026-10-01 新增第 8.4 节，明确结构化输出的约束范围、与工具调用的关系和未完成时的处理；同日明确 `input_image` 的解码要求、`detail` 的含义、图片 token 的计量和图片数量上限，见第 7.1、11 节）。协议路径版本：`/v1`。
 
 ## 1. 范围与原则
 
@@ -250,7 +250,10 @@ wire 上的能力只有 boolean 两种取值。Aporisa SDK 对 harness 暴露的
 - `role`：`user`、`developer` 或 `assistant`。系统级指令放在请求的 `instructions` 里；`developer` 用于 harness 注入的上下文说明，参照 codex。
 - `content` 的元素类型：
   - `input_text`：`{text}`，用于 user 和 developer。
-  - `input_image`：`{image_url, detail?}`，只用于 user。`image_url` 只接受 PNG 或 JPEG 格式的 `data:` URL；`detail` 取 `auto` 或 `high`。前提是模型的 `input_modalities` 包含 `image`。
+  - `input_image`：`{image_url, detail?}`，只用于 user（以及工具结果，见 `function_call_output`）。前提是模型的 `input_modalities` 包含 `image`。
+    - `image_url` 只接受 PNG 或 JPEG 格式的 `data:` URL（base64）。内容必须是与声明的格式一致、能完整解码的图片，否则以 400 `invalid_image` 拒绝；外部 URL 和其他格式不接受。
+    - `detail` 取 `auto`（默认）或 `high`，决定分辨率上限：服务端保持宽高比把图片缩小到上限以内（太小的图片按模型要求放大到下限），从不裁剪。`high` 的上限更高，占用的 token 更多。具体的像素上限属于后端的部署事实，记录在后端文档中。
+    - 图片按模型的方式占用 token，计入 `input_tokens`、`cached_tokens` 和上下文检查，与文本相同；`/v1/responses/input_tokens` 的计数也包括图片。前缀缓存按图片内容区分：同一位置换了一张图片，不会被当作相同的前缀。
   - `output_text`：`{text}`，只用于 assistant。
 - `phase`：可选，只用于 assistant。
   - `commentary`：回合中途的过程叙述，之后可能还有工具调用。
@@ -486,7 +489,7 @@ v0 只支持 `format.type = "text"`，带语法约束的格式留待后续版本
 
 ## 11. 容量
 
-所有资源都必须有上限：请求正文、输入文本总量、图片数量和大小、并发、排队、输出字节、总期限、空闲超时。具体数值属于后端的部署事实，记录在后端文档中，并通过 `/v1/models` 的 `context_window` 和 `max_output_tokens` 暴露必要的部分。超出上限时，按第 9 节返回明确的错误，不能自动截断输入或降低输出预算。
+所有资源都必须有上限：请求正文、输入文本总量、图片数量和大小、并发、排队、输出字节、总期限、空闲超时。一个请求中的图片（包括历史和工具结果里的）超过服务端的数量上限时，以 400 `invalid_request`（`param` 为 `input`）拒绝；单张图片的原始尺寸超过服务端能解码的上限时，以 400 `invalid_image` 拒绝。具体数值属于后端的部署事实，记录在后端文档中，并通过 `/v1/models` 的 `context_window` 和 `max_output_tokens` 暴露必要的部分。超出上限时，按第 9 节返回明确的错误，不能自动截断输入或降低输出预算。
 
 ## 12. v0 暂不纳入、后续版本再议
 

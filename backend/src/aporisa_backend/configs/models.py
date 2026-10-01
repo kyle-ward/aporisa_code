@@ -61,6 +61,12 @@ class ModelProfile:
     auto_compact_token_limit: int | None = None
     truncation_policy: dict = field(default_factory=lambda: {"mode": "bytes", "limit": 10_000})
     input_modalities: tuple[str, ...] = ("text",)
+    # Image sizing (B2-6 decision 1): an image is scaled, keeping its aspect ratio, to at
+    # most this many pixels per `detail` (and at least image_min_pixels, the model's own
+    # minimum); one token per 32x32 pixels, so auto ~1024 and high ~4096 tokens at most.
+    # The model allows up to 16.7M pixels (16,384 tokens per image), too costly to offer.
+    image_min_pixels: int = 65_536
+    image_max_pixels: dict = field(default_factory=lambda: {"auto": 1_048_576, "high": 4_194_304})
     reasoning_summary: bool = False
 
     def __post_init__(self):
@@ -77,6 +83,8 @@ class ModelProfile:
             or any(count < 1 for _, count in schedule)
         ):
             raise ValueError("draft_schedule starts at 0, ascends and drafts at least one")
+        if "image" in self.input_modalities and set(self.image_max_pixels) != {"auto", "high"}:
+            raise ValueError("an image model caps the pixels of both details (auto, high)")
         for name in ("lookup_schedule", "verify_prefill_schedule"):
             steps = getattr(self, name)
             if steps and (
@@ -137,6 +145,7 @@ PROFILES: dict[str, ModelProfile] = {
         lookup_schedule=((0, 32),),
         verify_prefill_schedule=((0, 8), (16_384, 3)),
         draft_kv_bytes_per_token=2_380,
+        input_modalities=("text", "image"),
     )
     for identity in ("Qwen3.8-Flash-Next-affine4g64",)
 }

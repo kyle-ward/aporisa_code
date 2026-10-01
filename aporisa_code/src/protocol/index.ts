@@ -6,6 +6,7 @@ export * from "./request.ts";
 export * from "./errors.ts";
 export * from "./events.ts";
 export * from "./validation.ts";
+export * from "./images.ts";
 export * from "./stream-validator.ts";
 export * from "./continuation.ts";
 export * from "./canonical.ts";

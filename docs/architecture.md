@@ -41,11 +41,11 @@ launchd (LaunchDaemon, KeepAlive=false)
 
 ## 4. 内部接口：网关 ↔ worker
 
-通道是 `socket.socketpair()`，帧为 4 字节大端长度加 UTF-8 JSON，单帧上限 20 MiB（`ipc/frames.py`）。KV 等大块状态从不经过 IPC。
+通道是 `socket.socketpair()`，帧为 4 字节大端长度加 UTF-8 JSON，单帧上限 96 MiB（`ipc/frames.py`；最大的负载是带图片的完整请求，HTTP 正文上限 64 MiB）。KV 等大块状态从不经过 IPC；编码后的图片特征也只在 worker 内部。
 
 | 网关 → worker | 字段 | 说明 |
 |---|---|---|
-| `init` | 模型目录、草稿模型目录与每轮草稿数、公开模型对象、适配层、KV 字节数、SSD 缓存目录与模型身份、引擎策略 | 第一帧；路径不放进命令行 |
+| `init` | 模型目录、草稿模型目录与每轮草稿数、公开模型对象、适配层、KV 字节数、SSD 缓存目录与模型身份、图片尺寸策略、引擎策略 | 第一帧；路径不放进命令行 |
 | `generate` | `id`、`response_id`、`request`（展开后的完整参数）、`session` | `generate:false` 即预热 |
 | `count_tokens` | `id`、`request` | 与生成走同一套渲染 |
 | `interrupt` / `cancel` | `id` | 优雅中断 / 硬取消 |
@@ -55,7 +55,7 @@ launchd (LaunchDaemon, KeepAlive=false)
 | worker → 网关 | 说明 |
 |---|---|
 | `ready` | 加载和预热全部通过，带启动信息与启动期间的内存压力 |
-| `accepted` / `rejected` | 通过或未通过上下文检查；网关收到 `accepted` 才开始流 |
+| `accepted` / `rejected` | 通过或未通过上下文检查和图片解码（`rejected` 带 `code`，图片问题另带出错的部分 `param`）；网关收到 `accepted` 才开始流 |
 | `item_added` / `delta` / `item_done` | item 事件；`item_done` 是权威的完整 item |
 | `finished` / `failed` | 终止，带 usage 与计量；`failed` 的 `tool_call_invalid` 带 `detail` |
 | `cancelled` | 该 job 已停止且其他消息都已发出；网关收到后才释放准入名额，60 秒未确认则结束 worker 进程组 |
@@ -70,6 +70,7 @@ launchd (LaunchDaemon, KeepAlive=false)
   - 增量解析：推理 → 回答 → XML 工具调用，按 schema 转换参数，确定 `phase`。
 - **会话**（`engine/sessions.py`）：一个会话是一份 MLX cache、其中的 token 列表、草稿模型的状态和最多 16 个快照（循环层状态的拷贝加上该位置的目标隐藏状态，KV 通过截断恢复）。匹配顺序：活跃游标（live）→ 最深的可用快照（snapshot）→ SSD 缓存（ssd，比内存多复用至少一块时）→ 冷启动（cold）。草稿模型跟不上一次恢复时，该会话不再起草，直到下次冷启动。
 - **内存预算**：所有会话的 KV 与快照可用的内存，每次请求前按当前实际余量计算（可用内存 + 会话已占用 + 缓冲缓存 − 激活预留 − 缓冲缓存上限 − 给桌面的余量），并且不超过按 wired 上限算出的值；不够时按 LRU 整个淘汰空闲会话。另外按内核的内存压力等级兜底：请求开始时若处于警告（活动监视器里的黄色），先丢掉全部空闲会话；worker 空闲时每 5 秒检查一次，处于警告就丢掉一个最久未用的空闲会话。
+- **图片输入**（`engine/vision.py`，B2-6）：网关做结构检查（声明的格式、文件头里的尺寸、文件完整）和数量、原图大小上限；worker 按 `detail` 的像素上限确定尺寸（每 32×32 像素一个 token），在流开始前把还要预填充的图片完整解码一遍。渲染时每张图片展开为对应数量的 `image_pad`，并算好整个请求的 M-RoPE 三维位置；预填充到图片时，用视觉塔的特征替换 pad 的 embedding。会话匹配和 SSD 缓存用「键序列」：每张图片的第一个 pad 换成由图片内容得到的负数，两张不同的图片不会共用缓存。
 - **SSD 缓存**（`engine/disk_cache.py`，B2-1）：会话因内存预算或内存压力被淘汰时、以及正常停机时，写入 SSD；之后的请求（包括服务重启之后）按内容匹配恢复。KV 按 2048 个 token 分块，文件名是 token 的链式哈希，相同前缀只存一份；检查点保存某个位置的循环层状态、logits、草稿模型隐藏状态和尾部 KV。磁盘上不存 token 列表，文件权限 0600，每次读入都校验 sha256，总量上限 64 GiB（LRU）。目录按布局摘要（模型身份、格式、MLX 版本等）区分，布局变了旧缓存不再读取并在启动时删除。
 - **生成**（`engine/generate.py`）：预填充按 2048 分块，并在快照点切开，每块顺带喂给草稿模型；外置 PLE 表的页由线程池预取，与当前块的 GPU 计算重叠（`engine/ple_prefetch.py`）；解码使用模型卡片的采样参数，presence penalty 作用于全部已生成 token。
 - **投机解码**（`engine/speculative.py`，B2-2）：解码按轮进行，采样出的 token 加上草稿模型的 argmax 草稿（上下文 16K 以下 2 个，以上 1 个：长上下文下一次验证 3 个 token 的开销陡增，见 validation.md），由目标模型一次前向验证；逐位置用请求的采样器采样，与草稿相同就继续。每个输出 token 都是目标模型的采样，草稿只决定一次前向覆盖几个位置，因此输出分布不变；与逐 token 解码之间只有 kernel 级的浮点差异（validation.md 的 B2 P1）。草稿有两个来源：上下文的末尾在更早处出现过（至少 3 个 token）时，复制那里之后的 token（提示词查找，B2-3，每轮最多 32 个）；否则用 MTP。验证 token 较多的轮次（16K 起 3 个以上，以下 8 个以上）走预填充路径，因为解码路径在长上下文把多 token 验证拆成一对一对计算，开销随 token 数陡增。
@@ -105,5 +106,6 @@ launchd (LaunchDaemon, KeepAlive=false)
 | 续接语义由网关持有 | worker 缓存丢失时续接仍然正确，不会出现 `previous_response_not_found` |
 | 会话按 token 前缀匹配，不用哈希链 | 26 万个整数的比较开销可以忽略；哈希链留给 B2 的 SSD 层 |
 | 权重目录不按平台分子目录 | 只支持 macOS |
+| 图片先按 EXIF 方向旋转，再按模型的处理器缩放 | 参考处理器不处理 EXIF，手机照片会被横着看；按显示的方向看才是用户发图的本意 |
 | SSD 缓存用按内容寻址的块和检查点、自定格式，而不是计划中「每个 key 一份 safetensors」 | 相同前缀只存一份、同一会话再写只写新增部分（SSD 写入量随新增 token 增长）；重启后 key 会变（WebSocket 的 `conn:<id>`），按内容匹配仍能命中；自定格式带整文件 sha256，读入时校验 |
 | 快照预算按实际余量动态计算 | 96 GiB 的机器上模型占约 70 GiB，按 wired 上限算会把桌面程序挤进压缩（validation.md 的 P4 记录） |

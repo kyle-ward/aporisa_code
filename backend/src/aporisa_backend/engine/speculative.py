@@ -78,6 +78,15 @@ def lookup_match(
     return [int(t) for t in follow], best
 
 
+def text_only(drafts: list[int], vision_ids: frozenset[int]) -> list[int]:
+    """Lookup drafts up to the first image token: a copy that runs into an image would draft
+    its key (negative, never a model id) or its pads (input only)."""
+    for index, draft in enumerate(drafts):
+        if draft < 0 or draft in vision_ids:
+            return drafts[:index]
+    return drafts
+
+
 @dataclass
 class DraftState:
     cache: list

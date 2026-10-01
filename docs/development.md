@@ -53,14 +53,14 @@ cd backend && UV_CACHE_DIR=../.cache/uv UV_PYTHON_INSTALL_DIR=../.runtime/python
 | `protocol/` | 合同的 Python 侧：严格 JSON、按已提交的 schema 校验、语义规则、错误码 |
 | `gateway/` | ASGI 网关：准入、HTTP/SSE、WebSocket、事件组装、worker 客户端与恢复 |
 | `ipc/` | 网关与 worker 之间的帧格式 |
-| `engine/` | worker 进程：加载与预热、模型适配层、会话与快照、SSD 会话缓存、生成、投机解码、结构化输出、PLE 预取 |
+| `engine/` | worker 进程：加载与预热、模型适配层、会话与快照、SSD 会话缓存、生成、投机解码、结构化输出、图片输入、PLE 预取 |
 | `lifecycle/` | doctor/prepare/run、共用检查、收据、身份记录与目录租约、权重维护、转换配方 |
 | `configs/` | 随代码评审的策略：模型指针、资源上限、引擎、部署、服务超时 |
 | `fake/` | 测试用的进程内假 worker |
 
 ## 对运行中的服务做真实生成验证
 
-`scripts/validate_runtime.py` 由用户显式运行，不属于 `check.sh`。它按 `backend/.env` 的 key 和端口，对已经启动的服务逐项检查：文本、推理、工具调用及工具结果续写、`prompt_cache_key` 前缀复用、WebSocket 续接、中途换档到 `none`、`/health/runtime`。结果只含数字，追加到 `.runtime/validation/validate_<时间>.jsonl`。
+`scripts/validate_runtime.py` 由用户显式运行，不属于 `check.sh`。它按 `backend/.env` 的 key 和端口，对已经启动的服务逐项检查：文本、推理、工具调用及工具结果续写、`prompt_cache_key` 前缀复用、WebSocket 续接、中途换档到 `none`、MTP 与提示词查找投机、结构化输出、图片输入（读出生成图片上的颜色和文字、读工具结果里的图片、同一张图再次请求全部命中缓存而另一张同尺寸的图不会）、`/health/runtime`。结果只含数字，追加到 `.runtime/validation/validate_<时间>.jsonl`。
 
 ```bash
 backend/.venv/bin/python scripts/validate_runtime.py

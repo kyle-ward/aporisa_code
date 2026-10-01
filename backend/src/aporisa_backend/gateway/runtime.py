@@ -17,6 +17,7 @@ from ..configs.models import ModelProfile, public_model
 from ..logging_config import event
 from ..protocol import validation
 from ..protocol.errors import ProtocolError
+from ..protocol.images import image_info, input_images
 from .admission import Admission, not_ready
 from .events import Assembler, AssemblyError, new_id
 from .worker_client import Job, WorkerClient, WorkerGone
@@ -157,6 +158,18 @@ class Runtime:
         if params["model"] != self.alias:
             raise ProtocolError("model_not_found", "Model not found.", "model")
         validation.request_violation(params, self.model)
+        self._check_images(params)
+
+    def _check_images(self, params: dict) -> None:
+        """Server image limits (protocol 11): how many, and how large a source the worker
+        decodes; sizes come from the headers the structural check already read."""
+        images = input_images(params["input"])
+        if len(images) > self.limits.max_images:
+            raise ProtocolError("invalid_request", "The request holds too many images.", "input")
+        for param, part in images:
+            info = image_info(part["image_url"])
+            if info is not None and info.width * info.height > self.limits.max_image_source_pixels:
+                raise ProtocolError("invalid_image", "The image is too large to decode.", param)
 
     def ready(self) -> bool:
         return self.state == "ready" and self.worker is not None and self.worker.alive
@@ -238,7 +251,7 @@ class ResponseRun:
         if first.get("type") == "rejected":
             await self.close()
             code = first.get("code", "internal_error")
-            param = "input" if code == "context_length_exceeded" else None
+            param = first.get("param") or ("input" if code == "context_length_exceeded" else None)
             raise ProtocolError(code, _REJECTED.get(code, _UNSERVED), param)
         if first.get("type") != "accepted":
             await self.close()
@@ -412,6 +425,9 @@ class ResponseRun:
                     "ssd_load_ms",
                     "ssd_spill_count",
                     "ssd_bytes_written",
+                    "image_count",
+                    "image_tokens",
+                    "vision_encode_ms",
                 )
             },
         )
@@ -420,6 +436,7 @@ class ResponseRun:
 _UNSERVED = "The request could not be served."
 _REJECTED = {
     "context_length_exceeded": "Input plus reserved output exceeds the model context window.",
+    "invalid_image": "The image could not be decoded.",
 }
 _FAILED = {
     "server_error": "The server failed while generating.",

@@ -21,6 +21,7 @@ from .sessions import SessionStore
 from .speculative import MtpDrafter
 from .structured import Structured
 from .tokens import Codec
+from .vision import ImagePolicy, VisionEncoder
 
 ADAPTERS = {"qwen38_flash_next": Qwen38Adapter}
 
@@ -47,7 +48,8 @@ def load(init: dict) -> Engine:
     drafter = load_drafter(model, Path(init["draft_dir"])) if init.get("draft_dir") else None
     weights = int(mx.get_active_memory())
     locked = lock_weights(model, *([drafter.model] if drafter is not None else []))
-    adapter = ADAPTERS[init["adapter"]](Codec(model_dir), init["model"])
+    policy = ImagePolicy.load(model_dir, init["images"]) if init.get("images") else None
+    adapter = ADAPTERS[init["adapter"]](Codec(model_dir), init["model"], policy)
     prefetcher = PlePrefetcher(lm, config.ple_threads) if external_ple(lm) else None
     budget = init.get("snapshot_budget_bytes")
     if budget is None:
@@ -92,6 +94,8 @@ def load(init: dict) -> Engine:
         if init["model"]["capabilities"].get("structured_output")
         else None,
     )
+    if policy is not None:
+        engine.vision = VisionEncoder(model.vision_tower, policy)
     engine.info = {
         "wired_limit_bytes": wired,
         "weights_bytes": weights,
@@ -102,6 +106,7 @@ def load(init: dict) -> Engine:
         "released_cache_bytes": released,
         "locked_bytes": locked,
         "ssd_cache": sessions.disk is not None,
+        "image_input": policy is not None,
     }
     engine.model_ref = model  # keeps the vision tower and config alive with the process
     return engine
@@ -291,6 +296,20 @@ def _terminal(messages: list[dict], what: str) -> dict:
     return last
 
 
+def _warmup_image() -> str:
+    """A 256x256 PNG data URL (red, white band): the vision path runs before ready."""
+    import base64
+    import io
+
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (256, 256), (200, 40, 40))
+    ImageDraw.Draw(image).rectangle((0, 0, 63, 255), fill=(255, 255, 255))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
 def warmup(engine: Engine, alias: str) -> None:
     """Exercises every path a request can take, before the gateway reports ready."""
 
@@ -372,6 +391,27 @@ def warmup(engine: Engine, alias: str) -> None:
         )
         if answer["type"] != "finished":
             raise WarmupError("structured output: the constrained answer failed")
+    if engine.vision is not None:
+        image = _run(
+            engine,
+            {
+                **base,
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "What colour is this?"},
+                            {"type": "input_image", "image_url": _warmup_image()},
+                        ],
+                    }
+                ],
+                "max_output_tokens": 4,
+                "reasoning": {"effort": "none"},
+            },
+        )
+        if _terminal(image, "image input")["type"] != "finished":
+            raise WarmupError("image input: the request failed")
     session = f"warmup:{secrets.token_hex(4)}"
     prompt = {**base, "input": [user("Warm the cache.")], "max_output_tokens": 4}
     warm = _terminal(_run(engine, {**prompt, "generate": False}, session), "prewarm")

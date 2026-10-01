@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   effectiveReasoningEffort,
+  imageInfo,
   incrementalInput,
+  inputImages,
   InputItem,
   requestViolation,
   parseStrictJson,
@@ -16,6 +18,7 @@ import {
   type StreamEvent,
 } from "../src/protocol/index.ts";
 import { MockEngine, mockModel } from "../src/mock/index.ts";
+import { pngDataUrl } from "../src/conformance/wire.ts";
 
 describe("strict JSON", () => {
   it("parses ordinary JSON like JSON.parse", () => {
@@ -241,5 +244,55 @@ describe("structured output values (§8.4)", () => {
     const value = schemaInstance(schema);
     expect(schemaValueViolation(value, schema)).toBeNull();
     expect(value).toMatchObject({ name: "text", count: 1, tags: ["a"], note: "text" });
+  });
+});
+
+describe("input images (§7.1, §11)", () => {
+  const model = mockModel();
+  const png = pngDataUrl(40, 24, [10, 200, 30]);
+  const pngBytes = Buffer.from(png.slice(png.indexOf(",") + 1), "base64");
+  // SOI, APP0 (empty), SOF0 (height 24, width 40), EOI: the structure a JPEG check reads.
+  const jpegBytes = Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x18, 0x00, 0x28, 0x01, 0x01, 0x11, 0x00,
+    0xff, 0xd9,
+  ]);
+  const url = (type: string, bytes: Buffer) => `data:image/${type};base64,${bytes.toString("base64")}`;
+  const user = (imageUrl: string) => ({
+    type: "message" as const,
+    role: "user" as const,
+    content: [
+      { type: "input_text" as const, text: "look" },
+      { type: "input_image" as const, image_url: imageUrl },
+    ],
+  });
+
+  it("reads the format and size of complete PNG and JPEG files", () => {
+    expect(imageInfo(png)).toEqual({ format: "png", width: 40, height: 24 });
+    expect(imageInfo(url("jpeg", jpegBytes))).toEqual({ format: "jpeg", width: 40, height: 24 });
+  });
+
+  it("rejects other bytes, a format that differs from the declared one and cut files", () => {
+    expect(imageInfo(url("png", Buffer.from("plain text, no image")))).toBeNull();
+    expect(imageInfo(url("jpeg", pngBytes))).toBeNull();
+    expect(imageInfo(url("png", jpegBytes))).toBeNull();
+    expect(imageInfo(url("png", pngBytes.subarray(0, pngBytes.length - 12)))).toBeNull();
+    expect(imageInfo(url("jpeg", jpegBytes.subarray(0, jpegBytes.length - 2)))).toBeNull();
+  });
+
+  it("names the image that fails, in messages and in tool outputs", () => {
+    const params = (input: ResponseParams["input"]): ResponseParams => ({ model: model.id, input });
+    const broken = url("png", Buffer.from("nope"));
+    expect(requestViolation(params([user(png)]), model)).toBeNull();
+    expect(requestViolation(params([user(broken)]), model)).toMatchObject({ code: "invalid_image", param: "input[0].content[1]" });
+    const call = { type: "function_call" as const, call_id: "c1", name: "shot", arguments: "{}" };
+    const output = { type: "function_call_output" as const, call_id: "c1", output: [{ type: "input_image" as const, image_url: broken }] };
+    expect(requestViolation(params([user(png), call, output]), model)).toMatchObject({ code: "invalid_image", param: "input[2].output[0]" });
+    expect(inputImages([user(png), call, output]).map((image) => image.param)).toEqual(["input[0].content[1]", "input[2].output[0]"]);
+  });
+
+  it("checks the modality before the image itself", () => {
+    const text = mockModel({ input_modalities: ["text"] });
+    const params: ResponseParams = { model: text.id, input: [user(url("png", Buffer.from("nope")))] };
+    expect(requestViolation(params, text)).toMatchObject({ code: "unsupported_parameter", param: "input[0]" });
   });
 });

@@ -2,7 +2,8 @@
 
 A frame is a 4-byte big-endian length followed by that many bytes of UTF-8 JSON (one
 object). The channel is an inherited socketpair, never a port or a file. Large state (KV,
-snapshots) never crosses it; the biggest payload is a full request (HTTP body limit 16 MiB).
+snapshots) never crosses it; the biggest payload is a full request (HTTP body limit 64 MiB,
+images included; a WebSocket continuation expands past it and is refused when it does not fit).
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import socket
 import struct
 import threading
 
-MAX_FRAME_BYTES = 20 * 1024 * 1024
+MAX_FRAME_BYTES = 96 * 1024 * 1024
 HEADER = struct.Struct(">I")
 
 

@@ -2,6 +2,7 @@
 // the SDK, so the same cases judge the mock server now and the real backend later.
 // Cases only assume behaviour every compliant server must show, whatever the model says.
 import assert from "node:assert/strict";
+import { crc32, deflateSync } from "node:zlib";
 import WebSocket from "ws";
 import {
   ErrorBody,
@@ -78,6 +79,48 @@ const CITY_SCHEMA = {
   additionalProperties: false,
 };
 
+/** A complete RGB PNG of one colour with a white band on the left, as a data URL. */
+export function pngDataUrl(width: number, height: number, rgb: readonly [number, number, number]): string {
+  const row = width * 3 + 1;
+  const raw = Buffer.alloc(row * height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const color = x < width / 4 ? [255, 255, 255] : rgb;
+      raw.set(color, y * row + 1 + x * 3);
+    }
+  }
+  const chunk = (type: string, data: Buffer) => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(body));
+    return Buffer.concat([length, body, crc]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([8, 2, 0, 0, 0], 8); // 8-bit RGB, no interlace
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const file = Buffer.concat([signature, chunk("IHDR", header), chunk("IDAT", deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
+  return `data:image/png;base64,${file.toString("base64")}`;
+}
+
+function imageMessage(text: string, imageUrl: string): InputItem {
+  return {
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_text", text },
+      { type: "input_image", image_url: imageUrl },
+    ],
+  };
+}
+
+const supportsImages = (context: WireContext) => context.model.input_modalities.includes("image");
+const RED = [200, 40, 40] as const;
+const BLUE = [40, 60, 200] as const;
+
 function baseRequest(context: WireContext, text = "Reply with one short sentence.") {
   return { model: context.target.model, input: [userMessage(text)], max_output_tokens: 256 };
 }
@@ -104,7 +147,7 @@ async function expectError(response: Response, status: number, code: HttpErrorCo
   assert.equal(response.status, status, `expected HTTP ${status} ${code}, got ${response.status}: ${text}`);
   const body = ErrorBody.safeParse(JSON.parse(text));
   assert.ok(body.success, `error body does not match the protocol: ${text}`);
-  assert.equal(body.data.error.code, code);
+  assert.equal(body.data.error.code, code, `expected ${code}, got: ${text}`);
 }
 
 /** Posts a streaming request and validates every event against §7.3. */
@@ -589,6 +632,102 @@ export const wireCases: WireCase[] = [
         if (item.type !== "function_call" || item.name !== "record_city") continue;
         assert.equal(schemaValueViolation(JSON.parse(item.arguments), CITY_SCHEMA), null);
       }
+    },
+  },
+  {
+    id: "W27",
+    title: "input images are accepted when the model declares them and counted as input (§7.1)",
+    async run(context) {
+      const question = "What colour is this image? Answer in one word.";
+      const request = {
+        ...baseRequest(context),
+        input: [imageMessage(question, pngDataUrl(256, 256, RED))],
+        max_output_tokens: 64,
+        reasoning: { effort: lightestEffort(context) },
+      };
+      if (!supportsImages(context)) {
+        const body = JSON.stringify({ ...request, stream: true });
+        await expectError(await http(context.target, "POST", "/responses", { body }), 400, "unsupported_parameter");
+        return;
+      }
+      const { response } = await streamHttp(context.target, request);
+      assert.notEqual(response.status, "failed", `failed: ${JSON.stringify(response.error)}`);
+      const { response: plain } = await streamHttp(context.target, { ...request, input: [userMessage(question)] });
+      const withImage = response.usage?.input_tokens ?? 0;
+      assert.ok(withImage > (plain.usage?.input_tokens ?? 0), "the image adds no input tokens");
+      if (context.model.capabilities.input_tokens) {
+        const { stream: _stream, ...countable } = { ...request, stream: undefined };
+        const counted = await http(context.target, "POST", "/responses/input_tokens", { body: JSON.stringify(countable) });
+        assert.equal(counted.status, 200);
+        assert.equal(InputTokensResult.parse(await counted.json()).input_tokens, withImage);
+      }
+    },
+  },
+  {
+    id: "W28",
+    title: "an image in a tool output is accepted (§7.1)",
+    async run(context) {
+      if (!supportsImages(context)) return;
+      const call = { type: "function_call", call_id: "call_shot", name: "take_screenshot", arguments: "{}" } as const;
+      const output: InputItem = {
+        type: "function_call_output",
+        call_id: "call_shot",
+        output: [
+          { type: "input_text", text: "Screenshot:" },
+          { type: "input_image", image_url: pngDataUrl(320, 192, BLUE) },
+        ],
+      };
+      const { response } = await streamHttp(context.target, {
+        ...baseRequest(context, "Take a screenshot and tell me its main colour."),
+        input: [userMessage("Take a screenshot and tell me its main colour."), call, output],
+        tools: [{ type: "function", name: "take_screenshot", description: "Capture the screen.", parameters: { type: "object", properties: {} } }],
+        tool_choice: "none",
+        max_output_tokens: 64,
+        reasoning: { effort: lightestEffort(context) },
+      });
+      assert.notEqual(response.status, "failed", `failed: ${JSON.stringify(response.error)}`);
+    },
+  },
+  {
+    id: "W29",
+    title: "an image that is not a complete PNG or JPEG of its declared type is rejected (§7.1)",
+    async run(context) {
+      if (!supportsImages(context)) return;
+      const valid = pngDataUrl(64, 64, RED);
+      const bytes = Buffer.from(valid.slice(valid.indexOf(",") + 1), "base64");
+      const broken = [
+        `data:image/png;base64,${Buffer.from("not an image at all, just text").toString("base64")}`,
+        `data:image/jpeg;base64,${bytes.toString("base64")}`, // PNG bytes declared as JPEG
+        `data:image/png;base64,${bytes.subarray(0, bytes.length - 20).toString("base64")}`, // cut short
+      ];
+      for (const imageUrl of broken) {
+        const body = JSON.stringify({ ...baseRequest(context), input: [imageMessage("Describe it.", imageUrl)], stream: true });
+        await expectError(await http(context.target, "POST", "/responses", { body }), 400, "invalid_image");
+      }
+    },
+  },
+  {
+    id: "W30",
+    title: "the prefix cache tells two images of the same size apart (§7.1, X1)",
+    requires: "prompt_cache",
+    async run(context) {
+      if (!supportsImages(context)) return;
+      const key = `wire-images-${Date.now()}`;
+      const ask = (rgb: readonly [number, number, number]) =>
+        streamHttp(context.target, {
+          ...baseRequest(context),
+          input: [imageMessage("What colour is this image? Answer in one word.", pngDataUrl(256, 256, rgb))],
+          max_output_tokens: 16,
+          reasoning: { effort: lightestEffort(context) },
+          prompt_cache_key: key,
+        });
+      await ask(RED);
+      const again = (await ask(RED)).response.usage;
+      assert.ok(again, "no usage");
+      assert.equal(again.input_tokens_details.cached_tokens, again.input_tokens, "the same request was not fully cached");
+      const other = (await ask(BLUE)).response.usage;
+      assert.ok(other, "no usage");
+      assert.ok(other.input_tokens_details.cached_tokens < other.input_tokens, "a different image reused the cached image");
     },
   },
 ];

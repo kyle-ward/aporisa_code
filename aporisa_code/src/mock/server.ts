@@ -12,6 +12,7 @@ import {
   isTerminalEvent,
   outputAsInput,
   parseStrictJson,
+  inputImages,
   requestViolation,
   sameContinuationProperties,
   StrictJsonError,
@@ -34,6 +35,8 @@ export interface MockServerOptions {
   chunkSize?: number;
   chunkDelayMs?: number;
   maxBodyBytes?: number;
+  /** Most input_image parts one request may hold, history and tool outputs included (§11). */
+  maxImages?: number;
   concurrency?: number;
   maxQueue?: number;
   queueTimeoutMs?: number;
@@ -85,7 +88,7 @@ export class MockServer {
   /** Full (continuation-expanded) request parameters of every admitted generation. */
   readonly requests: ResponseParams[] = [];
 
-  private readonly options: Required<Pick<MockServerOptions, "maxBodyBytes" | "keepaliveMs" | "retryAfterSeconds">> &
+  private readonly options: Required<Pick<MockServerOptions, "maxBodyBytes" | "maxImages" | "keepaliveMs" | "retryAfterSeconds">> &
     Pick<MockServerOptions, "connectionLifetimeMs" | "rejectWebSocketUpgrade">;
   private readonly admission: Admission;
   private readonly server: Server;
@@ -103,6 +106,7 @@ export class MockServer {
     });
     this.options = {
       maxBodyBytes: options.maxBodyBytes ?? 4 * 1024 * 1024,
+      maxImages: options.maxImages ?? 64,
       keepaliveMs: options.keepaliveMs ?? 15_000,
       retryAfterSeconds: options.retryAfterSeconds ?? 1,
       ...(options.connectionLifetimeMs !== undefined ? { connectionLifetimeMs: options.connectionLifetimeMs } : {}),
@@ -243,7 +247,7 @@ export class MockServer {
     const shaped = parseShape(InputTokensRequest, body);
     if (!shaped.ok) return this.sendError(response, shaped.error.code, shaped.error.param, shaped.error.message);
     if (shaped.value.model !== this.model.id) return this.sendError(response, "model_not_found", "model", "Unknown model.");
-    const violation = requestViolation(shaped.value, this.model);
+    const violation = requestViolation(shaped.value, this.model) ?? this.limitViolation(shaped.value);
     if (violation) return this.sendError(response, violation.code, violation.param, violation.message);
     return this.sendJson(response, 200, { object: "response.input_tokens", input_tokens: this.engine.inputTokens(shaped.value) });
   }
@@ -257,13 +261,21 @@ export class MockServer {
       previous_response_id?: string;
     };
     if (params.model !== this.model.id) return fail("model_not_found", "model", "Unknown model.");
-    const violation = requestViolation(params, this.model);
+    const violation = requestViolation(params, this.model) ?? this.limitViolation(params);
     if (violation) return { ok: false, error: violation };
     if (this.engine.exceedsContext(params)) {
       return fail("context_length_exceeded", "input", "Input exceeds the model context window.");
     }
     if (!this.ready) return fail("service_not_ready", null, "The service is not ready.");
     return { ok: true, params };
+  }
+
+  /** Server limits beyond the model's (§11). */
+  private limitViolation(params: Pick<ResponseParams, "input">): PreparedError | null {
+    if (inputImages(params.input).length > this.options.maxImages) {
+      return { code: "invalid_request", param: "input", message: "The request holds too many images." };
+    }
+    return null;
   }
 
   private sendJson(response: ServerResponse, status: number, body: unknown): void {

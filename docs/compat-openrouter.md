@@ -54,6 +54,7 @@
 | Aporisa | 处理 | 说明 |
 |---|---|---|
 | `message`、`function_call`、`function_call_output` | 映射 | 形状一致 |
+| `input_image`（user 消息与工具结果中） | 映射 | 形状一致，data URL 原样传递，`detail` 原样传递。driver 先按协议第 7.1 节做结构检查（格式与声明一致、文件完整），不通过时本地返回 `invalid_image`，不发往上游。`input_modalities` 取上游模型的声明；工具结果里的图片、`detail` 对分辨率的影响、图片 token 是否计入 usage，都待实测 |
 | `message.phase` | **模拟或丢弃** | 上游可能不提供。driver 在输出里不带 `phase`；回传时去掉这个字段（待实测上游是否接受） |
 | `reasoning` | 映射，有损 | 上游给的是 `summary` 加上**不透明**的 `encrypted_content`，通常没有明文 `content`。回传时必须原样保留，不能修改 |
 | `response.reasoning_text.delta` | 映射 | OpenRouter 文档中的事件名是 `response.reasoning.delta`，driver 负责改名（待实测实际的事件名） |

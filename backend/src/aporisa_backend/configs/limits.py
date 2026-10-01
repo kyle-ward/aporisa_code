@@ -18,13 +18,19 @@ class ServiceLimits:
     queue_timeout_s: float = 60
     request_timeout_s: float = 1800
     idle_timeout_s: float = 180
-    max_body_bytes: int = 16 * MIB
+    # A stateless HTTP request resends its whole history, images included (B2-6 decision 2:
+    # 16 MiB held only ~5-10 screenshots). The worker frame limit (ipc/frames.py) is above it.
+    max_body_bytes: int = 64 * MIB
     upload_timeout_s: float = 60
     max_http_tasks: int = 32
     max_output_bytes: int = 4 * MIB
     sse_keepalive_s: float = 15
     ws_lifetime_s: float = 3600
-    ws_max_message_bytes: int = 16 * MIB
+    ws_max_message_bytes: int = 64 * MIB
+    # input_image parts per request, history and tool outputs included (protocol 11).
+    max_images: int = 64
+    # Largest source image the worker decodes (width x height before resizing; ~8K x 8K).
+    max_image_source_pixels: int = 64 * MIB
     retry_after_s: int = 5
     shutdown_drain_s: float = 30
     # The worker spends up to shutdown_spill_s (configs/engine.py, 30 s) writing sessions

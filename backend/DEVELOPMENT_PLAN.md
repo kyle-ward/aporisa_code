@@ -163,7 +163,7 @@
 | `effective_context_window_percent` | 95 | 与 codex 一致 |
 | `auto_compact_token_limit` | null，由 harness 按窗口的 90% 推导 | 实测延迟后再考虑给出建议值 |
 | `truncation_policy` | `{"mode":"bytes","limit":10000}` | 与 codex 默认值一致 |
-| `input_modalities` | B1：`["text"]`；B2 视情况加入 `"image"` | 视觉编码器放到 B2 |
+| `input_modalities` | B1：`["text"]`；B2-6 起 `["text","image"]` | 视觉塔随模型权重一起加载 |
 | `reasoning.supported_efforts` | `["none","low","medium","high"]` | 映射见第 5.2 节 |
 | `reasoning.summary` | false | 模型只输出原始推理 |
 | `capabilities` | 见第 5.5 节 | 按阶段逐项开启 |
@@ -349,7 +349,8 @@
 | 排队等待超时 | 60 秒，超时返回 429 `queue_timeout` |
 | 单次生成总期限 | 1800 秒 |
 | 空闲超时 | 收到第一个 token 后，连续 180 秒没有新 token 就判定超时 |
-| HTTP 正文 | 16 MiB |
+| HTTP 正文 | 64 MiB（B2-6 起；原为 16 MiB，只够放约 5–10 张截图的历史） |
+| 每个请求的图片 | 最多 64 张（含历史和工具结果）；单张原图最多约 6,700 万像素（约 8K×8K） |
 | 输出字节 | 4 MiB |
 | WebSocket 连接最长寿命 | 60 分钟，与 codex 一致 |
 
@@ -404,6 +405,7 @@ B1 起，每个请求记录以下字段，这些数据同时也是报告的实�
 | `ple_cache_hit_rate` | PLE 行缓存命中率 | B2（行缓存属于 B2-5） |
 | `ssd_spill_count`、`ssd_bytes_written` | 本次请求期间写入 SSD 缓存的会话数和字节数（淘汰时写入）；没有 SSD 缓存时不输出 | B2 P4 |
 | `ssd_load_ms` | 从 SSD 恢复会话的耗时（读入、校验、建 cache）；只在 `restore_path=ssd` 时输出 | B2 P4 |
+| `image_count`、`image_tokens`、`vision_encode_ms` | 请求中的图片数、图片 token 数、本次视觉编码的耗时（已在缓存中的图片不再编码）；没有图片时不输出 | B2 P5 |
 
 B2 的字段在实现之前不输出，不用 0 占位。
 
@@ -539,6 +541,22 @@ backend/
 - **计量**：每个请求 `ssd_spill_count`、`ssd_bytes_written`、`ssd_load_ms`；`/health/runtime` 的 worker 视图增加 `ssd_cache_bytes`、`ssd_checkpoints`、`ssd_written_bytes`、`ssd_read_bytes`、`ssd_errors`。
 - **验收**（重启需要用户执行）：`validate_runtime.py --restart-prepare 200000` 建立约 200K 的会话，记下 key、长度和提示词的哈希；用户执行 `./backend_service.sh restart`；`validate_runtime.py --restart-resume` 发送同一个请求，要求 `restore_path=ssd`、全部 token 命中、首 token 在 10 秒内。
 
+**P5（B2-6 图片输入）定稿（2026-10-01，用户确认四项建议）**：
+1. 分辨率上限：`detail=auto` 最多约 100 万像素（约 1,024 个 token），`high` 最多约 400 万像素（约 4,096 个 token）；模型自己的上限 1,600 万像素不开放。视觉塔剖析后维持（一张 auto 图约 1.9 秒、high 图约 8.4 秒，见 validation.md）。
+2. HTTP 正文、WebSocket 消息上限提高到 64 MiB，IPC 单帧 96 MiB；每个请求最多 64 张图片。
+3. 顺序：图片输入在调优之前做（它改动位置计算和缓存的键）。
+4. 前端这次只做合同层（一致性测试、mock、协议说明）；`view_image` 工具和 UI 上传放到对应的前端阶段，作为必做项登记（见下文）。
+
+**P5 实现要点**：
+- **合同**（protocol.md 第 7.1、11 节）：`image_url` 必须是与声明格式一致、能完整解码的 PNG 或 JPEG；`detail` 决定分辨率上限，保持宽高比缩放，从不裁剪；图片 token 计入 `input_tokens`、`cached_tokens` 和上下文检查；前缀缓存按图片内容区分；图片数超出上限返回 `invalid_request`，原图太大返回 `invalid_image`。前后端共用同一套结构检查（声明的格式、文件头里的尺寸、文件完整），worker 再完整解码。一致性测试新增 W27–W30。
+- **渲染**（`engine/adapters/qwen38.py`）：按 template 的 `render_content`，图片在 user 消息和工具结果里渲染为 `<|vision_start|><|image_pad|><|vision_end|>`，pad 展开为图片的 token 数（模型的处理器对 template 文本做的就是这件事）；小模型测试中与「官方 template + 展开」逐 token 一致。占位用带随机数的私有字符标记，请求文本无法伪造。视觉 token 从采样中禁止。
+- **尺寸与预处理**（`engine/vision.py`）：用 mlx-vlm 自带的 Qwen3-VL 处理器（numpy + PIL 的移植，不需要 torch，也是 mlx-vlm 服务这个模型时用的）：缩放到 32 的倍数，每 32×32 像素一个 token，最少 64 个 token。与参考处理器不同的一点：先按 EXIF 方向旋转，照片按显示的方向看。网关只读文件头；worker 在流开始前对还要预填充的图片完整解码（PNG 先校验每个块的 CRC：PIL 会宽松地解出损坏的数据），失败以 `rejected`（`invalid_image`，带出错的部分）结束，网关返回 400。
+- **位置**：M-RoPE 三维位置（时间、行、列）。图片之后的文本从图片的最大位置 + 1 继续，所以位置不再等于 token 序号；整个请求的位置在渲染时算好，预填充按块切片，解码用「偏移 + 位移」。小模型上与 mlx-vlm 的 `get_rope_index` 逐项相同。
+- **预填充**：覆盖图片 token 的块，以 embedding 输入，pad 的位置换成视觉塔的特征（每张图片在第一次需要时编码一次，用完即释放）；一块只装下一张图片的一部分也可以。小模型上整段一块时与 mlx-vlm 自己的图片路径（`get_input_embeddings` 加一次前向）逐位一致，把图片切在两块之间时只差 kernel 级的舍入。
+- **缓存的键**：所有 pad 的 token id 相同，只按 token 比较会让两张同尺寸的不同图片共用 KV。渲染时生成一份「键序列」：每张图片的第一个 pad 换成由图片摘要（内容、`detail`、缩放后的尺寸）得到的负数，其余与 token 相同。会话匹配（live、snapshot）和 SSD 的链式哈希都用键序列，模型仍然收到真实的 token id；纯文本请求的键就是 token，原有的 SSD 缓存仍然有效。提示词查找的草稿遇到图片（负数键或视觉 token）就截断。
+- **计量**：`image_count`、`image_tokens`、`vision_encode_ms`；`/health/runtime` 的 worker 视图增加 `image_input`。预热包括一次图片请求。
+- **前端后续（必做，登记于此，按前端阶段实现）**：OpenRouter driver 的 `input_image` 映射（F2，见 compat-openrouter.md，待实测）；harness 参照 codex 实现 `view_image` 工具（读取本地图片，以工具结果中的 `input_image` 交给模型）；UI 支持在消息中粘贴或拖入图片。
+
 **B2 的验收**：集成节点 I2，即 F6 和 F7 的实验在「完整 C」下重跑，并与 OpenRouter 的结果对照。
 
 **B2 定稿（2026-10-01，用户确认）**：
@@ -616,7 +634,7 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 
 - worker 是网关的子进程，用 `start_new_session=True` 启动，停机时由网关结束它的进程组（AGENTS.md 的停机顺序）。
 - **通道**：`socket.socketpair()`，子进程通过 `pass_fds` 继承其中一端。不经过文件系统，不需要内部 token，其他进程接触不到。worker 的 stdout 不承载协议，因为第三方库会往里打印；启动阶段保留 stderr 的有界尾部用于诊断（local_asr 的做法），就绪后丢弃。
-- **帧**：4 字节大端长度 + UTF-8 JSON，单帧上限 20 MiB（HTTP 正文上限 16 MiB 加余量）。选 JSON 不选 msgpack：负载主要是文本，KV 等大块状态从不经过 IPC，JSON 不需要额外依赖，也方便测试。
+- **帧**：4 字节大端长度 + UTF-8 JSON，单帧上限 96 MiB（HTTP 正文上限 64 MiB 加余量；B2-6 前为 20 MiB）。WebSocket 续接展开后超出单帧上限的请求返回 413，不当作 worker 故障。选 JSON 不选 msgpack：负载主要是文本，KV 等大块状态从不经过 IPC，JSON 不需要额外依赖，也方便测试。
 - **网关 → worker**：
 
 | op | 字段 | 说明 |
@@ -827,4 +845,6 @@ backend/tests/                  单元测试、网关测试（假 worker）、IP
 - **2026-10-01**：P3.5 真实验证：一轮一次采样让改代码提速 9–13%，锁定权重 68.1 GiB、长上下文正常；普通回答因查找短匹配误中慢约 6%（`speculative` 未过）。改为短匹配须与 MTP 的预测一致才用查找草稿。
 - **2026-10-01**：P3.5 与权重锁定通过验收（验证 12 项、W01–W26 全部通过；普通回答 44.0 / 45.4 tok/s，改代码 154.7 tok/s）。
 - **2026-10-01**：P4（B2-1 SSD 溢出与重启恢复）定稿：用户采用四项建议（读盘校验、停机预算 45 / 120 秒、不做跨会话系统提示复用、不新增生命周期模式）。代码完成：`engine/disk_cache.py`、会话淘汰与停机时写入、请求时从 SSD 恢复、计量、`validate_runtime.py` 的重启验收。
+- **2026-10-01**：P5（B2-6 图片输入）定稿：用户采用四项建议（分辨率上限 auto 约 100 万、high 约 400 万像素；正文 64 MiB、每请求 64 张图；先于调优；前端只做合同层）。合同（protocol 第 7.1、11 节、W27–W30、mock、TS 结构检查）与后端实现完成，小模型测试通过。
+- **2026-10-01**：P5 通过验收（用户报告后端 CI 通过）并提交。真实验证：视觉塔剖析（4,096 个图片 token 编码 3.2 秒、带图预填充 8.4 秒，峰值比权重多 3.85 GB，无压缩），维持分辨率上限；验证脚本 12 项（含 `images`）与 W01–W30 通过。
 - **2026-10-01**：P4 通过验收（用户报告后端 CI 通过）并提交。真实验收：197K 会话停机写盘 6.5–7.8 秒，重启后从 SSD 恢复 1.4–1.7 秒、首 token 1.9–2.2 秒（冷启动 320–331 秒）。第一次恢复时系统压缩了约 7 GB（经主机内存中转），改为直接读进 MLX 数组后为 0。

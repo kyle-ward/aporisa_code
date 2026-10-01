@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from .errors import ProtocolError
+from .images import image_info, input_images
 
 SCHEMA_TYPES = {"object", "array", "string", "number", "integer", "boolean", "null"}
 ALLOWED_KEYWORDS = {
@@ -218,6 +219,13 @@ def input_violation(items: list[dict], model: dict) -> None:
                 )
     if open_calls:
         raise _fail("invalid_request", "input", "Every tool call needs exactly one later output.")
+    for param, part in input_images(items):
+        if image_info(part["image_url"]) is None:
+            raise _fail(
+                "invalid_image",
+                param,
+                "The image is not a complete PNG or JPEG of the declared type.",
+            )
 
 
 def effective_effort(params: dict, model: dict) -> str:

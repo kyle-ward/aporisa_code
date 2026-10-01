@@ -9,6 +9,7 @@ import pytest
 from assets import MODEL_DIR, requires_tokenizer
 
 from aporisa_backend.configs.models import PROFILES, active_pointer, public_model
+from aporisa_backend.engine.vision import VISION_IDS
 
 pytestmark = requires_tokenizer
 
@@ -271,11 +272,12 @@ def test_token_map_reuses_generated_ids(adapter):
 
 
 def test_tool_choice_none_and_parallel_flags(adapter):
+    vision = tuple(sorted(VISION_IDS))  # input-only tokens are never sampled
     plan = adapter.render({"model": ALIAS, "input": [user("x")], "tool_choice": "none"})
-    assert plan.banned_ids == (248058,)
+    assert plan.banned_ids == (248058, *vision)
     assert plan.stop_after_call
     plan = adapter.render({"model": ALIAS, "input": [user("x")], "parallel_tool_calls": True})
-    assert plan.banned_ids == () and not plan.stop_after_call
+    assert plan.banned_ids == vision and not plan.stop_after_call
 
 
 # --- parser ------------------------------------------------------------------------------------
@@ -438,3 +440,202 @@ def test_parsed_items_render_back_to_the_generated_text(adapter):
     )
     check_stream(events, parser)
     assert assistant_turn(parser.items) == "<|im_start|>assistant\n<think>\n" + completion
+
+
+# --- images (B2-6) ---------------------------------------------------------------------------
+
+
+def image_url(width, height, color=(200, 40, 40), kind="PNG", orientation=None):
+    import base64
+    import io
+
+    from PIL import Image
+
+    image = Image.new("RGB", (width, height), color)
+    image.paste((255, 255, 255), (0, 0, max(1, width // 4), height))
+    buffer = io.BytesIO()
+    options = {}
+    if orientation is not None:
+        exif = Image.Exif()
+        exif[0x0112] = orientation
+        options["exif"] = exif.tobytes()
+    image.save(buffer, format=kind, **options)
+    return f"data:image/{kind.lower()};base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def picture(url, detail=None):
+    part = {"type": "input_image", "image_url": url}
+    return {**part, "detail": detail} if detail else part
+
+
+@pytest.fixture(scope="module")
+def policy():
+    from aporisa_backend.engine.vision import ImagePolicy
+    from aporisa_backend.gateway.process_worker import image_policy
+
+    return ImagePolicy.load(MODEL_DIR, image_policy(PROFILES[IDENTITY]))
+
+
+@pytest.fixture(scope="module")
+def seeing(codec, policy):
+    from aporisa_backend.engine.adapters.qwen38 import Qwen38Adapter
+
+    return Qwen38Adapter(codec, MODEL, policy)
+
+
+def test_render_with_images_equals_template_and_processor(seeing, official):
+    """The template's placeholders, each pad expanded to the image's tokens (what the model's
+    processor does to the template text), tokenized as one string."""
+    from aporisa_backend.engine.vision import IMAGE_PAD
+
+    first, second = image_url(640, 480), image_url(300, 900, (10, 90, 200))
+    request = {
+        "model": ALIAS,
+        "tools": TOOLS[:1],
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "  Compare "},
+                    picture(first),
+                    {"type": "input_text", "text": " with the screenshot. "},
+                ],
+            },
+            call("c1", "exec_command", {"cmd": "screenshot"}),
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [{"type": "input_text", "text": "Saved:"}, picture(second, "high")],
+            },
+        ],
+    }
+    plan = seeing.render(request)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "  Compare "},
+                {"type": "image"},
+                {"type": "text", "text": " with the screenshot. "},
+            ],
+        },
+        {
+            "role": "assistant",
+            "reasoning_content": "",
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": {"cmd": "screenshot"}},
+                }
+            ],
+        },
+        {"role": "tool", "content": [{"type": "text", "text": "Saved:"}, {"type": "image"}]},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {k: TOOLS[0][k] for k in ("name", "description", "parameters")},
+        }
+    ]
+    text = official.apply_chat_template(
+        messages, tools=tools, tokenize=False, add_generation_prompt=True, reasoning_effort="medium"
+    )
+    pads = [spec.tokens for _, spec in plan.images]
+    pieces = text.split("<|image_pad|>")
+    assert len(pieces) == 3
+    expanded = (
+        pieces[0] + "<|image_pad|>" * pads[0] + pieces[1] + "<|image_pad|>" * pads[1] + pieces[2]
+    )
+    assert plan.tokens == official.encode(expanded, add_special_tokens=False)
+    for start, spec in plan.images:
+        assert plan.tokens[start - 1 : start + spec.tokens + 1] == [
+            248053,
+            *[IMAGE_PAD] * spec.tokens,
+            248054,
+        ]
+    assert [spec.param for _, spec in plan.images] == ["input[0].content[1]", "input[2].output[1]"]
+
+
+def test_image_tokens_follow_the_detail_caps(seeing, policy):
+    from aporisa_backend.engine.vision import describe
+
+    def tokens(width, height, detail=None):
+        return describe(picture(image_url(width, height), detail), "p", policy).tokens
+
+    assert tokens(64, 64) == 64  # scaled up to the model's minimum (256x256)
+    assert tokens(512, 512) == 256  # 32x32 pixels per token, already within the cap
+    assert tokens(1920, 1080) <= 1024 < tokens(1920, 1080, "high") <= 4096
+    assert tokens(4000, 3000, "high") <= 4096
+    # the same count as the processor that preprocesses the pixels
+    processor = policy.processor("auto")
+    assert tokens(1920, 1080) == processor.num_image_tokens(1080, 1920)
+
+
+def test_keys_tell_images_apart_and_positions_follow_mrope(seeing):
+    import numpy as np
+
+    def render(color, detail=None):
+        content = [
+            {"type": "input_text", "text": "Look:"},
+            picture(image_url(320, 256, color), detail),
+        ]
+        return seeing.render(
+            {"model": ALIAS, "input": [{"type": "message", "role": "user", "content": content}]}
+        )
+
+    red, blue, red_again = render((200, 40, 40)), render((40, 40, 200)), render((200, 40, 40))
+    assert red.tokens == blue.tokens  # pads are pads
+    assert red.keys == red_again.keys and red.keys != blue.keys
+    [(start, spec)] = red.images
+    assert red.keys[start] < 0 and red.keys[start + 1 :] == red.tokens[start + 1 :]
+    assert red.keys[:start] == red.tokens[:start]
+    # text before the image counts up; the image takes (row, column) positions; text after
+    # continues from the image's largest position + 1
+    positions = red.positions
+    assert (positions[:, :start] == np.arange(start)).all()
+    h, w = spec.grid_h, spec.grid_w
+    assert (positions[0, start : start + h * w] == start).all()
+    assert positions[1, start + w] == start + 1 and positions[2, start + 1] == start + 1
+    after = start + h * w
+    assert positions[0, after] == start + max(h, w)
+    assert red.position_shift == positions[0, -1] + 1 - len(red.tokens)
+    assert render((200, 40, 40), "high").keys[start] != red.keys[start]  # detail is identity
+
+
+def test_exif_orientation_is_applied(policy):
+    from aporisa_backend.engine.vision import decode, describe
+
+    spec = describe(picture(image_url(400, 200, kind="JPEG", orientation=6)), "p", policy)
+    assert (spec.width, spec.height) == (200, 400)
+    assert decode(spec, policy).shape == (3, 400, 200)
+
+
+def test_unusable_images_name_their_part(adapter, policy):
+    import base64
+
+    from aporisa_backend.engine.vision import ImageError, describe
+
+    png = image_url(64, 64)
+    data = base64.b64decode(png.split(",", 1)[1])
+    cases = [
+        "data:image/jpeg;base64," + base64.b64encode(data).decode(),  # declared JPEG, is PNG
+        image_url(20_000, 40),  # aspect ratio beyond 200:1
+    ]
+    for url in cases:
+        with pytest.raises(ImageError) as error:
+            describe(picture(url), "input[0].content[1]", policy)
+        assert error.value.param == "input[0].content[1]"
+    from dataclasses import replace
+
+    small = replace(policy, max_source_pixels=1000)
+    with pytest.raises(ImageError):
+        describe(picture(png), "p", small)
+    # an adapter without an image policy (a text-only model) cannot render one
+    request = {
+        "model": ALIAS,
+        "input": [{"type": "message", "role": "user", "content": [picture(png)]}],
+    }
+    with pytest.raises(ImageError):
+        adapter.render(request)

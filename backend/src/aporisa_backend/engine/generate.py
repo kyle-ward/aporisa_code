@@ -5,6 +5,11 @@ render -> context check -> session match (memory, then SSD) -> accepted -> chunk
 decode with the parser -> finished. Cancel and interrupt flags are checked between prefill
 chunks and between decode rounds. Every forward call passes explicit text positions.
 
+Images (B2-6, vision.py): a prefill chunk that covers image tokens is fed embeddings with
+the vision tower's features in place of the pads (each image encoded once, when its first
+chunk comes) and the plan's M-RoPE positions; decoding continues at offset + the plan's
+position shift. Sessions are matched on the plan's key sequence, which tells images apart.
+
 Decoding runs in rounds (B2-2, speculative.py): the bonus token b is sampled, the drafter
 proposes up to n tokens, one target forward verifies [b, d1..dn], and the target's own
 samples are emitted until one differs from its draft. Without a drafter (or when drafting
@@ -26,7 +31,8 @@ from .. import vmstats
 from ..protocol.structured import value_violation
 from .adapters.qwen38 import CALL_CLOSE, STOP_IDS, Qwen38Adapter, RenderPlan, TokenMap
 from .sessions import Session, SessionStore, cache_offset
-from .speculative import lookup_match
+from .speculative import lookup_match, text_only
+from .vision import VISION_IDS, ImageError, decode
 
 PREFILL_CHUNK = 2048
 
@@ -165,10 +171,20 @@ class Engine:
         self._vm_start: dict = {}
         self._disk_start = (0, 0)
         self._max_chunk_s = 0.0
+        self._vision_s = 0.0
+        self._images = (0, 0)  # (images, image tokens) of the current request
+        self.vision = None  # vision.VisionEncoder when the model takes images
 
     # --- model calls ----------------------------------------------------------------------
 
-    def _forward(self, cache: list, tokens: list[int], hidden: bool = False):
+    def _forward(
+        self,
+        cache: list,
+        tokens: list[int],
+        hidden: bool = False,
+        positions: mx.array | None = None,
+        embeds: mx.array | None = None,
+    ):
         """Prefill forward: (logits after the last token, pre-mixer hidden states or None).
 
         The model returns only the pre-mixer hidden states; the final mixer and lm_head run
@@ -177,11 +193,13 @@ class Engine:
         shares its parent's buffer, so the kept row pinned the whole gigabyte for as long as
         the session or a snapshot held it (unaccounted in session_bytes).
         """
-        offset = cache_offset(cache)
+        if positions is None:
+            positions = text_positions(cache_offset(cache), len(tokens))
         out = self.lm(
             mx.array([tokens], dtype=mx.int32),
+            inputs_embeds=embeds,
             cache=cache,
-            position_ids=text_positions(offset, len(tokens)),
+            position_ids=positions,
             return_hidden=True,
             skip_logits=True,
         )
@@ -190,7 +208,7 @@ class Engine:
         logits = self.lm.lm_head(last)[0, -1]
         return logits, (states if hidden else None)
 
-    def _verify(self, cache: list, tokens: list[int]):
+    def _verify(self, cache: list, tokens: list[int], shift: int = 0):
         """Forward over [bonus, drafts...]: every position's logits and hidden state.
 
         Short rounds take the model's batch-invariant decode path, the one single-token
@@ -198,11 +216,11 @@ class Engine:
         long context costs ~60 ms per extra token (P2 profile: 16 tokens take 964 ms at
         111K), so wide rounds take the prefill path instead, as a prompt chunk would
         (`verify_prefill_schedule`). Both are the model's own inference paths; they differ
-        only in kernel rounding.
+        only in kernel rounding. `shift` places the tokens after a prompt's images (M-RoPE).
         """
         offset = cache_offset(cache)
         ids = mx.array([tokens], dtype=mx.int32)
-        positions = text_positions(offset, len(tokens))
+        positions = text_positions(offset + shift, len(tokens))
         wide = _at(self.settings.verify_prefill_schedule, offset)
         if wide and len(tokens) >= wide:
             out = self.lm(
@@ -215,12 +233,22 @@ class Engine:
         return out.logits[0], out.hidden_states[-1]
 
     def _prefill(
-        self, session: Session, tokens: list[int], stops: list[int], flags: JobFlags, limit: int
+        self,
+        session: Session,
+        tokens: list[int],
+        stops: list[int],
+        flags: JobFlags,
+        limit: int,
+        plan: RenderPlan | None = None,
     ) -> bool:
         """Appends tokens[len(session.tokens):]; snapshots at every offset in `stops`.
 
-        Returns False when interrupted; what was prefilled stays in the session for reuse.
+        With a plan, the session records its cache keys and image chunks get their
+        features and positions. Returns False when interrupted; what was prefilled stays in
+        the session for reuse.
         """
+        keys = plan.cache_keys if plan is not None else tokens
+        features: dict[int, mx.array] = {}  # image index -> vision features, while needed
         start = len(session.tokens)
         cuts = sorted({s for s in stops if start < s <= len(tokens)} | {len(tokens)})
         pieces: list[tuple[int, int]] = []
@@ -240,8 +268,13 @@ class Engine:
                 return False
             chunk_started = time.monotonic()
             draft = session.draft
+            positions, embeds = self._image_inputs(plan, begin, end, features)
             logits, hidden = self._forward(
-                session.cache, tokens[begin:end], hidden=draft is not None
+                session.cache,
+                tokens[begin:end],
+                hidden=draft is not None,
+                positions=positions,
+                embeds=embeds,
             )
             if draft is not None:
                 self.drafter.observe(draft, tokens[begin:end], hidden, begin)
@@ -257,12 +290,45 @@ class Engine:
             # One chunk (PLE lookup + GPU) cannot be interrupted; its duration bounds how
             # fast a cancel is confirmed.
             self._max_chunk_s = max(self._max_chunk_s, time.monotonic() - chunk_started)
-            session.extend(tokens[begin:end])
+            if features:  # drop the features of images now fully in the cache
+                done = [i for i in features if plan.images[i][0] + plan.images[i][1].tokens <= end]
+                for index in done:
+                    del features[index]
+            session.extend(keys[begin:end])
             session.logits = logits
             if end in cuts:
                 session.snapshot(limit, self.drafter.snapshot(draft) if draft else None)
             mx.clear_cache()
         return True
+
+    def _image_inputs(self, plan: RenderPlan | None, begin: int, end: int, features: dict):
+        """(positions, embeddings) for prefill chunk [begin, end): None, None without images.
+        An image's features are computed when the first chunk covering it comes."""
+        if plan is None or plan.positions is None:
+            return None, None
+        positions = mx.array(plan.positions[:, begin:end])[:, None, :]
+        spans = [
+            (index, start, spec)
+            for index, (start, spec) in enumerate(plan.images)
+            if start < end and start + spec.tokens > begin
+        ]
+        if not spans:
+            return positions, None
+        embeds = self.lm.model.embed_tokens(mx.array([plan.tokens[begin:end]], dtype=mx.int32))
+        pieces, cursor = [], begin
+        for index, start, spec in spans:
+            if index not in features:
+                encode_started = time.monotonic()
+                features[index] = self.vision.encode(spec)
+                self._vision_s += time.monotonic() - encode_started
+            first, last = max(start, begin), min(start + spec.tokens, end)
+            if first > cursor:
+                pieces.append(embeds[:, cursor - begin : first - begin])
+            pieces.append(features[index][None, first - start : last - start].astype(embeds.dtype))
+            cursor = last
+        if cursor < end:
+            pieces.append(embeds[:, cursor - begin :])
+        return positions, mx.concatenate(pieces, axis=1)
 
     @staticmethod
     def _wait(future, flags: JobFlags) -> bool:
@@ -296,22 +362,37 @@ class Engine:
         self._vm_start = vmstats.sample()
         self._disk_start = self._disk_counters()
         self._max_chunk_s = 0.0
+        self._vision_s = 0.0
         request, job_id = job["request"], job["id"]
 
         def emit(message: dict) -> None:
             send({"id": job_id, **message})
 
-        plan = self.adapter.render(request, self.token_map)
+        try:
+            plan = self.adapter.render(request, self.token_map)
+        except ImageError as error:
+            emit({"type": "rejected", "code": "invalid_image", "param": error.param})
+            return
+        self._images = (len(plan.images), plan.image_tokens)
         input_tokens = len(plan.tokens)
         if input_tokens + plan.max_output_tokens > self.settings.context_window:
             emit({"type": "rejected", "code": "context_length_exceeded"})
             return
-        match = self.sessions.acquire(job.get("session"), plan.tokens)
+        match = self.sessions.acquire(job.get("session"), plan.cache_keys)
         session = match.session
         try:
             total = input_tokens + plan.max_output_tokens
             self.sessions.make_room(session, total)
-            self.sessions.recall(match, plan.tokens)
+            self.sessions.recall(match, plan.cache_keys)
+            # Every image still to be prefilled must decode, before the stream starts
+            # (protocol 9.1 invalid_image); cached ones decoded when they were first sent.
+            for start, spec in plan.images:
+                if start + spec.tokens > match.cached:
+                    try:
+                        decode(spec, self.vision.policy)
+                    except ImageError as error:
+                        emit({"type": "rejected", "code": "invalid_image", "param": error.param})
+                        return
             emit(
                 {
                     "type": "accepted",
@@ -326,7 +407,7 @@ class Engine:
             fresh = [b for b in plan.boundaries if b > match.cached]
             stops = fresh[-(self.sessions.max_snapshots - 1) :] if fresh else []
             prefill_started = time.monotonic()
-            complete = self._prefill(session, plan.tokens, stops, flags, limit)
+            complete = self._prefill(session, plan.tokens, stops, flags, limit, plan)
             prefill_s = time.monotonic() - prefill_started
             usage_base = {"input_tokens": input_tokens, "cached_tokens": match.cached}
             if not complete or request.get("generate") is False:
@@ -434,7 +515,7 @@ class Engine:
 
                     transaction = start_speculative_cache(session.cache, len(inputs))
                 try:
-                    logits, hidden = self._verify(session.cache, inputs)
+                    logits, hidden = self._verify(session.cache, inputs, plan.position_shift)
                     mx.eval(logits)
                     constrained = active
                     choices = [draw(logits[0])] if constrained else sampler.rows(logits, drafts)
@@ -519,6 +600,7 @@ class Engine:
                 settings.lookup_min_match,
                 settings.lookup_max_match,
             )
+            drafts = text_only(drafts, VISION_IDS)
             if drafts and (matched >= settings.lookup_trust_match or not mtp):
                 return drafts, "lookup"
             if drafts:
@@ -578,6 +660,9 @@ class Engine:
             "snapshot_bytes": sum(s.nbytes for s in session.snapshots),
             "session_bytes": session.nbytes(),
             "restore_path": match.path,
+            "image_count": self._images[0] or None,
+            "image_tokens": self._images[1] or None,
+            "vision_encode_ms": round(self._vision_s * 1000) if self._images[0] else None,
             "ssd_load_ms": match.load_ms,
             "ssd_spill_count": spills if disk else None,
             "ssd_bytes_written": written if disk else None,

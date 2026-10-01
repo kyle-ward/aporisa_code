@@ -145,3 +145,49 @@ def test_continuation_properties_and_expansion():
     ]
     full = expand_continuation(first, output, {**first, "input": [user("two")]})
     assert full["input"] == [user("one"), *output, user("two")]
+
+
+def png(width: int = 40, height: int = 24) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), (10, 200, 30)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def data_url(kind: str, data: bytes) -> str:
+    import base64
+
+    return f"data:image/{kind};base64," + base64.b64encode(data).decode()
+
+
+def test_image_structure_matches_the_frontend_rule():
+    """protocol 7.1, the same cases as protocol.test.ts."""
+    from aporisa_backend.protocol.images import ImageInfo, image_info
+
+    # SOI, APP0 (empty), SOF0 (height 24, width 40), EOI
+    jpeg = bytes.fromhex("ffd8ffe00002ffc0000b080018002801011100ffd9")
+    assert image_info(data_url("png", png())) == ImageInfo("png", 40, 24)
+    assert image_info(data_url("jpeg", jpeg)) == ImageInfo("jpeg", 40, 24)
+    assert image_info(data_url("png", b"plain text, no image")) is None
+    assert image_info(data_url("jpeg", png())) is None
+    assert image_info(data_url("png", jpeg)) is None
+    assert image_info(data_url("png", png()[:-12])) is None
+    assert image_info(data_url("jpeg", jpeg[:-2])) is None
+
+
+def test_images_are_checked_after_the_modality():
+    image = {"type": "input_image", "image_url": data_url("png", b"nope")}
+    body = {
+        **request(),
+        "input": [{"type": "message", "role": "user", "content": [image]}],
+    }
+    with pytest.raises(ProtocolError) as broken:
+        request_violation(body, MODEL)
+    assert (broken.value.code, broken.value.param) == ("invalid_image", "input[0].content[0]")
+    text_only = {**MODEL, "input_modalities": ["text"]}
+    with pytest.raises(ProtocolError) as unsupported:
+        request_violation(body, text_only)
+    assert unsupported.value.code == "unsupported_parameter"

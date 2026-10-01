@@ -22,6 +22,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from ..configs.engine import ENGINE, EngineConfig
+from ..configs.limits import LIMITS
 from ..configs.models import ModelProfile
 from ..console import emit
 from ..ipc.frames import FrameError, encode, read_frame
@@ -39,6 +40,17 @@ WORKER_ENV = {
 }
 TERMINAL = frozenset({"finished", "failed", "rejected"})
 _GONE = object()
+
+
+def image_policy(profile: ModelProfile) -> dict | None:
+    """The worker's image sizing (B2-6), or None for a text-only model."""
+    if "image" not in profile.input_modalities:
+        return None
+    return {
+        "min_pixels": profile.image_min_pixels,
+        "max_pixels": dict(profile.image_max_pixels),
+        "max_source_pixels": LIMITS.max_image_source_pixels,
+    }
 
 
 class ProcessWorker(WorkerClient):
@@ -114,6 +126,7 @@ class ProcessWorker(WorkerClient):
                 "draft_kv_bytes_per_token": self.profile.draft_kv_bytes_per_token,
                 "snapshot_budget_bytes": self.snapshot_budget_bytes,
                 "kv_cache": self.kv_cache,
+                "images": image_policy(self.profile),
                 "engine": self.engine.as_dict(),
             }
         )
@@ -191,7 +204,13 @@ class ProcessWorker(WorkerClient):
         if self.dead or self.writer is None:
             raise WorkerGone
         try:
-            self.writer.write(encode(message))
+            data = encode(message)
+        except FrameError:
+            # A request too large for one frame (a WebSocket continuation can expand past the
+            # message limit) is the client's problem, not a broken worker channel.
+            raise ProtocolError("request_too_large", "The request is too large.") from None
+        try:
+            self.writer.write(data)
             await self.writer.drain()
         except (ConnectionError, OSError, FrameError) as error:
             self._mark_dead()
@@ -296,6 +315,10 @@ class ProcessWorker(WorkerClient):
 
     async def count_tokens(self, request: dict) -> int:
         reply = await self._call({"op": "count_tokens", "request": request})
+        if reply.get("error") == "invalid_image":
+            raise ProtocolError(
+                "invalid_image", "The image could not be decoded.", reply.get("param")
+            )
         if "input_tokens" not in reply:
             raise ProtocolError("internal_error", "The request could not be counted.")
         return int(reply["input_tokens"])

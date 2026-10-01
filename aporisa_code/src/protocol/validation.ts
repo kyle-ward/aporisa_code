@@ -5,6 +5,7 @@ import type { InputItem } from "./items.ts";
 import type { Model, ReasoningEffort } from "./models.ts";
 import type { ResponseParams } from "./request.ts";
 import type { HttpErrorCode } from "./errors.ts";
+import { imageInfo, inputImages } from "./images.ts";
 import { schemaSubsetViolation } from "./tools.ts";
 
 export interface RequestViolation {
@@ -131,6 +132,11 @@ export function inputViolation(input: readonly InputItem[], model: Model): Reque
   }
   if (openCalls.size > 0) {
     return violation("invalid_request", "input", "Every tool call needs exactly one later output.");
+  }
+  for (const image of inputImages(input)) {
+    if (imageInfo(image.imageUrl) === null) {
+      return violation("invalid_image", image.param, "The image is not a complete PNG or JPEG of the declared type.");
+    }
   }
   return null;
 }
