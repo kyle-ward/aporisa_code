@@ -2,6 +2,11 @@
 
 本文只记录已经实际运行过的检查，以及明确尚未验证的事项。预期不写成结果，替身测试也不代替真实验收。
 
+## 后端 v0 收尾（2026-10-01，Mac Studio）
+
+- B2-7 的 soak 按用户决定只写好脚本 `scripts/soak.py`，没有对真实服务运行。agent 在假 worker 的网关上做了冒烟：3 轮、566 次 agent 请求、0 个失败，五项结论都能给出；在假 worker 上，内存类的数据为空，所以泄漏一项在那里没有实际意义。
+- `/health/runtime` 的 worker 视图新增 `rss_bytes`、`open_fds`。真实 worker 进程的测试（`test_process_worker.py`）因为服务正在运行，agent 没有跑，由用户的后端 CI 覆盖。
+
 ## B2 P6：调优（2026-10-01，Mac Studio）
 
 范围：DEVELOPMENT_PLAN 的「P6（B2-5）」，剖析数据和实现见那里的「P6 剖析结果与实现」。

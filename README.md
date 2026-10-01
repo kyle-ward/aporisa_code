@@ -14,7 +14,7 @@ Aporisa Code 是一个安装在本机、直接运行的 agent app，只支持 ma
 
 - 协议合同 v0 已定稿（含 `configuration_update` 修订）。
 - 前端：SDK（native driver，WebSocket 默认、HTTP 兜底）、mock server、stub driver 和 wire 层一致性测试都已实现，并通过了确定性检查。harness、UI 和 OpenRouter 兼容层尚未开始。
-- 后端：B1 已完成：作为 macOS 系统服务运行，对服务运行一致性测试 W01–W24 全部通过，真实生成验证（含 132K 上下文）通过。架构见 [架构](docs/architecture.md)，实测见 [验证记录](docs/validation.md)。集成节点 I1（前端从 Air 连接 Studio 上的后端）尚未进行。B2 进行中：MTP 投机解码、提示词查找投机（改代码类任务在 125K 上下文下约为普通解码的 5 倍）、结构化输出、SSD 会话缓存（服务重启后 197K 上下文的会话约 2 秒内给出首 token，冷启动约 320 秒）、图片输入（PNG、JPEG，user 消息和工具结果中均可）与调优（agent 每轮首 token 中位数 −27%，200K 上下文不写 swap）已验收。
+- 后端：v0 已完成：作为 macOS 系统服务运行，对服务运行一致性测试 W01–W30 全部通过，真实生成验证（含 200K 上下文）通过。架构见 [架构](docs/architecture.md)，实测见 [验证记录](docs/validation.md)。集成节点 I1（前端从 Air 连接 Studio 上的后端）尚未进行。B2 中，MTP 投机解码、提示词查找投机（改代码类任务在 125K 上下文下约为普通解码的 5 倍）、结构化输出、SSD 会话缓存（服务重启后 197K 上下文的会话约 2 秒内给出首 token，冷启动约 320 秒）、图片输入（PNG、JPEG，user 消息和工具结果中均可）与调优（agent 每轮首 token 中位数 −27%，200K 上下文不写 swap）已验收。
 
 ```bash
 ./frontend.sh prepare         # 安装项目内的 Node 和锁定的依赖（唯一联网的模式）

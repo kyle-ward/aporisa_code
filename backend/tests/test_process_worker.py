@@ -124,6 +124,7 @@ async def test_runtime_health_includes_worker_status(served):
     assert worker["released_cache_bytes"] >= 0 and "sys_swapouts" in worker["startup"]
     assert worker["locked_bytes"] > 0  # weights mlock'ed at load
     assert worker["system"]["swap_used_bytes"] >= 0 and worker["ple_files_cached_bytes"] >= 0
+    assert worker["rss_bytes"] > 0 and worker["open_fds"] > 0
     last = worker["last"]
     assert last["restore_path"] in ("cold", "live", "snapshot")
     assert last["ple_bytes_read"] > 0 and last["snapshot_count"] >= 1

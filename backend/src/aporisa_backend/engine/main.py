@@ -83,14 +83,21 @@ class Worker:
 
     def _status(self) -> dict:
         """Status reply (control thread): the cached view plus point-in-time memory facts.
-        Counting PLE page-cache residency takes ~0.6 s, so it runs only when asked."""
+        Counting PLE page-cache residency takes ~0.6 s, so it runs only when asked. The
+        process's resident size and open descriptors show leaks MLX memory does not (a
+        long run's trend, scripts/soak.py)."""
+        import psutil
+
         from .. import vmstats
         from .runtime import ple_cached_bytes
 
         system = vmstats.sample()
+        process = psutil.Process()
         return {
             **self.view,
             "ple_files_cached_bytes": ple_cached_bytes(self.engine),
+            "rss_bytes": process.memory_info().rss,
+            "open_fds": process.num_fds(),
             "system": {
                 key: system[key]
                 for key in (

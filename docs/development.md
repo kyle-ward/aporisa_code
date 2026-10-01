@@ -77,6 +77,15 @@ backend/.venv/bin/python scripts/validate_runtime.py --restart-resume
 
 第一步建立约 200K 的会话，把 key、长度和提示词的 sha256（不含文本）记在 `.runtime/validation/restart.json`；第二步发送同一个请求，要求从 SSD 恢复（`restore_path=ssd`）、全部 token 命中、首 token 在 10 秒内。两步之间仓库文件有改动时，提示词会变，第二步会要求重新准备。
 
+`--agent-loop` 是调优（B2-5）的对比基准：用固定 commit 的仓库文件模拟 20 轮工具调用，按服务端首 token 时间汇总，单独运行。
+
+长时间 soak（B2-7）用 `scripts/soak.py`，由用户在不需要这台机器时显式运行。它按轮循环：基准探针、多个 agent 会话、可选的长上下文、图片、结构化输出、WebSocket、预热、断连、并发排队和非法请求；每 10 秒采样 `/health/runtime` 和系统内存，最后按泄漏、衰减、稳定、内存、隐私五项给出结论。长上下文、中途重启（`--restart-pause`）、末尾的 200K（`--final-long`）和过夜空闲（`--idle-hours`）都是开关，默认关闭：
+
+```bash
+backend/.venv/bin/python scripts/soak.py --hours 4
+backend/.venv/bin/python scripts/soak.py --hours 4 --long-tokens 131072 --restart-pause --final-long 200000 --idle-hours 8
+```
+
 `--long` 增加长上下文检查（B1-10 的验收）：一次冷预填充，服务端预填充速度要达到 B0-5 同长度「纯计算」速度的 80%；紧接着续接一轮，只预填充增量；整个过程 swap 用量不增长。
 
 运行期间每秒采样一次系统的压缩器、swap 和空闲内存，每项检查结束时报告它造成的系统级内存压力，最后给出整轮的汇总；数据都在同一个结果文件里。
