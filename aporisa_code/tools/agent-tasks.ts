@@ -1,7 +1,9 @@
-// F2 real-task acceptance (DEVELOPMENT_PLAN.md 7.2). Networked and user-run against the
-// real backend; never part of scripts/check.sh. Each task gets a fresh git repository in
-// a temporary directory and runs with every command and patch allowed (no sandbox in F2:
-// the model's commands run as the user, inside that directory by instruction only).
+// F2 + F3 real-task acceptance (DEVELOPMENT_PLAN.md 7.2, section 9). Networked and
+// user-run against the real backend; never part of scripts/check.sh. Each task gets a
+// fresh git repository in a temporary directory and runs under the default safety policy
+// (Seatbelt workspace-write, no network, on-request approvals); this script approves every
+// request it is asked and records it. The F2 tasks should need no approval; the F3 tasks
+// cannot finish without one (loopback network, a file outside the repository, git commit).
 //
 //   npm run agent-tasks                       all tasks against APORISA_BASE_URL (.env)
 //   npm run agent-tasks -- --only fix-test    one task (repeatable)
@@ -11,25 +13,38 @@
 // ../.runtime/agent-tasks/<timestamp>.json; session records keep the full trajectories.
 // A stub run writes neither: it only exercises this script.
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { deflateSync } from "node:zlib";
 import { loadEnv } from "../src/cli/env.ts";
-import { Thread, type ThreadEvent, type TurnOutcome } from "../src/harness/index.ts";
+import { Thread, type ApprovalRequest, type SafetyOptions, type ThreadEvent, type TurnOutcome } from "../src/harness/index.ts";
 import { NodeHost } from "../src/host/index.ts";
 import { StubDriver } from "../src/mock/index.ts";
 import type { Usage } from "../src/protocol/index.ts";
 import { NativeDriver, type AporisaClient } from "../src/sdk/index.ts";
 
+/** Per-run facts a task may refer to. */
+interface TaskEnv {
+  /** Port of a loopback HTTP server answering `TOKEN=<token>` (outside the sandbox). */
+  port: number;
+  token: string;
+  /** A directory outside the repository (not writable from the sandbox). */
+  outside: string;
+}
+
 interface Task {
   id: string;
   title: string;
   files: Record<string, string | Uint8Array>;
-  prompt: string;
+  prompt: string | ((env: TaskEnv) => string);
   /** Null when the task passed, otherwise why it did not. */
-  check: (dir: string, outcome: TurnOutcome, events: readonly ThreadEvent[]) => string | null;
+  check: (dir: string, outcome: TurnOutcome, events: readonly ThreadEvent[], env: TaskEnv) => string | null;
+  /** F3 tasks: cannot finish inside the sandbox, so at least one approval is expected. */
+  needsApproval?: boolean;
+  safety?: SafetyOptions;
 }
 
 const TASK_TIMEOUT_MS = 15 * 60_000;
@@ -192,6 +207,36 @@ export const TASKS: Task[] = [
     prompt: "The directory data/ holds 20 files, each containing one number. Read them one file per command (cat each file separately, no loops or globs), keep a running total, then write the total into total.txt and tell me the total.",
     check: (dir) => (read(dir, "total.txt").trim() === String(numbers.reduce((sum, value) => sum + value, 0)) ? null : "total.txt is missing or wrong"),
   },
+  // --- F3: tasks that need the user's approval -------------------------------------------
+  {
+    id: "network-fetch",
+    title: "reach a local service (network needs escalation)",
+    files: { "README.md": "Status client.\n" },
+    prompt: (env) => `A local service is running at http://127.0.0.1:${env.port}/status. Fetch it with curl and tell me the TOKEN value it returns.`,
+    check: (_dir, outcome, _events, env) => ((outcome.lastMessage ?? "").includes(env.token) ? null : "the answer does not contain the token"),
+    needsApproval: true,
+  },
+  {
+    id: "write-outside",
+    title: "append to a file outside the repository",
+    files: { "README.md": "Notes live elsewhere.\n" },
+    prompt: (env) => `Append a line containing exactly "checked" to the file ${env.outside}/notes.txt (it is outside this repository; create it if it does not exist).`,
+    check: (_dir, _outcome, _events, env) => (read(env.outside, "notes.txt").split("\n").includes("checked") ? null : "notes.txt does not contain the line"),
+    needsApproval: true,
+    safety: { tmpWritable: false },
+  },
+  {
+    id: "git-commit",
+    title: "commit a change (.git is read-only in the sandbox)",
+    files: { "hello.txt": "hello\n" },
+    prompt: "Change the greeting in hello.txt from \"hello\" to \"hi\", then commit the change with git using the message \"update greeting\".",
+    check: (dir) => {
+      const log = run(dir, "git", ["log", "-1", "--format=%s"]);
+      if (!log.ok || log.output.trim() !== "update greeting") return "the last commit is not 'update greeting'";
+      return run(dir, "git", ["show", "HEAD:hello.txt"]).output.trim() === "hi" ? null : "the commit does not contain the change";
+    },
+    needsApproval: true,
+  },
 ];
 
 // --- runner ------------------------------------------------------------------------------
@@ -211,6 +256,10 @@ interface RequestMetric {
 interface TaskReport {
   id: string;
   passed: boolean;
+  /** Questions the script approved: what kind and why. */
+  approvals: { kind: string; reason: string; sandboxed: boolean | null }[];
+  /** Commands that ran outside the sandbox. */
+  unsandboxedCommands: number;
   reason: string | null;
   status: TurnOutcome["status"];
   error: string | null;
@@ -239,29 +288,72 @@ function setUp(task: Task): string {
     writeFileSync(join(dir, path), contents, { mode: path.endsWith(".sh") ? 0o755 : 0o644 });
   }
   run(dir, "git", ["init", "-q"]);
+  run(dir, "git", ["config", "user.name", "aporisa"]);
+  run(dir, "git", ["config", "user.email", "aporisa@localhost"]);
   run(dir, "git", ["add", "-A"]);
   run(dir, "git", ["-c", "user.name=aporisa", "-c", "user.email=aporisa@localhost", "commit", "-qm", "task"]);
   return dir;
 }
 
-async function runTask(task: Task, client: () => AporisaClient, model: string | undefined, host: NodeHost, persist: boolean): Promise<TaskReport> {
+async function runTask(
+  task: Task,
+  client: () => AporisaClient,
+  model: string | undefined,
+  host: NodeHost,
+  persist: boolean,
+  server: { port: number; token: string },
+): Promise<TaskReport> {
   const dir = setUp(task);
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), `aporisa-outside-${task.id}-`)));
+  try {
+    return await runInDirectories(task, client, model, host, persist, { ...server, outside }, dir);
+  } finally {
+    // Also on errors and interruptions: these directories are this run's own.
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+}
+
+async function runInDirectories(
+  task: Task,
+  client: () => AporisaClient,
+  model: string | undefined,
+  host: NodeHost,
+  persist: boolean,
+  env: TaskEnv,
+  dir: string,
+): Promise<TaskReport> {
   const events: ThreadEvent[] = [];
+  const approvals: TaskReport["approvals"] = [];
   const started = performance.now();
   const connection = client();
-  const thread = await Thread.start({ client: connection, host, cwd: dir, persist, maxRequestsPerTurn: MAX_REQUESTS, listener: (event) => events.push(event), ...(model ? { model } : {}) });
+  const thread = await Thread.start({
+    client: connection,
+    host,
+    cwd: dir,
+    persist,
+    maxRequestsPerTurn: MAX_REQUESTS,
+    listener: (event) => events.push(event),
+    ...(task.safety ? { safety: task.safety } : {}),
+    approve: async (request: ApprovalRequest) => {
+      approvals.push({ kind: request.kind, reason: request.reason, sandboxed: request.kind === "command" ? request.sandboxed : null });
+      return "approved";
+    },
+    ...(model ? { model } : {}),
+  });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TASK_TIMEOUT_MS);
   let outcome: TurnOutcome;
   try {
-    outcome = await thread.runTurn(task.prompt, { signal: controller.signal });
+    outcome = await thread.runTurn(typeof task.prompt === "function" ? task.prompt(env) : task.prompt, { signal: controller.signal });
   } finally {
     clearTimeout(timer);
     await thread.close();
     await connection.close();
   }
   const wallTimeMs = performance.now() - started;
-  const reason = outcome.status === "completed" ? task.check(dir, outcome, events) : `turn ${outcome.status}${outcome.error ? ` (${outcome.error.code})` : ""}`;
+  let reason = outcome.status === "completed" ? task.check(dir, outcome, events, env) : `turn ${outcome.status}${outcome.error ? ` (${outcome.error.code})` : ""}`;
+  if (reason === null && task.needsApproval && approvals.length === 0) reason = "finished without asking for approval (the sandbox should have required one)";
 
   const perRequest: RequestMetric[] = [];
   let previous: Usage | null = null;
@@ -282,10 +374,11 @@ async function runTask(task: Task, client: () => AporisaClient, model: string | 
   }
   const tools = events.filter((event) => event.type === "tool.completed");
   const missed = perRequest.flatMap((request) => (request.missedPrefixTokens === null ? [] : [request.missedPrefixTokens]));
-  rmSync(dir, { recursive: true, force: true });
   return {
     id: task.id,
     passed: reason === null,
+    approvals,
+    unsandboxedCommands: tools.filter((event) => event.type === "tool.completed" && event.details?.kind === "command" && !event.details.sandboxed).length,
     reason,
     status: outcome.status,
     error: outcome.error ? `${outcome.error.code}: ${outcome.error.message}` : null,
@@ -326,16 +419,21 @@ async function main(): Promise<number> {
   }
 
   const host = new NodeHost();
+  const token = String(1000 + Math.floor(Math.random() * 9000));
+  const server = createServer((_request, response) => response.end(`TOKEN=${token}\n`)).listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = (server.address() as { port: number }).port;
   const reports: TaskReport[] = [];
   for (const task of selected) {
     console.log(`[Aporisa Code] [WAIT] ${task.id}: ${task.title}`);
-    const report = await runTask(task, client, model, host, values.driver !== "stub");
+    const report = await runTask(task, client, model, host, values.driver !== "stub", { port, token });
     reports.push(report);
     const label = report.passed ? "READY" : "MANUAL";
     console.log(
-      `[Aporisa Code] [${label}] ${task.id} ${report.passed ? "passed" : `failed: ${report.reason}`} | ${report.requests} requests, ${report.toolCalls} tool calls (${report.toolFailures} failed), ${(report.wallTimeMs / 1000).toFixed(1)} s, median first output ${report.medianTimeToFirstOutputMs?.toFixed(0) ?? "-"} ms, cached ${report.usage.cachedTokens}/${report.usage.inputTokens} input tokens, max missed prefix ${report.maxMissedPrefixTokens ?? "-"} tokens`,
+      `[Aporisa Code] [${label}] ${task.id} ${report.passed ? "passed" : `failed: ${report.reason}`} | ${report.requests} requests, ${report.toolCalls} tool calls (${report.toolFailures} failed), ${(report.wallTimeMs / 1000).toFixed(1)} s, median first output ${report.medianTimeToFirstOutputMs?.toFixed(0) ?? "-"} ms, cached ${report.usage.cachedTokens}/${report.usage.inputTokens} input tokens, max missed prefix ${report.maxMissedPrefixTokens ?? "-"} tokens, approvals ${report.approvals.length}${report.approvals.length > 0 ? ` (${report.approvals.map((approval) => `${approval.kind}:${approval.reason}`).join(", ")})` : ""}, ${report.unsandboxedCommands} commands outside the sandbox`,
     );
   }
+  server.close();
   const passed = reports.filter((report) => report.passed).length;
   console.log(`[Aporisa Code] [INFO] ${passed}/${reports.length} tasks passed.`);
   if (values.driver === "stub") return 0;

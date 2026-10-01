@@ -3,7 +3,7 @@
 import { HostError } from "../../host/index.ts";
 import { schemaSubsetViolation, schemaValueViolation, type FunctionTool, type Model } from "../../protocol/index.ts";
 import { applyPatchTool } from "./apply-patch/tool.ts";
-import { execCommandTool, writeStdinTool } from "./exec.ts";
+import { createExecCommandTool, writeStdinTool } from "./exec.ts";
 import { ToolError, type ToolContext, type ToolHandler, type ToolResult } from "./types.ts";
 import { updatePlanTool } from "./update-plan.ts";
 import { viewImageTool } from "./view-image.ts";
@@ -59,9 +59,14 @@ export class ToolRegistry {
   }
 }
 
-/** The F2 tool set (FD-02); view_image only for models that accept images. */
-export function defaultTools(model: Pick<Model, "input_modalities">): ToolHandler[] {
-  const tools: ToolHandler[] = [execCommandTool, writeStdinTool, applyPatchTool, updatePlanTool];
+export interface ToolSetOptions {
+  /** exec_command offers sandbox escalation (a sandbox and approvals that can lift it). */
+  escalation?: boolean;
+}
+
+/** The tool set (FD-02); view_image only for models that accept images. */
+export function defaultTools(model: Pick<Model, "input_modalities">, options: ToolSetOptions = {}): ToolHandler[] {
+  const tools: ToolHandler[] = [createExecCommandTool({ escalation: options.escalation ?? false }), writeStdinTool, applyPatchTool, updatePlanTool];
   if (model.input_modalities.includes("image")) tools.push(viewImageTool);
   return tools;
 }

@@ -16,12 +16,21 @@ import {
   type ApprovalRequest,
   type ToolContext,
 } from "../src/harness/tools/index.ts";
+import { SessionRules } from "../src/harness/safety/index.ts";
 import { mockModel } from "../src/mock/index.ts";
 
 const host = new NodeHost({ shell: "/bin/sh" });
 const registry = new ToolRegistry(defaultTools(mockModel()));
 let root: string;
 let processes: ProcessManager;
+
+/** A sandboxed, ask-for-everything policy writable only in `root` (a real path). */
+function untrusted(root: string): ToolContext["safety"] {
+  return {
+    policy: { sandbox: "workspace-write", approval: "untrusted", network: false, writableRoots: [root], protectedNames: [".git"], denyPaths: [], stripSecrets: true },
+    rules: new SessionRules(),
+  };
+}
 
 function context(overrides: Partial<ToolContext> = {}): ToolContext {
   return { host, cwd: root, processes, truncation: { mode: "bytes", limit: 10_000 }, ...overrides };
@@ -176,14 +185,15 @@ describe("apply_patch tool", () => {
     expect((await call("apply_patch", { input: patch("*** Update File: missing.txt\n@@\n-a\n+b") })).output).toContain("missing.txt: no such file");
   });
 
-  it("asks before writing and leaves files alone when declined", async () => {
+  it("asks before writing (untrusted policy) and leaves files alone when declined", async () => {
     const asked: ApprovalRequest[] = [];
+    const real = await host.fs.realpath(root);
     const result = await call(
       "apply_patch",
       { input: patch("*** Add File: x.txt\n+x") },
-      { approve: async (request) => (asked.push(request), false) },
+      { safety: untrusted(real), approve: async (request) => (asked.push(request), "denied") },
     );
-    expect(asked).toEqual([{ kind: "patch", cwd: root, changes: [{ path: "x.txt", kind: "add" }] }]);
+    expect(asked).toEqual([{ kind: "patch", cwd: root, changes: [{ path: "x.txt", kind: "add" }], reason: "untrusted", paths: [`${real}/x.txt`] }]);
     expect(result).toMatchObject({ success: false, output: expect.stringContaining("declined") });
     expect(await readdir(root)).toEqual([]);
   });
@@ -217,10 +227,14 @@ describe("exec_command and write_stdin", () => {
     expect(small.output).toContain("chars truncated");
   });
 
-  it("asks before running and does not start a declined command", async () => {
+  it("asks before running (untrusted policy) and does not start a declined command", async () => {
     const asked: ApprovalRequest[] = [];
-    const result = await call("exec_command", { cmd: "touch made" }, { approve: async (request) => (asked.push(request), false) });
-    expect(asked).toEqual([{ kind: "command", command: "touch made", cwd: root }]);
+    const result = await call(
+      "exec_command",
+      { cmd: "touch made" },
+      { safety: untrusted(await host.fs.realpath(root)), approve: async (request) => (asked.push(request), "denied") },
+    );
+    expect(asked).toEqual([{ kind: "command", command: "touch made", cwd: root, reason: "untrusted", sandboxed: true, rememberPrefixes: [["touch"]] }]);
     expect(result.success).toBe(false);
     expect(await readdir(root)).toEqual([]);
   });

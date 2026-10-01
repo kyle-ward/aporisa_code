@@ -2,7 +2,7 @@
 // app-server Thread / Turn / Item; not frozen until the L3 contract before F4. Events are
 // plain JSON so they can cross IPC and be written as JSONL by the CLI.
 import type { OutputItem, ReasoningEffort, StreamErrorCode, ToolOutput, Usage } from "../protocol/index.ts";
-import type { ApprovalRequest, ToolDetails } from "./tools/index.ts";
+import type { ApprovalDecision, ApprovalRequest, ToolDetails } from "./tools/index.ts";
 
 export type TurnStatus = "completed" | "interrupted" | "failed";
 
@@ -27,7 +27,16 @@ export interface TurnOutcome {
 }
 
 export type ThreadEvent =
-  | { type: "thread.started"; threadId: string; model: string; cwd: string; effort: ReasoningEffort; resumed: boolean; sessionPath: string | null }
+  | {
+      type: "thread.started";
+      threadId: string;
+      model: string;
+      cwd: string;
+      effort: ReasoningEffort;
+      resumed: boolean;
+      sessionPath: string | null;
+      safety: { sandbox: string; approval: string; network: boolean };
+    }
   | { type: "turn.started"; turnId: string }
   | { type: "item.started"; turnId: string; itemId: string; kind: OutputItem["type"]; name?: string }
   | { type: "item.delta"; turnId: string; itemId: string; kind: "text" | "reasoning" | "arguments"; delta: string }
@@ -35,7 +44,7 @@ export type ThreadEvent =
   | { type: "tool.started"; turnId: string; callId: string; name: string; arguments: string }
   | { type: "tool.completed"; turnId: string; callId: string; name: string; success: boolean; output: ToolOutput; details?: ToolDetails }
   | { type: "approval.requested"; turnId: string; callId: string; request: ApprovalRequest }
-  | { type: "approval.resolved"; turnId: string; callId: string; approved: boolean }
+  | { type: "approval.resolved"; turnId: string; callId: string; approved: boolean; decision: ApprovalDecision }
   | { type: "effort.changed"; turnId: string; effort: ReasoningEffort; via: "configuration_update" | "baseline" }
   | {
       type: "response.completed";

@@ -41,6 +41,19 @@ export interface HostFileSystem {
   readDir(path: string): Promise<string[]>;
 }
 
+/** What a sandboxed command may do (F3). Every path must be absolute and already resolved
+ * (realpath): Seatbelt matches physical paths, so /tmp must be given as /private/tmp. */
+export interface SandboxSpec {
+  /** Directories the command may write below (reads are unrestricted except denyPaths). */
+  writableRoots: string[];
+  /** Entries directly under each writable root that stay read-only, e.g. ".git". */
+  protectedNames: string[];
+  /** Neither readable nor writable, overriding everything else. */
+  denyPaths: string[];
+  /** Outbound and inbound network, including loopback. */
+  network: boolean;
+}
+
 export interface ExecRequest {
   /** Shell command line, run as `<shell> -lc <command>` (or `-c` when login is false). */
   command: string;
@@ -52,6 +65,10 @@ export interface ExecRequest {
   shell?: string;
   /** Run as a login shell (codex default). Default true. */
   login?: boolean;
+  /** Run under the macOS Seatbelt sandbox; absent runs unsandboxed. */
+  sandbox?: SandboxSpec;
+  /** Drop inherited variables whose names contain KEY, SECRET or TOKEN (codex's default excludes). */
+  stripSecrets?: boolean;
 }
 
 export interface ProcessChunk {
@@ -129,6 +146,8 @@ export interface HostInfo {
   homeDir: string;
   /** Where sessions and other app data live (0700). */
   dataDir: string;
+  /** The per-user temporary directory ($TMPDIR), as given (not resolved). */
+  tmpDir: string;
   /** IANA time zone, e.g. "Asia/Hong_Kong". */
   timeZone: string;
 }

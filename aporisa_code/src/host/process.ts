@@ -6,6 +6,7 @@ import { constants } from "node:os";
 import { isAbsolute } from "node:path";
 import { HostError } from "./errors.ts";
 import { HeadTailBuffer } from "./head-tail-buffer.ts";
+import { SANDBOX_EXEC, seatbeltArgs } from "./sandbox/seatbelt.ts";
 import type {
   ExecRequest,
   ProcessChunk,
@@ -42,6 +43,19 @@ const KILL_WAIT_MS = 5_000;
 const INTERRUPT = "\u0003";
 const END_OF_INPUT = "\u0004";
 
+/** codex's default environment excludes: names containing these (case-insensitive). */
+const SECRET_NAME = /KEY|SECRET|TOKEN/i;
+
+export function commandEnvironment(request: Pick<ExecRequest, "env" | "stripSecrets">, inherited: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(inherited)) {
+    if (value === undefined) continue;
+    if (request.stripSecrets && SECRET_NAME.test(name)) continue;
+    env[name] = value;
+  }
+  return { ...env, ...EXEC_ENV, ...request.env };
+}
+
 /** Marker between head and tail when an interval's output exceeded the buffer (codex wording). */
 export function omissionMarker(omittedBytes: number): string {
   return `... ${omittedBytes} bytes omitted ...`;
@@ -77,9 +91,11 @@ export class NodeProcessManager implements ProcessManager {
     if (!cwdStat) throw new HostError("not_found", `working directory does not exist: ${request.cwd}`);
     if (!cwdStat.isDirectory()) throw new HostError("not_a_directory", `working directory is not a directory: ${request.cwd}`);
 
-    const child = spawn(shell, [request.login === false ? "-c" : "-lc", request.command], {
+    const argv = [shell, request.login === false ? "-c" : "-lc", request.command];
+    const [program, ...args] = request.sandbox ? [SANDBOX_EXEC, ...seatbeltArgs(request.sandbox, argv)] : argv;
+    const child = spawn(program as string, args, {
       cwd: request.cwd,
-      env: { ...process.env, ...EXEC_ENV, ...request.env },
+      env: commandEnvironment(request),
       detached: true, // setsid: the shell leads a new process group
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -87,7 +103,7 @@ export class NodeProcessManager implements ProcessManager {
       child.once("spawn", resolve);
       child.once("error", (error) => {
         const missing = (error as { code?: unknown }).code === "ENOENT";
-        reject(new HostError(missing ? "not_found" : "io_error", `could not start ${shell}: ${missing ? "not found" : "spawn failed"}`, { cause: error }));
+        reject(new HostError(missing ? "not_found" : "io_error", `could not start ${program}: ${missing ? "not found" : "spawn failed"}`, { cause: error }));
       });
     });
 

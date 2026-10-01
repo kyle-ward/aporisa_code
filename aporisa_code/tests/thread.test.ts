@@ -217,13 +217,13 @@ describe("cancellation", () => {
 });
 
 describe("approvals and effort", () => {
-  it("asks before commands and reports a refusal to the model", async () => {
+  it("asks before commands under the untrusted policy and reports a refusal to the model", async () => {
     const client = stub([[call("exec_command", { cmd: "touch made" })]]);
-    const { thread, events } = await start(client, { approve: async () => false });
+    const { thread, events } = await start(client, { safety: { approval: "untrusted" }, approve: async () => "denied" });
     await thread.runTurn("go");
     expect(events.filter((event) => event.type.startsWith("approval."))).toMatchObject([
-      { type: "approval.requested", request: { kind: "command", command: "touch made" } },
-      { type: "approval.resolved", approved: false },
+      { type: "approval.requested", request: { kind: "command", command: "touch made", reason: "untrusted" } },
+      { type: "approval.resolved", approved: false, decision: "denied" },
     ]);
     expect(thread.items.find((item) => item.type === "function_call_output")).toMatchObject({ output: expect.stringContaining("declined") });
   });

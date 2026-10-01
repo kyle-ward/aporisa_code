@@ -5,7 +5,7 @@ import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadEnv, parseEnv } from "../src/cli/env.ts";
 import { runCli, type CliIo } from "../src/cli/main.ts";
-import { approvalQuestion, renderer } from "../src/cli/render.ts";
+import { approvalQuestion, parseApproval, renderer } from "../src/cli/render.ts";
 
 let root: string;
 
@@ -69,6 +69,30 @@ describe("aporisa CLI", () => {
     expect(await runCli(["exec", "--driver", "stub", "--image", "nope.png", "x"], missing)).toBe(2);
   });
 
+  it("maps the safety flags and rejects contradictory ones", async () => {
+    for (const argv of [
+      ["exec", "--dangerously-bypass-sandbox", "--sandbox", "read-only", "x"],
+      ["exec", "--dangerously-bypass-sandbox", "--network", "x"],
+      ["exec", "--auto", "--approval", "untrusted", "x"],
+      ["exec", "--sandbox", "open", "x"],
+      ["exec", "--approval", "sometimes", "x"],
+    ]) {
+      const terminal = io();
+      expect(await runCli(argv, terminal), argv.join(" ")).toBe(2);
+    }
+    const cases: [string[], object][] = [
+      [[], { sandbox: "workspace-write", approval: "on-request", network: false }],
+      [["--sandbox", "read-only", "--network"], { sandbox: "read-only", approval: "on-request", network: true }],
+      [["--auto"], { sandbox: "workspace-write", approval: "never", network: false }],
+      [["--dangerously-bypass-sandbox"], { sandbox: "danger-full-access", approval: "never", network: false }],
+    ];
+    for (const [flags, safety] of cases) {
+      const terminal = io();
+      expect(await runCli(["exec", "--driver", "stub", "--no-persist", "--json", ...flags, "x"], terminal)).toBe(0);
+      expect(JSON.parse(terminal.stdout[0] ?? "{}")).toMatchObject({ type: "thread.started", safety });
+    }
+  });
+
   it("needs a connection for the native driver", async () => {
     const previous = { url: process.env.APORISA_BASE_URL, key: process.env.APORISA_API_KEY };
     process.env.APORISA_BASE_URL = "";
@@ -102,14 +126,24 @@ describe("rendering", () => {
       name: "exec_command",
       success: true,
       output: "x",
-      details: { kind: "command", command: "ls -la", cwd: "/", exitCode: 0, sessionId: null, wallTimeMs: 1200 },
+      details: { kind: "command", command: "ls -la", cwd: "/", exitCode: 0, sessionId: null, wallTimeMs: 1200, sandboxed: true, escalated: false },
     });
     expect(out.join("")).toBe("Hi\n");
     expect(err.join("")).toBe("▶ $ ls -la\n  ✓ exit 0 (1.2s)\n");
   });
 
-  it("asks a clear approval question", () => {
-    expect(approvalQuestion({ kind: "command", command: "rm -rf build", cwd: "/w" })).toBe("Run in /w?\n  $ rm -rf build\n[y/N] ");
-    expect(approvalQuestion({ kind: "patch", cwd: "/w", changes: [{ path: "a", kind: "update", movePath: "b" }] })).toBe("Apply this patch in /w?\n  update a -> b\n[y/N] ");
+  it("asks clear approval questions and parses the answers", () => {
+    const escalation = { kind: "command" as const, command: "npm install", cwd: "/w", reason: "escalation" as const, sandboxed: false, justification: "Install the dependencies?", rememberPrefixes: [["npm", "install"]] };
+    expect(approvalQuestion(escalation)).toBe(
+      "The model asks to run this command outside the sandbox in /w?\n  Install the dependencies?\n  $ npm install\n[y] yes  [a] yes, and allow `npm install` for this session  [N] no: ",
+    );
+    const dangerous = { kind: "command" as const, command: "rm -rf build", cwd: "/w", reason: "dangerous" as const, sandboxed: true, rememberPrefixes: null };
+    expect(approvalQuestion(dangerous)).toBe("This command looks destructive (inside the sandbox) in /w?\n  $ rm -rf build\n[y] yes  [N] no: ");
+    const patchRequest = { kind: "patch" as const, cwd: "/w", changes: [{ path: "a", kind: "update" as const, movePath: "b" }], reason: "outside_workspace" as const, paths: ["/x/b"] };
+    expect(approvalQuestion(patchRequest)).toContain("writes outside the workspace or into a protected directory (/x/b):\n  update a -> b\n");
+    expect(parseApproval("Y", escalation)).toBe("approved");
+    expect(parseApproval("a", escalation)).toBe("approved_for_session");
+    expect(parseApproval("a", dangerous)).toBe("denied");
+    expect(parseApproval("", escalation)).toBe("denied");
   });
 });

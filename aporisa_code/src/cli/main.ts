@@ -5,13 +5,13 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
-import { imageMediaType, MAX_IMAGE_BYTES, Thread, type ApprovalRequest, type UserInput } from "../harness/index.ts";
+import { imageMediaType, MAX_IMAGE_BYTES, Thread, type ApprovalDecision, type ApprovalPolicy, type ApprovalRequest, type SafetyOptions, type SandboxMode, type UserInput } from "../harness/index.ts";
 import { NodeHost } from "../host/index.ts";
 import { StubDriver } from "../mock/index.ts";
 import type { InputImagePart, InputTextPart, ReasoningEffort } from "../protocol/index.ts";
 import { NativeDriver, type AporisaClient } from "../sdk/index.ts";
 import { ENV_FILE, loadEnv } from "./env.ts";
-import { approvalQuestion, processOutput, renderer, type Output } from "./render.ts";
+import { approvalQuestion, parseApproval, processOutput, renderer, type Output } from "./render.ts";
 
 export const USAGE = `Usage:
   npm run aporisa -- exec [options] <task...>   Run one turn and exit ("-" reads the task from stdin)
@@ -23,8 +23,12 @@ Options:
   --effort <level>       Reasoning effort (none, low, medium, high)
   --resume <id|path>     Continue a saved thread
   --image <path>         Attach a PNG or JPEG to the task (repeatable)
-  --auto                 Run commands and patches without asking. Use only in a throwaway directory:
-                         F2 has no sandbox yet; commands run as you.
+  --sandbox <mode>       read-only, workspace-write (default) or danger-full-access
+  --approval <policy>    untrusted, on-request (default) or never
+  --network              Allow network access inside the sandbox
+  --auto                 Never ask (--approval never); the sandbox stays on
+  --dangerously-bypass-sandbox
+                         No sandbox and no questions: commands run with your full permissions
   --json                 Print events as JSONL on stdout
   --show-reasoning       Print the model's reasoning on stderr
   --no-persist           Do not write the session record
@@ -36,6 +40,8 @@ Options:
 Connection: APORISA_BASE_URL, APORISA_API_KEY and APORISA_MODEL from the environment or ${ENV_FILE}.`;
 
 const EFFORTS: readonly ReasoningEffort[] = ["none", "low", "medium", "high"];
+const SANDBOX_MODES: readonly SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
+const APPROVAL_POLICIES: readonly ApprovalPolicy[] = ["untrusted", "on-request", "never"];
 
 export class UsageError extends Error {}
 
@@ -58,6 +64,10 @@ function parse(argv: string[]) {
       resume: { type: "string" },
       image: { type: "string", multiple: true },
       auto: { type: "boolean", default: false },
+      sandbox: { type: "string" },
+      approval: { type: "string" },
+      network: { type: "boolean", default: false },
+      "dangerously-bypass-sandbox": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       "show-reasoning": { type: "boolean", default: false },
       "no-persist": { type: "boolean", default: false },
@@ -71,10 +81,24 @@ function parse(argv: string[]) {
   if (command !== undefined && command !== "exec") throw new UsageError(`unknown command '${command}'`);
   if (values.effort !== undefined && !EFFORTS.includes(values.effort as ReasoningEffort)) throw new UsageError(`--effort must be one of ${EFFORTS.join(", ")}`);
   if (values.driver !== "native" && values.driver !== "stub") throw new UsageError("--driver must be native or stub");
+  if (values.sandbox !== undefined && !SANDBOX_MODES.includes(values.sandbox as SandboxMode)) throw new UsageError(`--sandbox must be one of ${SANDBOX_MODES.join(", ")}`);
+  if (values.approval !== undefined && !APPROVAL_POLICIES.includes(values.approval as ApprovalPolicy)) throw new UsageError(`--approval must be one of ${APPROVAL_POLICIES.join(", ")}`);
+  const bypass = values["dangerously-bypass-sandbox"];
+  if (bypass && (values.sandbox !== undefined || values.approval !== undefined || values.auto || values.network)) {
+    throw new UsageError("--dangerously-bypass-sandbox cannot be combined with --sandbox, --approval, --auto or --network");
+  }
+  if (values.auto && values.approval !== undefined && values.approval !== "never") throw new UsageError("--auto means --approval never");
+  const safety: SafetyOptions = bypass
+    ? { sandbox: "danger-full-access", approval: "never" }
+    : {
+        ...(values.sandbox !== undefined ? { sandbox: values.sandbox as SandboxMode } : {}),
+        ...(values.auto ? { approval: "never" as const } : values.approval !== undefined ? { approval: values.approval as ApprovalPolicy } : {}),
+        ...(values.network ? { network: true } : {}),
+      };
   if (values.transport !== undefined && values.transport !== "websocket" && values.transport !== "http") throw new UsageError("--transport must be websocket or http");
   const maxRequests = values["max-requests"] === undefined ? undefined : Number(values["max-requests"]);
   if (maxRequests !== undefined && (!Number.isInteger(maxRequests) || maxRequests < 1)) throw new UsageError("--max-requests must be a positive integer");
-  return { values, command: command ?? "interactive", task: rest, maxRequests };
+  return { values, command: command ?? "interactive", task: rest, maxRequests, safety };
 }
 
 function readImages(paths: readonly string[], base: string): InputImagePart[] {
@@ -115,7 +139,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     io.output.err(`ERROR: ${(error as Error).message}\n${USAGE}\n`);
     return 2;
   }
-  const { values, command, task, maxRequests } = parsed;
+  const { values, command, task, maxRequests, safety } = parsed;
   if (values.help) {
     io.output.out(`${USAGE}\n`);
     return 0;
@@ -175,16 +199,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
   process.on("SIGINT", interrupt);
 
   let warnedNoTerminal = false;
-  const approve = values.auto
-    ? undefined
-    : async (request: ApprovalRequest): Promise<boolean> => {
-        if (!terminal) {
-          if (!warnedNoTerminal) io.output.err("[Aporisa Code] [MANUAL] stdin is not a terminal, so commands and patches cannot be approved; they are refused. Use --auto only in a throwaway directory.\n");
-          warnedNoTerminal = true;
-          return false;
-        }
-        const answer = await lines().question(approvalQuestion(request));
-        return /^y(es)?$/i.test(answer.trim());
+  // Without a terminal nobody can answer: the harness then refuses whatever needs approval.
+  const approve = terminal
+    ? async (request: ApprovalRequest): Promise<ApprovalDecision> => parseApproval(await lines().question(approvalQuestion(request)), request)
+    : async (): Promise<ApprovalDecision> => {
+        if (!warnedNoTerminal) io.output.err("[Aporisa Code] [MANUAL] stdin is not a terminal, so nothing that needs approval can run; it is refused. Use --auto to never ask (the sandbox stays on).\n");
+        warnedNoTerminal = true;
+        return "denied";
       };
 
   const host = new NodeHost();
@@ -194,7 +215,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     host,
     listener,
     persist: !values["no-persist"],
-    ...(approve ? { approve } : {}),
+    safety,
+    approve,
     ...(values.effort ? { effort: values.effort as ReasoningEffort } : {}),
     ...(maxRequests !== undefined ? { maxRequestsPerTurn: maxRequests } : {}),
   };

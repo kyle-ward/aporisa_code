@@ -1,9 +1,11 @@
 // exec_command and write_stdin, after codex's unified exec (core/src/tools/handlers/
-// shell_spec.rs, core/src/tools/context.rs). Pipes instead of a PTY (FD-06).
+// shell_spec.rs, core/src/tools/context.rs). Pipes instead of a PTY (FD-06); sandbox and
+// approvals per the thread's safety policy (F3).
 import type { ProcessChunk } from "../../host/index.ts";
 import { resolve } from "../paths.ts";
 import { approxTokensFromBytes, byteBudget, byteLength, truncateText, withAllowance } from "./truncate.ts";
-import { declined, ToolError, type ToolContext, type ToolHandler, type ToolResult } from "./types.ts";
+import { assessCommand, likelySandboxDenied, sandboxSpec } from "../safety/index.ts";
+import { askUser, declined, ToolError, unavailable, type ToolContext, type ToolHandler, type ToolResult } from "./types.ts";
 
 export const DEFAULT_YIELD_MS = 10_000;
 export const MIN_YIELD_MS = 250;
@@ -48,46 +50,133 @@ function fullText(chunk: ProcessChunk, shown: string): string | undefined {
   return shown.endsWith(chunk.output) ? undefined : chunk.output;
 }
 
-export const execCommandTool: ToolHandler = {
-  spec: {
-    type: "function",
-    name: "exec_command",
-    description:
-      "Runs a shell command and returns its output, or a session ID when the command is still running after yield_time_ms. Use write_stdin with that session ID to send input or to keep waiting. Output is plain text (no terminal); stdin is a pipe.",
-    parameters: {
-      type: "object",
-      properties: {
-        cmd: { type: "string", description: "Shell command to execute." },
-        workdir: { type: "string", description: "Working directory for the command. Defaults to the turn cwd." },
-        yield_time_ms: { type: "number", description: "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms." },
-        max_output_tokens: { type: "number", description: "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy." },
-      },
-      required: ["cmd"],
-      additionalProperties: false,
-    },
-  },
-  parallel: true,
+export interface ExecCommandOptions {
+  /** Offer `sandbox_permissions` and `justification` (a sandbox the user can lift on request). */
+  escalation: boolean;
+}
 
-  async run(args, context) {
-    const command = args.cmd as string;
-    if (command.trim() === "") throw new ToolError("cmd must not be empty.");
-    const cwd = typeof args.workdir === "string" ? resolve(context.cwd, args.workdir) : context.cwd;
-    if (context.approve && !(await context.approve({ kind: "command", command, cwd }))) return declined("to run this command");
-    const session = await context.processes.start({ command, cwd });
-    const chunk = await session.read({
-      yieldMs: clamp(args.yield_time_ms, DEFAULT_YIELD_MS, MIN_YIELD_MS, MAX_YIELD_MS),
-      ...(context.signal ? { signal: context.signal } : {}),
-    });
-    const output = formatChunk(chunk, session.id, clamp(args.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS, 1, Number.MAX_SAFE_INTEGER), context);
-    const full = fullText(chunk, output);
-    return {
-      output,
-      success: chunk.exitCode === null || chunk.exitCode === 0,
-      ...(full !== undefined ? { fullOutput: full } : {}),
-      details: { kind: "command", command, cwd, exitCode: chunk.exitCode, sessionId: chunk.exitCode === null ? session.id : null, wallTimeMs: chunk.wallTimeMs },
-    };
+const ESCALATION_PARAMETERS = {
+  sandbox_permissions: {
+    type: "string",
+    enum: ["use_default", "require_escalated"],
+    description: "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` to run outside the sandbox (needs the user's approval).",
+  },
+  justification: {
+    type: "string",
+    description:
+      'Only with "require_escalated": one short question asking the user to allow the command outside the sandbox, phrased by its purpose in the task, e.g. "Do you want to install the project\'s npm dependencies?"',
   },
 };
+
+const DENIAL_HINT: Record<string, string> = {
+  "on-request":
+    '[Aporisa Code] This failure looks like a sandbox restriction. If the command is needed, run it again with "sandbox_permissions": "require_escalated" and a justification.',
+  never: "[Aporisa Code] This failure looks like a sandbox restriction. Approvals are off in this session, so the command cannot run outside the sandbox.",
+};
+
+/** exec_command after codex (shell_spec.rs), with the F3 sandbox and approvals. */
+export function createExecCommandTool(options: ExecCommandOptions): ToolHandler {
+  return {
+    spec: {
+      type: "function",
+      name: "exec_command",
+      description:
+        "Runs a shell command and returns its output, or a session ID when the command is still running after yield_time_ms. Use write_stdin with that session ID to send input or to keep waiting. Output is plain text (no terminal); stdin is a pipe.",
+      parameters: {
+        type: "object",
+        properties: {
+          cmd: { type: "string", description: "Shell command to execute." },
+          workdir: { type: "string", description: "Working directory for the command. Defaults to the turn cwd." },
+          yield_time_ms: { type: "number", description: "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms." },
+          max_output_tokens: { type: "number", description: "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy." },
+          ...(options.escalation ? ESCALATION_PARAMETERS : {}),
+        },
+        required: ["cmd"],
+        additionalProperties: false,
+      },
+    },
+    parallel: true,
+
+    async run(args, context) {
+      const command = args.cmd as string;
+      if (command.trim() === "") throw new ToolError("cmd must not be empty.");
+      const cwd = typeof args.workdir === "string" ? resolve(context.cwd, args.workdir) : context.cwd;
+      const escalate = args.sandbox_permissions === "require_escalated";
+      const justification = typeof args.justification === "string" && args.justification.trim() !== "" ? args.justification.trim() : undefined;
+      const safety = context.safety;
+
+      let sandboxed = false;
+      if (safety) {
+        const assessment = assessCommand(safety.policy, safety.rules, command, escalate);
+        if (assessment.action === "refuse") throw new ToolError(assessment.message);
+        sandboxed = assessment.sandboxed;
+        if (assessment.action === "ask") {
+          const decision = await askUser(context, {
+            kind: "command",
+            command,
+            cwd,
+            reason: assessment.reason,
+            sandboxed,
+            ...(justification !== undefined ? { justification } : {}),
+            rememberPrefixes: assessment.prefixes,
+          });
+          if (decision === "unavailable") return unavailable("This command");
+          if (decision === "denied") return declined(sandboxed ? "to run this command" : "to run this command outside the sandbox");
+          if (decision === "approved_for_session" && assessment.prefixes) safety.rules.rememberCommand(assessment.prefixes, !sandboxed);
+        }
+      }
+
+      let result = await runCommand(command, cwd, sandboxed, escalate && !sandboxed, args, context);
+      const details = result.details?.kind === "command" ? result.details : null;
+      if (safety && sandboxed && details && likelySandboxDenied(safety.policy, details.exitCode, result.fullOutput ?? String(result.output))) {
+        if (safety.policy.approval === "untrusted") {
+          // codex asks to retry without the sandbox under the untrusted policy.
+          const decision = await askUser(context, { kind: "command", command, cwd, reason: "sandbox_denied", sandboxed: false, rememberPrefixes: null });
+          if (decision === "approved" || decision === "approved_for_session") result = await runCommand(command, cwd, false, true, args, context);
+        } else {
+          const hint = DENIAL_HINT[safety.policy.approval];
+          if (hint && safety.policy.sandbox !== "danger-full-access") result = { ...result, output: `${String(result.output)}\n${hint}` };
+        }
+      }
+      return result;
+    },
+  };
+}
+
+async function runCommand(command: string, cwd: string, sandboxed: boolean, escalated: boolean, args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+  const policy = context.safety?.policy;
+  const sandbox = sandboxed && policy ? sandboxSpec(policy) : null;
+  const session = await context.processes.start({
+    command,
+    cwd,
+    ...(sandbox ? { sandbox } : {}),
+    ...(policy?.stripSecrets ? { stripSecrets: true } : {}),
+  });
+  const chunk = await session.read({
+    yieldMs: clamp(args.yield_time_ms, DEFAULT_YIELD_MS, MIN_YIELD_MS, MAX_YIELD_MS),
+    ...(context.signal ? { signal: context.signal } : {}),
+  });
+  const output = formatChunk(chunk, session.id, clamp(args.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS, 1, Number.MAX_SAFE_INTEGER), context);
+  const full = fullText(chunk, output);
+  return {
+    output,
+    success: chunk.exitCode === null || chunk.exitCode === 0,
+    ...(full !== undefined ? { fullOutput: full } : {}),
+    details: {
+      kind: "command",
+      command,
+      cwd,
+      exitCode: chunk.exitCode,
+      sessionId: chunk.exitCode === null ? session.id : null,
+      wallTimeMs: chunk.wallTimeMs,
+      sandboxed: sandbox !== null,
+      escalated,
+    },
+  };
+}
+
+/** No escalation parameters: the shape used without a sandbox the model could ask to lift. */
+export const execCommandTool: ToolHandler = createExecCommandTool({ escalation: false });
 
 export const writeStdinTool: ToolHandler = {
   spec: {

@@ -17,6 +17,8 @@ export interface SessionMeta {
   /** Baseline effort when the thread started. */
   effort: ReasoningEffort;
   harnessVersion: string;
+  /** Sandbox, approval and network settings the thread started with (F3; absent before). */
+  safety?: { sandbox: string; approval: string; network: boolean };
 }
 
 export type SessionLine =

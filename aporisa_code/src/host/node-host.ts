@@ -1,7 +1,7 @@
 // The host on Node: real file system and processes, no sandbox yet (F3 adds one).
 import { randomUUID } from "node:crypto";
 import { appendFile, chmod, lstat, mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { fromNodeError, HostError } from "./errors.ts";
 import { NodeProcessManager } from "./process.ts";
@@ -154,6 +154,7 @@ export class NodeHost implements Host {
       shell: this.options.shell ?? (envShell && isAbsolute(envShell) ? envShell : "/bin/zsh"),
       homeDir: home,
       dataDir: this.options.dataDir ?? join(home, "Library", "Application Support", "Aporisa Code"),
+      tmpDir: process.env.TMPDIR ?? tmpdir(),
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     };
   }

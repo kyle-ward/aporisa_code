@@ -2,6 +2,7 @@
 // JPEG goes back to the model as an input_image in the tool result. The client neither
 // converts nor scales; the backend sizes images per `detail` (protocol section 7.1).
 import { resolve } from "../paths.ts";
+import { isDenied, realPath } from "../safety/index.ts";
 import { ToolError, type ToolHandler } from "./types.ts";
 
 /** Files above this are refused; well under the backend's 64 MiB request body. */
@@ -46,6 +47,9 @@ export const viewImageTool: ToolHandler = {
   async run(args, context) {
     const display = args.path as string;
     const path = resolve(context.cwd, display);
+    if (context.safety && isDenied(context.safety.policy, await realPath(context.host.fs, path))) {
+      throw new ToolError(`${display} is in a private location that cannot be read.`);
+    }
     const bytes = await context.host.fs.readFile(path, { maxBytes: MAX_IMAGE_BYTES });
     const mediaType = imageMediaType(bytes);
     if (!mediaType) throw new ToolError(`${display} is not a PNG or JPEG image; only those two formats can be viewed. Convert it first (for example with sips) if needed.`);

@@ -1,7 +1,7 @@
 // The F2 tool set (DEVELOPMENT_PLAN.md section 5).
 export * from "./types.ts";
-export { defaultTools, ToolRegistry, type ToolCall } from "./registry.ts";
-export { execCommandTool, formatChunk, writeStdinTool } from "./exec.ts";
+export { defaultTools, ToolRegistry, type ToolCall, type ToolSetOptions } from "./registry.ts";
+export { createExecCommandTool, execCommandTool, formatChunk, writeStdinTool, type ExecCommandOptions } from "./exec.ts";
 export { applyPatchTool, APPLY_PATCH_DESCRIPTION } from "./apply-patch/tool.ts";
 export { commitPatch, deriveNewContents, PatchApplyError, planPatch, seekSequence, summarize } from "./apply-patch/apply.ts";
 export { parsePatch, PatchParseError, type Hunk, type UpdateFileChunk } from "./apply-patch/parser.ts";

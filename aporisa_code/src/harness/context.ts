@@ -77,9 +77,15 @@ export function agentsMdMessage(cwd: string, text: string): InputItem {
   return userMessage(`# AGENTS.md instructions for ${cwd}\n\n<INSTRUCTIONS>\n${text}\n</INSTRUCTIONS>`);
 }
 
+/** The thread's permissions (sandbox, network, approvals) as a developer message (F3). */
+export function permissionsItem(text: string): InputItem {
+  return { type: "message", role: "developer", content: [{ type: "input_text", text }] };
+}
+
 /** The thread's fixed opening items; they never change for the life of the thread. */
-export async function initialContext(cwd: string, fs: HostFileSystem, info: HostInfo, date: Date): Promise<InputItem[]> {
+export async function initialContext(cwd: string, fs: HostFileSystem, info: HostInfo, date: Date, permissions?: string): Promise<InputItem[]> {
   const items = [environmentContext(cwd, info, date)];
+  if (permissions !== undefined) items.push(permissionsItem(permissions));
   const agents = await loadAgentsMd(cwd, fs);
   if (agents !== null) items.push(agentsMdMessage(cwd, agents));
   return items;

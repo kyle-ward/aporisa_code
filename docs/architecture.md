@@ -2,7 +2,7 @@
 
 本文描述 Aporisa Code 各部分的职责划分、进程模型和内部接口。公共协议只在 [protocol.md](protocol.md) 定义，这里只引用；已验证的事实见 [validation.md](validation.md)。
 
-> 状态（2026-10-01）：后端 v0（B0–B2）完成；本文描述的是 B1 的实现加上 B2 的投机解码、结构化输出、SSD 会话缓存、图片输入和调优，均已在真实模型上验收（validation.md）。前端 F2 已完成（harness core、host 层、命令行，真实任务验收通过）；执行安全（F3）和 UI（F4）尚未开始，计划见 `aporisa_code/DEVELOPMENT_PLAN.md`。
+> 状态（2026-10-01）：后端 v0（B0–B2）完成；本文描述的是 B1 的实现加上 B2 的投机解码、结构化输出、SSD 会话缓存、图片输入和调优，均已在真实模型上验收（validation.md）。前端 F2 已完成（harness core、host 层、命令行，真实任务验收通过）；F3（执行安全）已完成，真实任务验收通过；UI（F4）尚未开始。计划见 `aporisa_code/DEVELOPMENT_PLAN.md`。
 
 ## 1. 三块与边界
 
@@ -26,7 +26,14 @@ harness（F2）以 codex 为蓝本，决策记录见前端开发计划（FD-01 �
 - **上下文**：F2 只做 baseline：请求前按上一次 usage 加新增内容估算，超出有效窗口就不发送；压缩与裁剪属于 F6。
 - **会话记录**：`~/Library/Application Support/Aporisa Code/sessions/` 下每个会话一个 JSONL（目录 0700、文件 0600），可恢复；恢复时按 codex 的规则补齐缺失的工具结果。
 - **事件**：harness 对外只输出事件（thread / turn / item / tool / approval / response.completed / warning），命令行是第一个消费者；F4 之前定稿为 L3 合同。
-- harness 只通过 host 接口接触文件系统和进程，不能使用 Node 内置模块；F2 没有沙箱，命令以用户身份运行，默认逐条询问（F3 取代）。SDK 只有 native、openrouter、stub 三种 driver；OpenRouter 的映射差异只在 [compat-openrouter.md](compat-openrouter.md) 定义。
+- harness 只通过 host 接口接触文件系统和进程，不能使用 Node 内置模块。
+
+执行安全（F3，前端开发计划第 9 节）以 codex 为蓝本：
+
+- **沙箱**：命令经 `/usr/bin/sandbox-exec` 在 macOS Seatbelt 下运行（策略移植自 codex）。默认 `workspace-write`：全盘可读，只能写工作目录、`/tmp`、`$TMPDIR`；工作区里的 `.git`、`.agents`、`.codex`、`.aporisa` 只读；`~/.ssh`、`~/.gnupg`、`~/.aws`、`~/Library/Keychains` 和 Aporisa 的数据目录不可读；默认不联网（包括本机回环）。子进程环境中名字含 KEY、SECRET、TOKEN 的变量被剔除。
+- **审批**：默认 `on-request`：沙箱内的命令直接运行；模型需要越权时在 `exec_command` 里带 `sandbox_permissions: "require_escalated"` 和一句 `justification`，用户批准后在沙箱外运行；强制删除这类危险命令总要询问。`untrusted` 对只读命令以外都询问，`never` 不询问、越权与危险命令直接拒绝。批准可以「本会话允许」，按命令前缀记住。
+- **harness 侧的检查**：`apply_patch` 和 `view_image` 不经过沙箱，按同一策略检查真实路径：补丁写到可写范围外或受保护目录时询问，写到禁读位置一律拒绝。
+- **告知模型**：会话开头有一条说明权限的 developer 消息；恢复会话时档位变了，就在历史末尾追加新的说明。SDK 只有 native、openrouter、stub 三种 driver；OpenRouter 的映射差异只在 [compat-openrouter.md](compat-openrouter.md) 定义。
 
 ## 3. 后端进程模型
 

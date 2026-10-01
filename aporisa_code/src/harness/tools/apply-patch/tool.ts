@@ -1,7 +1,8 @@
 // The apply_patch tool. A function tool with one string argument holding codex's patch
 // format, for every driver (DEVELOPMENT_PLAN.md FD-05: codex itself now ships only the
 // freeform form, which the local backend does not offer).
-import { declined, ToolError, type ToolHandler } from "../types.ts";
+import { assessPatch, realPath } from "../../safety/index.ts";
+import { askUser, declined, ToolError, unavailable, type ToolHandler } from "../types.ts";
 import { commitPatch, PatchApplyError, planPatch, summarize } from "./apply.ts";
 import { parsePatch, PatchParseError } from "./parser.ts";
 
@@ -57,8 +58,19 @@ export const applyPatchTool: ToolHandler = {
       if (error instanceof PatchApplyError) throw new ToolError(`${error.message}\nThe patch was not applied; no file was changed.`);
       throw error;
     }
-    if (context.approve && !(await context.approve({ kind: "patch", cwd: context.cwd, changes: plan.changes }))) {
-      return declined("this patch");
+    const safety = context.safety;
+    if (safety) {
+      // apply_patch runs in the harness, not in the sandbox: check its paths against the
+      // same policy (codex does the same), on real paths so symlinks cannot escape.
+      const paths = await Promise.all([...plan.writes.keys()].map((path) => realPath(context.host.fs, path)));
+      const assessment = assessPatch(safety.policy, safety.rules, paths);
+      if (assessment.action === "refuse") throw new ToolError(assessment.message);
+      if (assessment.action === "ask") {
+        const decision = await askUser(context, { kind: "patch", cwd: context.cwd, changes: plan.changes, reason: assessment.reason, paths: assessment.paths });
+        if (decision === "unavailable") return unavailable("This patch");
+        if (decision === "denied") return declined("this patch");
+        if (decision === "approved_for_session") safety.rules.rememberPaths(assessment.paths);
+      }
     }
     await commitPatch(plan, context.host.fs);
     return { output: summarize(plan.changes), success: true, details: { kind: "patch", changes: plan.changes } };

@@ -4,7 +4,7 @@
 >
 > - 协议合同是 [docs/protocol.md](../docs/protocol.md)。harness 只通过 SDK 使用合同；需要改合同时，按合同第 13 节的流程进行。
 > - 设计参考以 openai/codex 为主（只读克隆在 Studio 的 `~/Personal/references/codex`，本文引用的源码位置基于 HEAD `a933dd77`，路径相对于 `codex-rs/`）。刻意偏离 codex 的地方，在第 2 节和相关小节写明原因。
-> - 状态（2026-10-01）：**F2 完成**。代码与确定性测试完成，用户在 Studio 上运行真实验收 8/8 通过（docs/validation.md）；验收暴露的 FD-08 问题已修订。下一阶段 F3 等用户明确开始。
+> - 状态（2026-10-02）：**F2、F3 完成**。F3 的真实验收 11/11 通过（docs/validation.md）。交互模式的真人测试推迟到 F4 之后（用户决定）。下一阶段 F4 等用户明确开始。
 
 ## 1. 目标与阶段
 
@@ -15,7 +15,7 @@ harness core 是项目的核心价值。F2 到 F4 的目标是：在本地后端
 | F0 | 合同 v0 | 完成（`d52f052`） |
 | F1 | SDK、mock、stub driver、wire 层一致性测试 | 完成（`3f58fd8`）；W01–W30 对真实后端全部通过 |
 | **F2** | **无界面 agent loop，直接对接本地后端**：host 层、工具、回合循环、会话持久化、CLI | 本文第 3–8 节 |
-| F3 | 执行安全：沙箱（macOS Seatbelt）、权限策略、审批 | 未开始；默认值到 F3 开始时再定 |
+| F3 | 执行安全：沙箱（macOS Seatbelt）、权限策略、审批 | 完成：真实验收 11/11（第 9 节） |
 | F4 | Electron UI MVP；之前定 L3（harness ↔ UI）合同；`frontend.sh dev/build/install` | 未开始；从这里开始日常自用 |
 | F5 | OpenRouter 兼容 driver（含图片映射） | 未开始 |
 | F6 | 上下文管理：token 账本、可插拔策略 | 未开始 |
@@ -33,7 +33,7 @@ harness core 是项目的核心价值。F2 到 F4 的目标是：在本地后端
 | FD-04 | harness 对外只输出事件流，按 codex 的 Thread / Turn / Item 组织。CLI 是第一个消费者；F4 之前再定稿为 L3 合同 | codex 的 app-server v2；F2 先用、F4 再冻结，避免过早定死 | 建议 |
 | FD-05 | **`apply_patch` 一律做成 function 工具**，只有一个字符串参数 `input`，内容是 codex 的补丁格式；即使模型声明了 `custom_tools` 也不用 custom 形态 | 偏离 codex（新版 codex 只提供 freeform 形态）。原因：本地后端没有 `custom_tools`；Qwen 的工具调用格式里字符串参数是原样文本（`<parameter=input>…</parameter>`），不需要 JSON 转义，function 形态没有额外代价；三种 driver 用同一份工具定义，轨迹可比 | 用户已定（2026-10-01） |
 | FD-06 | `exec_command` 用管道而不是 PTY，不提供 `tty` 参数；保留 codex 的「到时间先返回、进程继续跑、用 `write_stdin` 跟进」语义 | 偏离 codex。PTY 需要 node-pty 这类原生依赖，要随 Node 和 Electron 版本编译；管道已经覆盖测试、构建、开发服务器这些主要场景。交互式程序（需要终端的编辑器、`git add -p` 这类）暂不支持，需要时再加 | 用户已定（2026-10-01） |
-| FD-07 | F2 的临时安全措施：CLI 默认在每次 `exec_command` 和 `apply_patch` 之前询问；`--auto` 跳过询问，只用于一次性的临时工作区。F3 用沙箱和审批策略取代 | F2 没有沙箱，模型的命令以用户身份直接运行；真实任务验收在临时仓库里由用户启动 | 用户已定（2026-10-01） |
+| FD-07 | F2 的临时安全措施：CLI 默认在每次 `exec_command` 和 `apply_patch` 之前询问；`--auto` 跳过询问，只用于一次性的临时工作区。F3 用沙箱和审批策略取代 | F2 没有沙箱，模型的命令以用户身份直接运行；真实任务验收在临时仓库里由用户启动 | 用户已定（2026-10-01）；**已被 F3 取代**（第 9 节：沙箱 + `on-request`，`--auto` 改为不询问但沙箱照开） |
 | FD-08 | 模型输出的工具调用损坏（`response.failed`，code 为 `tool_call_invalid`）时，harness 再请求一次；连续第二次失败才结束本回合并报错。按失败响应里有没有完成的工具调用分两种：**没有**（坏掉的调用之前只有推理或说明文字）时丢弃这些 item，原样重发同一份请求；**有**时这些调用已经执行，保留全部 item 和工具结果后再请求 | 这是重新采样，不是重放；协议禁止的是服务端自动重试，harness 自己决定是否再请求。真实验收中发现，保留「没有工具调用的 assistant 输出」会让它和下一次响应的 assistant item 被后端合并成同一个 assistant 回合渲染，历史的渲染随之改变，从那里起前缀缓存失效（`rename` 任务漏掉 640 token）；丢弃则请求不变。已执行的调用不能丢弃，否则历史会缺少真实发生过的副作用；有工具结果隔开时渲染不受影响 | 用户已定（2026-10-01），2026-10-01 按真实验收修订 |
 | FD-09 | F2 的上下文管理只做 baseline：工具输出按模型的 `truncation_policy` 截断后写入历史；请求前估算 token，超过有效窗口就不发送，明确报错；不做压缩 | 压缩和裁剪属于 F6 的研究内容。F4 开始自用时是否先加一个最简单的压缩，到 F4 再定 | 用户已定（F6 的范围） |
 | FD-10 | 系统指令自写（英文），结构参考 codex 的 `protocol/src/prompts/base_instructions/default.md`；环境上下文和项目 AGENTS.md 作为会话开头的 user 消息，会话期间不变 | 前缀稳定是本地后端性能的关键（续接首 token 0.12 秒，冷启动 3.4K token 要 4.6 秒） | 建议 |
@@ -240,26 +240,51 @@ harness 对外的事件（F4 之前不冻结）：`thread.started`、`turn.start
 
 整个阶段连续完成，只在需要用户决策或运行权限之外的命令时停下（用户 2026-10-01 的要求）；提交只在用户要求时进行。F2 的定稿设计已写进 `docs/architecture.md` 第 2 节和 `docs/development.md`；本文保留 F2 各节作为决策记录，前端全部完成后与后端开发文档一样拆分删除。
 
-## 9. 留给后续阶段的事
+## 9. F3：执行安全
 
-- F3：Seatbelt 沙箱（`/usr/bin/sandbox-exec`，参考 codex 的 `sandboxing/`）、网络开关、审批策略、命令切分与危险命令判定、环境变量收紧。用户 2026-10-01 采纳的默认值（F3 开始前的只读评估）：
-  1. 默认 `workspace-write`：可写工作目录、`/tmp`、`$TMPDIR`，全盘可读；
-  2. 默认不联网，需要时模型申请（`sandbox_permissions: "require_escalated"` 加 `justification`），用户批准；
-  3. 审批默认 `on-request`，取代 F2 的「每次都问」；`--auto` 改为「从不询问、沙箱照开」；完全不设限需要显式的 `--dangerously-bypass-sandbox`；
-  4. 可写目录下的 `.git` 和项目元数据目录只读（与 codex 一致，提交需要申请）；
-  5. 额外禁读 `~/.ssh`、`~/.gnupg`、`~/.aws`、`~/Library/Keychains` 和 Aporisa 的数据目录；
-  6. 子进程环境变量默认剔除名字含 KEY、SECRET、TOKEN 的变量；
-  7. 「记住批准」只在本次会话内按命令前缀生效，持久化规则推迟。
+### 9.1 用户采纳的默认值（2026-10-01，F3 开始前的只读评估）
 
-  实现要点：命令切分自写保守版（复杂语法一律询问，不引入解析依赖）；沙箱路径按真实路径（`/tmp` → `/private/tmp`）；`apply_patch`、`view_image` 在 harness 侧按同一策略检查路径；移植 codex 的 `.sbpl`（注明 Apache-2.0）。已确认 agent 的环境里能运行 `sandbox-exec`，逃逸测试可以进入 `check.sh`。
-- F4：L3 合同定稿；会话列表与恢复；是否先加最简单的压缩；图片粘贴与拖入。
+1. 默认 `workspace-write`：可写工作目录、`/tmp`、`$TMPDIR`，全盘可读；
+2. 默认不联网，需要时模型申请（`sandbox_permissions: "require_escalated"` 加 `justification`），用户批准；
+3. 审批默认 `on-request`，取代 F2 的「每次都问」；`--auto` 改为「从不询问、沙箱照开」；完全不设限需要显式的 `--dangerously-bypass-sandbox`；
+4. 可写目录下的 `.git` 和项目元数据目录只读（与 codex 一致，提交需要申请）；
+5. 额外禁读 `~/.ssh`、`~/.gnupg`、`~/.aws`、`~/Library/Keychains` 和 Aporisa 的数据目录；
+6. 子进程环境变量默认剔除名字含 KEY、SECRET、TOKEN 的变量；
+7. 「记住批准」只在本次会话内按命令前缀生效，持久化规则推迟。
+
+### 9.2 实现
+
+| 层 | 内容 |
+| --- | --- |
+| host（`src/host/sandbox/`） | `ExecRequest.sandbox`（`SandboxSpec`：可写根目录、受保护的目录名、禁读路径、网络）时以 `/usr/bin/sandbox-exec -p <策略> -D… -- <shell> -lc <命令>` 运行；沙箱进程就是命令本身，进程组和 F2 一样。策略 = codex 的基础策略、网络策略、偏好设置策略（原文移植，`codex-policies.ts`）+ 全盘可读 + 每个可写根目录的 `subpath`（排除 `.git` 等受保护名字的正则）+ 禁止删除可写根目录本身 + 禁读路径（放在最后）+ codex 的 fcntl 限制。额外放行 `com.apple.bsd.dirhelper`（查询本用户临时目录；否则 Python 每次启动都报警告，codex 只在开网络时放行）。`stripSecrets` 时剔除名字含 KEY / SECRET / TOKEN 的继承变量 |
+| 策略（`src/harness/safety/policy.ts`） | 三种沙箱档位（`read-only`、`workspace-write`、`danger-full-access`）× 三种审批（`untrusted`、`on-request`、`never`）。所有路径取真实路径（`/tmp` → `/private/tmp`，符号链接展开，尚不存在的文件按最近的已存在祖先解析）。受保护的名字：`.git`、`.agents`、`.codex`、`.aporisa`。命令判定照 codex：危险命令（强制 rm，包括 `sudo`、`env`、`sh -c` 包裹）总要询问、审批关闭时拒绝；申请越权时询问（会话内记住的前缀不再问）、审批关闭时拒绝；`untrusted` 对只读命令以外的一切都询问；其余在沙箱里直接运行 |
+| 命令切分（`src/harness/safety/shell.ts`） | 自写的保守切分器：按 `|`、`||`、`&&`、`;`、`&`、换行切成简单命令；遇到展开、重定向、子 shell、通配符、注释、前置赋值、未闭合引号即标为「复杂」。复杂命令不匹配记住的前缀，也不算只读命令，最多多问一次。「本会话允许」记住的前缀：`git`、`npm`、`cargo` 这类带子命令的工具取两个词，其余取程序名 |
+| 工具 | `exec_command` 在可以越权时才提供 `sandbox_permissions` 和 `justification` 参数（`never` 或无沙箱时不提供）；沙箱内失败且输出像沙箱拒绝时：`on-request` 在输出末尾提示如何申请（codex 不自动重试），`untrusted` 询问是否在沙箱外重跑（codex 的做法）。`apply_patch` 和 `view_image` 在 harness 进程里执行，按同一策略检查真实路径：补丁写到可写范围外或受保护目录时询问（`never` 拒绝），写到禁读位置一律拒绝；不能查看禁读位置的图片 |
+| 回合循环 | 会话开始时解析策略；开头的 developer 消息说明权限（codex 的 permissions 模板）；会话元数据记录档位，恢复时档位不同就在历史末尾追加新的权限说明（前缀不变）。审批的结果改为三种：批准、本会话允许、拒绝；没有审批者时需要审批的一律拒绝并告诉模型 |
+| 命令行 | `--sandbox`、`--approval`、`--network`、`--auto`（= `--approval never`）、`--dangerously-bypass-sandbox`（不能与其他安全参数同用）；审批提问 `[y] / [a] 本会话允许 / [N]` |
+
+### 9.3 验收
+
+- 确定性（`check.sh frontend`，真实 Seatbelt）：
+  - 逃逸测试：工作区外写入、经符号链接写出、`.git` 的写入、删除、改名与新建、删除工作区根目录、禁读目录的读取与列目录、本机回环网络（默认被拦、开网络后可达）、密钥变量剔除、沙箱下按进程组结束、路径中的正则字符；
+  - 策略、切分、危险命令（codex 用例）、只读命令、前缀；
+  - 回合循环中的权限说明、越权申请与会话记忆、无人审批与审批关闭、`untrusted` 的拒绝后重跑、补丁审批、禁读图片、恢复时追加权限说明。
+- 真实验收（用户运行 `npm run agent-tasks`）：F2 的 8 个任务改在默认档位下运行，脚本自动批准每次询问并记录；新增 3 个必须越权才能完成的任务：`network-fetch`（本机回环服务）、`write-outside`（仓库外的文件）、`git-commit`（`.git` 只读）。标准：11 个任务跑完不崩溃；F2 的 8 个任务最好不需要审批（作为观察指标）；F3 的 3 个任务通过且至少经过一次审批。
+- 命令行交互模式（审批提问、`a` 记住、Ctrl-C）的真人测试：用户决定推迟到 F4 完成之后，通过界面一起验收；在此之前只运行无交互的测试。
+- 结果（2026-10-02）：11/11 通过；F2 的 8 个任务在沙箱里没有触发任何审批；F3 的 3 个任务各经过一次越权审批，其中两个先撞墙再按提示申请，`git-commit` 根据权限说明直接申请。
+
+## 10. 留给后续阶段的事
+
+- F4：L3 合同定稿；会话列表与恢复；是否先加最简单的压缩；图片粘贴与拖入；审批的界面交互；补上推迟的真人交互验收（审批、本会话允许、取消）。
 - F5：OpenRouter driver，录制回放。
 - F6：上下文管理策略（压缩、工具输出裁剪、推理保留多少），以及「省 token」与「保住前缀缓存」之间的取舍。
-- 待需要时：PTY、`apply_patch` 的 shell heredoc 形式、MCP、子 agent。
+- 待需要时：PTY、`apply_patch` 的 shell heredoc 形式、MCP、子 agent、持久化的命令规则（codex 的 execpolicy）、只开网络的细粒度越权（codex 的 `with_additional_permissions`）。
 
-## 10. 变更记录
+## 11. 变更记录
 
 - **2026-10-01**：初稿。阶段顺序、工具集、会话存放位置、本文位置由用户确定；FD-05 到 FD-08 待用户决定。
 - **2026-10-01**：用户采纳 FD-05 到 FD-08，开始 F2.1。
+- **2026-10-02**：用户运行 F2 + F3 真实验收，11/11 通过。用户决定真人交互测试推迟到 UI 完成之后，此前只运行无交互的测试。
+- **2026-10-01**：F3 代码完成（第 9 节）。实现中的取舍：沿用 codex 在 `on-request` 下不自动重试、只提示申请的做法（`untrusted` 才询问是否在沙箱外重跑）；额外放行 `com.apple.bsd.dirhelper`；「本会话允许」的前缀只对 git、npm 这类工具取子命令；新增 `tmpWritable` 选项（codex 的 exclude 开关，测试中用于构造工作区外的位置）。
 - **2026-10-01**：用户运行真实验收，8/8 通过。按结果修订：FD-08 在没有完成的工具调用时丢弃失败响应的 item、原样重发（`rename` 任务中保留它们让前缀缓存漏掉 640 token）；验收指标的「首事件」（`response.created`，后端收到请求立即发出）改为首个输出 item 的时间；系统指令补充 macOS 的 BSD 命令行和「没有读文件工具」两句（模型用过 `cat -A`、调用过不存在的 `read_file`）。F3 的默认值按用户采纳的建议（见第 9 节），F3 等用户明确开始。
 - **2026-10-01**：F2.1–F2.4 代码完成。实现中补充的设计：主进程退出后结束整个进程组、stdin 的 Ctrl-C / Ctrl-D 语义（4.2）；FD-08 细化为保留已完成的 item 后再请求；审批与回合取消赛跑（取消视为拒绝）；并行工具的审批按调用顺序逐个询问；会话恢复时按 codex 的规则补齐缺失的工具结果（每次加载重算，不写回文件）；图片按固定成本估算 token（1,100 / 4,200），不按 base64 字节数。
