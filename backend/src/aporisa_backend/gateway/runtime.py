@@ -88,6 +88,7 @@ class Runtime:
             "worker_ready",
             duration_ms=round((time.monotonic() - started) * 1000),
             released_cache_bytes=info.get("released_cache_bytes"),
+            locked_bytes=info.get("locked_bytes"),
             **{key: (info.get("startup") or {}).get(key) for key in PRESSURE_FIELDS},
         )
         self.state = "ready"

@@ -18,6 +18,7 @@ from .generate import Engine, JobFlags, Settings
 from .ple_prefetch import PlePrefetcher, external_ple
 from .sessions import SessionStore
 from .speculative import MtpDrafter
+from .structured import Structured
 from .tokens import Codec
 
 ADAPTERS = {"qwen38_flash_next": Qwen38Adapter}
@@ -44,6 +45,7 @@ def load(init: dict) -> Engine:
     released = materialize(model, model_dir)
     drafter = load_drafter(model, Path(init["draft_dir"])) if init.get("draft_dir") else None
     weights = int(mx.get_active_memory())
+    locked = lock_weights(model, *([drafter.model] if drafter is not None else []))
     adapter = ADAPTERS[init["adapter"]](Codec(model_dir), init["model"])
     prefetcher = PlePrefetcher(lm, config.ple_threads) if external_ple(lm) else None
     budget = init.get("snapshot_budget_bytes")
@@ -80,9 +82,13 @@ def load(init: dict) -> Engine:
             lookup_min_match=config.lookup_min_match,
             lookup_max_match=config.lookup_max_match,
             lookup_cooldown=config.lookup_cooldown,
+            lookup_trust_match=config.lookup_trust_match,
         ),
         prefetcher,
         drafter,
+        Structured(model_dir, int(lm.args.vocab_size))
+        if init["model"]["capabilities"].get("structured_output")
+        else None,
     )
     engine.info = {
         "wired_limit_bytes": wired,
@@ -92,9 +98,44 @@ def load(init: dict) -> Engine:
         "draft_schedule": [list(step) for step in engine.settings.draft_schedule],
         "lookup_schedule": [list(step) for step in engine.settings.lookup_schedule],
         "released_cache_bytes": released,
+        "locked_bytes": locked,
     }
     engine.model_ref = model  # keeps the vision tower and config alive with the process
     return engine
+
+
+def lock_weights(*modules) -> int:
+    """Wires every weight buffer at the VM level (mlock); returns the bytes locked.
+
+    MLX's wired limit keeps buffers resident while the GPU works, but after ~10 idle hours
+    the system had un-wired the model and compressed 53 GB of it into a compressor that
+    could not shrink 4-bit weights (stored 53.5 GB in 53.3 GB): no memory freed, pressure
+    held at warn, swap written, and the next request would decompress it all (B2). Locked
+    pages are never compressed or swapped; the user keeps the rest of the machine for the
+    desktop and stops the service to get the memory back. Failure fails the startup.
+    """
+    import ctypes
+    import ctypes.util
+    import os
+
+    import numpy as np
+    from mlx.utils import tree_flatten
+
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    unsigned = {1: mx.uint8, 2: mx.uint16, 4: mx.uint32, 8: mx.uint64}
+    locked = 0
+    for module in modules:
+        for _, array in tree_flatten(module.parameters()):
+            # bfloat16 has no buffer-protocol format; a same-size integer view shares memory.
+            view = array.view(unsigned[array.dtype.size]) if array.dtype.size in unsigned else array
+            mx.eval(view)
+            address = np.asarray(memoryview(view)).ctypes.data
+            if libc.mlock(ctypes.c_void_p(address), ctypes.c_size_t(array.nbytes)) != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, f"cannot lock the model weights: {os.strerror(error)}")
+            locked += array.nbytes
+    return locked
 
 
 def load_drafter(model, draft_dir: Path) -> MtpDrafter:
@@ -276,6 +317,34 @@ def warmup(engine: Engine, alias: str) -> None:
         _run(engine, {**base, "tools": tools, "input": history, "max_output_tokens": 4}),
         "tool rendering",
     )
+    if engine.structured is not None:
+        schema = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+        answer = _terminal(
+            _run(
+                engine,
+                {
+                    **base,
+                    "input": [user("Is water wet?")],
+                    "max_output_tokens": 16,
+                    "reasoning": {"effort": "none"},
+                    "text": {
+                        "format": {
+                            "type": "json_schema",
+                            "name": "w",
+                            "schema": schema,
+                            "strict": True,
+                        }
+                    },
+                },
+            ),
+            "structured output",
+        )
+        if answer["type"] != "finished":
+            raise WarmupError("structured output: the constrained answer failed")
     session = f"warmup:{secrets.token_hex(4)}"
     prompt = {**base, "input": [user("Warm the cache.")], "max_output_tokens": 4}
     warm = _terminal(_run(engine, {**prompt, "generate": False}, session), "prewarm")

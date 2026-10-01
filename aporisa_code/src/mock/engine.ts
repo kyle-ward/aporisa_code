@@ -3,6 +3,8 @@
 import {
   canonicalJson,
   effectiveReasoningEffort,
+  schemaInstance,
+  schemaValueViolation,
   StreamValidator,
   type EventWithoutSequence,
   type InputItem,
@@ -26,7 +28,11 @@ export interface MockPlan {
   steps: MockStep[];
   /** Emit response.failed once this many steps have completed. */
   failAfter?: { steps: number; code: StreamErrorCode; message: string };
+  /** Set by the engine: indices of steps under structured-output constraints (§8.4). */
+  constrained?: ReadonlySet<number>;
 }
+
+const STRUCTURED_OUTPUT_INVALID = "The output did not satisfy the requested schema.";
 
 export interface MockScriptContext {
   params: ResponseParams;
@@ -249,6 +255,7 @@ export class MockEngine {
           result = yield* stream.call(this, step.text, "output", (delta) => ({ type: "response.output_text.delta", ...ref, delta }));
           if (result.stop === "cancelled") return;
           if (result.stop === "interrupted") break;
+          if (result.stop === "budget" && plan.constrained?.has(stepIndex)) break; // §8.4: no half JSON
           yield emit({ type: "response.output_text.done", ...ref, text: result.text });
           yield emit({ type: "response.content_part.done", ...ref, part: { type: "output_text", text: result.text } });
           const item: OutputItem = { type: "message", id, role: "assistant", content: [{ type: "output_text", text: result.text }], ...phase };
@@ -305,6 +312,7 @@ export class MockEngine {
           );
           if (result.stop === "cancelled") return;
           if (result.stop === "interrupted") break;
+          if (result.stop === "budget" && plan.constrained?.has(stepIndex)) break; // §8.4
           yield emit(
             isFunction
               ? { type: "response.function_call_arguments.done", ...ref, arguments: result.text }
@@ -356,7 +364,49 @@ export class MockEngine {
       const firstCall = steps.findIndex((step) => step.type === "function_call" || step.type === "custom_tool_call");
       if (firstCall !== -1) steps = steps.slice(0, firstCall + 1);
     }
-    return { ...plan, steps };
+    return this.structure(params, { ...plan, steps });
+  }
+
+  /**
+   * Structured output (§8.4), as constrained decoding would produce it: with text.format the
+   * answer is either tool calls (no commentary) or one message holding a schema instance;
+   * arguments of strict tools that break their schema fail with structured_output_invalid.
+   */
+  private structure(params: ResponseParams, plan: MockPlan): MockPlan {
+    if (!this.model.capabilities.structured_output) return plan;
+    const format = params.text?.format;
+    const strict = new Map(
+      (params.tools ?? []).flatMap((tool) => (tool.type === "function" && tool.strict === true ? [[tool.name, tool.parameters]] : [])),
+    );
+    if (!format && strict.size === 0) return plan;
+    let steps = plan.steps;
+    if (format) {
+      const calls = steps.some((step) => step.type === "function_call" || step.type === "custom_tool_call");
+      let answered = false;
+      steps = steps.flatMap((step): MockStep[] => {
+        if (step.type !== "message") return [step];
+        if (calls || answered) return [];
+        answered = true;
+        return [{ type: "message", text: JSON.stringify(schemaInstance(format.schema)), phase: "final_answer" }];
+      });
+    }
+    const constrained = new Set<number>();
+    let failAfter = plan.failAfter;
+    for (const [index, step] of steps.entries()) {
+      if (step.type === "message" && format) constrained.add(index);
+      if (step.type !== "function_call" || !strict.has(step.name)) continue;
+      constrained.add(index);
+      let violation: string | null;
+      try {
+        violation = schemaValueViolation(JSON.parse(step.arguments), strict.get(step.name));
+      } catch {
+        violation = "arguments are not JSON";
+      }
+      if (violation && (failAfter === undefined || failAfter.steps > index)) {
+        failAfter = { steps: index, code: "structured_output_invalid", message: STRUCTURED_OUTPUT_INVALID };
+      }
+    }
+    return { ...plan, steps, constrained, ...(failAfter ? { failAfter } : {}) };
   }
 }
 

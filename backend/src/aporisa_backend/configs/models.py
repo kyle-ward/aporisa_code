@@ -98,11 +98,11 @@ CAPABILITY_NAMES = (
     "reasoning_effort_updates",
 )
 
-# B1 capability set (DEVELOPMENT_PLAN.md 5.5); B0-12 confirmed parallel tool calls.
+# DEVELOPMENT_PLAN.md 5.5; B0-12 confirmed parallel tool calls; B2-4 structured output.
 _FLASH_NEXT_CAPABILITIES = {
     "parallel_tool_calls": True,
     "custom_tools": False,
-    "structured_output": False,
+    "structured_output": True,
     "prompt_cache": True,
     "prewarm": True,
     "input_tokens": True,

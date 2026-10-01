@@ -178,6 +178,21 @@ def tiny_draft_dir(tiny_model_dir):
     return tiny_model.build_mtp(tiny_model_dir, tiny_model_dir.parent / "mtp")
 
 
+def patch_sampler(monkeypatch, sample) -> None:
+    """Replaces per-token sampling with `sample(self, logits, ...)`. A decode round's
+    Sampler.rows then yields row by row on demand, so scripted and recording samplers see
+    exactly one call per token the round's walk takes (the real rows() draws a whole round
+    at once and the walk discards the rest)."""
+    from aporisa_backend.engine import generate as gen
+
+    def rows(self, logits, drafts):
+        for index in range(logits.shape[0]):
+            yield sample(self, logits[index])
+
+    monkeypatch.setattr(gen.Sampler, "__call__", sample)
+    monkeypatch.setattr(gen.Sampler, "rows", rows)
+
+
 def worker_init(model_dir, **overrides) -> dict:
     """The init frame the gateway sends a worker, for in-process engine tests."""
     from aporisa_backend.configs.engine import ENGINE

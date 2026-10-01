@@ -9,6 +9,7 @@ import {
   isTerminalEvent,
   Model,
   ModelList,
+  schemaValueViolation,
   StreamEvent,
   StreamValidator,
   WsErrorMessage,
@@ -55,6 +56,27 @@ export function userMessage(text: string): InputItem {
 }
 
 const CONTINUATION_SETUP_TOKENS = 2048;
+const STRUCTURED_OUTPUT_TOKENS = 1024;
+
+/** The lightest effort the model accepts: structured cases test the answer, not reasoning. */
+function lightestEffort(context: WireContext): string {
+  const efforts = context.model.reasoning.supported_efforts;
+  return efforts.includes("none") ? "none" : (efforts[0] ?? context.model.reasoning.default_effort);
+}
+
+const CITY_SCHEMA = {
+  type: "object",
+  properties: {
+    city: { type: "string" },
+    population: { type: "integer" },
+    capital: { type: "boolean" },
+    languages: { type: "array", items: { type: "string" } },
+    size: { type: "string", enum: ["small", "medium", "large"] },
+    mayor: { anyOf: [{ type: "string" }, { type: "null" }] },
+  },
+  required: ["city", "population", "capital", "languages", "size", "mayor"],
+  additionalProperties: false,
+};
 
 function baseRequest(context: WireContext, text = "Reply with one short sentence.") {
   return { model: context.target.model, input: [userMessage(text)], max_output_tokens: 256 };
@@ -516,6 +538,56 @@ export const wireCases: WireCase[] = [
         assert.ok(next.status === "completed" || next.status === "incomplete");
       } finally {
         session.close();
+      }
+    },
+  },
+  {
+    id: "W25",
+    title: "text.format makes the answer one JSON value of the schema (§8.4)",
+    requires: "structured_output",
+    async run(context) {
+      const { response } = await streamHttp(context.target, {
+        ...baseRequest(context, "Describe the city of Paris as a JSON object."),
+        max_output_tokens: STRUCTURED_OUTPUT_TOKENS,
+        reasoning: { effort: lightestEffort(context) },
+        text: { format: { type: "json_schema", name: "city", schema: CITY_SCHEMA, strict: true } },
+      });
+      assert.equal(response.status, "completed", `status ${response.status}`);
+      const messages = response.output.filter((item) => item.type === "message");
+      assert.equal(messages.length, 1, "text.format allows exactly one answer message");
+      const [message] = messages;
+      assert.ok(message?.type === "message");
+      if (message.phase !== undefined) assert.equal(message.phase, "final_answer");
+      const text = message.content.map((part) => (part.type === "output_text" ? part.text : "")).join("");
+      let value: unknown;
+      assert.doesNotThrow(() => {
+        value = JSON.parse(text);
+      }, "the answer is not JSON");
+      assert.equal(schemaValueViolation(value, CITY_SCHEMA), null);
+    },
+  },
+  {
+    id: "W26",
+    title: "arguments of a strict tool follow its schema (§8.4)",
+    requires: "structured_output",
+    async run(context) {
+      const { response } = await streamHttp(context.target, {
+        ...baseRequest(
+          context,
+          "Call the record_city tool for Paris, population 2100000, capital true, languages French, " +
+            "size large, mayor unknown (null). Call the tool; do not answer in text.",
+        ),
+        max_output_tokens: STRUCTURED_OUTPUT_TOKENS,
+        reasoning: { effort: lightestEffort(context) },
+        tools: [
+          { type: "function", name: "record_city", description: "Record facts about a city.", parameters: CITY_SCHEMA, strict: true },
+        ],
+      });
+      assert.equal(response.status, "completed", `status ${response.status}`);
+      // A model cannot be forced to call; every call it makes must conform.
+      for (const item of response.output) {
+        if (item.type !== "function_call" || item.name !== "record_city") continue;
+        assert.equal(schemaValueViolation(JSON.parse(item.arguments), CITY_SCHEMA), null);
       }
     },
   },

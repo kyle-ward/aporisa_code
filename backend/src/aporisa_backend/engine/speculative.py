@@ -30,7 +30,13 @@ import numpy as np
 def lookup_drafts(
     history: np.ndarray, bonus: int, count: int, min_match: int, max_match: int
 ) -> list[int]:
-    """Prompt lookup (B2-3): drafts copied from the context.
+    return lookup_match(history, bonus, count, min_match, max_match)[0]
+
+
+def lookup_match(
+    history: np.ndarray, bonus: int, count: int, min_match: int, max_match: int
+) -> tuple[list[int], int]:
+    """Prompt lookup (B2-3): drafts copied from the context, and how many tokens matched.
 
     The context is `history` (the tokens in the cache) followed by `bonus` (sampled, not
     yet in the cache). Finds the earlier position whose preceding tokens match the context's
@@ -47,10 +53,10 @@ def lookup_drafts(
     """
     size = history.size
     if count <= 0 or size + 1 < min_match:
-        return []
+        return [], 0
     ends = np.flatnonzero(history == bonus)  # candidate windows end here, like the tail
     if ends.size == 0:
-        return []
+        return [], 0
     length = np.ones(ends.size, dtype=np.int32)
     alive = np.ones(ends.size, dtype=bool)
     for back in range(1, max_match):
@@ -63,13 +69,13 @@ def lookup_drafts(
         length += alive
     best = int(length.max())
     if best < min_match:
-        return []
+        return [], 0
     end = int(ends[np.flatnonzero(length == best)[-1]])
     count = min(count, 2 ** (best - min_match + 1))
     follow = history[end + 1 : end + 1 + count].tolist()
     if len(follow) < count and end + 1 + len(follow) == size:
         follow.append(bonus)  # the window ends right before the tail: it repeats itself
-    return [int(t) for t in follow]
+    return [int(t) for t in follow], best
 
 
 @dataclass

@@ -19,7 +19,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import ALIAS, request, user, worker_init
+from conftest import ALIAS, patch_sampler, request, user, worker_init
 
 from aporisa_backend.engine import generate as gen
 from aporisa_backend.engine.sessions import cache_offset
@@ -68,7 +68,7 @@ def recorded(monkeypatch):
         tokens.append(token)
         return token
 
-    monkeypatch.setattr(gen.Sampler, "__call__", record)
+    patch_sampler(monkeypatch, record)
     return tokens
 
 
@@ -79,11 +79,41 @@ BODIES = [
 
 
 @pytest.mark.parametrize("body", BODIES)
-def test_same_output_as_plain_decoding(engine, body):
+def test_same_output_as_plain_decoding(engine, greedy, body):
     plain, plain_metrics = run(engine, body, drafts=0)
     speculative, metrics = run(engine, body)
     assert speculative == plain
     assert "mtp_accept_rate" in metrics and plain_metrics.get("mtp_accept_rate") is None
+
+
+@pytest.mark.parametrize("body", BODIES)
+def test_batched_round_sampling_is_reproducible(engine, body):
+    """Real sampling, a whole round per draw: same seed, same output; usage adds up."""
+    first, metrics = run(engine, body)
+    again, _ = run(engine, body)
+    assert first == again and "mtp_accept_rate" in metrics
+    usage = first[-1]["usage"]
+    assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
+
+
+def test_round_rows_see_the_drafts_before_them():
+    """Row j is sampled as if drafts[:j] were emitted (presence penalty), banned ids never."""
+    from types import SimpleNamespace
+
+    from aporisa_backend.engine.adapters.qwen38 import Sampling
+
+    plan = SimpleNamespace(
+        sampling=Sampling(temperature=0.0, top_p=1.0, top_k=0, min_p=0.0, presence_penalty=1.5),
+        banned_ids=(7,),
+    )
+    sampler = gen.Sampler(plan, vocab_rows=16, tokenizer_vocab=16)
+    row = [0.0] * 16
+    row[5], row[3], row[7] = 3.0, 2.0, 10.0
+    logits = mx.array([row, row, row])
+    assert sampler.rows(logits, [5, 3]) == [5, 3, 5]  # 5 penalized after row 0, 3 after row 1
+    assert sampler.rows(logits[:1], []) == [5]  # rows remember nothing
+    sampler.accept([5])
+    assert sampler.rows(logits[:1], []) == [3] and sampler(logits[0]) == 3
 
 
 def substitute(monkeypatch, recorded, reference, wrong_every=0):
@@ -110,7 +140,7 @@ def greedy(monkeypatch):
     def argmax(self, logits):
         return int(mx.argmax(logits.astype(mx.float32) + self.mask).item())
 
-    monkeypatch.setattr(gen.Sampler, "__call__", argmax)
+    patch_sampler(monkeypatch, argmax)
 
 
 @pytest.mark.parametrize("wrong_every", [0, 3])
@@ -256,7 +286,7 @@ def script(monkeypatch, engine):
             state["index"] += 1
             return token
 
-        monkeypatch.setattr(gen.Sampler, "__call__", sample)
+        patch_sampler(monkeypatch, sample)
         return tokens
 
     return use
@@ -303,3 +333,41 @@ def test_lookup_drafts_copy_from_the_context(engine, script):
     assert session.draft.offset() == len(session.tokens) - 1
     assert cache_offset(session.cache) == len(session.tokens)
     engine.sessions.release("wide")
+
+
+def test_draft_weights_are_locked_too(engine):
+    from mlx.utils import tree_flatten
+
+    def size(module):
+        return sum(a.nbytes for _, a in tree_flatten(module.parameters()))
+
+    assert engine.info["locked_bytes"] == size(engine.model_ref) + size(engine.drafter.model)
+
+
+def test_short_lookup_matches_need_the_mtp_drafts_agreement(engine, monkeypatch):
+    from aporisa_backend.engine.sessions import Session
+
+    calls: list[int] = []
+    predicted = {"token": 0}
+
+    def propose(self, state, bonus, count):
+        calls.append(bonus)
+        return [predicted["token"]] * count
+
+    monkeypatch.setattr(MtpDrafter, "propose", propose)
+    engine.settings.draft_schedule, engine.settings.lookup_schedule = ((0, 2),), ((0, 32),)
+    try:
+        short = Session(None, [], draft=object())
+        short.extend([10, 11, 12, 13, 14, 99, 10, 11])  # tail 10 11 + bonus 12: 3 tokens match
+        predicted["token"] = 13
+        assert engine._drafts(short, 12, 64, 0) == ([13, 14], "lookup")  # MTP agrees
+        predicted["token"] = 50
+        assert engine._drafts(short, 12, 64, 0) == ([50, 50], "mtp")  # MTP disagrees
+        long = Session(None, [], draft=object())
+        long.extend([1, 2, 3, 4, 5, 6, 7, 8, 9, 99, 1, 2, 3, 4, 5, 6, 7])  # 8 tokens match
+        calls.clear()
+        drafts, source = engine._drafts(long, 8, 64, 0)
+        assert source == "lookup" and drafts[:2] == [9, 99] and not calls  # trusted
+    finally:
+        engine.settings.draft_schedule = ((0, DRAFTS),)
+        engine.settings.lookup_schedule = ((0, 0),)

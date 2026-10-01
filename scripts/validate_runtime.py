@@ -17,6 +17,8 @@ with the key and port from backend/.env. Default checks take a few minutes:
                 the draft acceptance rate, in effort none and medium
   lookup        prompt lookup (B2-3): a code edit that copies a file, decoding at least
                 twice B0-10's plain speed with lookup drafts in use
+  structured    structured output (B2-4): text.format answers in effort none and medium
+                are JSON of the schema; a strict tool call's arguments follow its schema
   runtime       /health/runtime includes the worker's view
 
 --long TOKENS adds the B1-10 acceptance: one cold prefill of about TOKENS tokens (server
@@ -51,6 +53,7 @@ from aporisa_backend import vmstats  # noqa: E402
 from aporisa_backend.configs.models import active_pointer  # noqa: E402
 from aporisa_backend.configs.settings import Settings  # noqa: E402
 from aporisa_backend.console import emit  # noqa: E402
+from aporisa_backend.protocol.structured import value_violation  # noqa: E402
 
 TIMEOUT_S = 600
 LONG_TIMEOUT_S = 3600
@@ -70,6 +73,18 @@ MTP_MIN_OUTPUT_TOKENS = 128
 LOOKUP_SPEEDUP_REQUIRED = 2.0
 LOOKUP_MIN_OUTPUT_TOKENS = 400
 EDIT_FILE = ROOT / "backend" / "src" / "aporisa_backend" / "engine" / "tokens.py"
+CITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "city": {"type": "string"},
+        "population": {"type": "integer"},
+        "capital": {"type": "boolean"},
+        "languages": {"type": "array", "items": {"type": "string"}},
+        "size": {"type": "string", "enum": ["small", "medium", "large"]},
+        "mayor": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    },
+    "required": ["city", "population", "capital", "languages", "size", "mayor"],
+}
 SWAP_GROWTH_ALLOWED = 256 * 1024**2
 
 TOOLS = [
@@ -428,6 +443,55 @@ class Validator:
             f"{result['lookup_accept_rate']}); B0-10 plain {B0_PLAIN_DECODE_TOK_S} tok/s.",
         )
 
+    async def structured(self, client):
+        fmt = {"type": "json_schema", "name": "city", "schema": CITY_SCHEMA, "strict": True}
+        for effort in ("none", "medium"):
+            body = self.request(
+                [user("Describe the city of Paris as a JSON object.")],
+                reasoning={"effort": effort},
+                max_output_tokens=2048,
+                text={"format": fmt},
+            )
+            response, _ = await self.stream(client, body)
+            check(response["status"] == "completed", f"effort {effort}: {response['status']}")
+            messages = [i for i in response["output"] if i["type"] == "message"]
+            check(len(messages) == 1, f"effort {effort}: {len(messages)} answer messages")
+            text = "".join(part["text"] for part in messages[0]["content"])
+            try:
+                value = json.loads(text)
+            except ValueError:
+                raise Failure(f"effort {effort}: the answer is not JSON") from None
+            violation = value_violation(value, CITY_SCHEMA)
+            check(violation is None, f"effort {effort}: {violation}")
+            self.record(f"structured.{effort}", **_usage(response["usage"]))
+        tool = {
+            "type": "function",
+            "name": "record_city",
+            "description": "Record facts about a city.",
+            "parameters": CITY_SCHEMA,
+            "strict": True,
+        }
+        body = self.request(
+            [
+                user(
+                    "Call the record_city tool for Paris: population 2100000, capital, "
+                    "languages French, size large, mayor unknown (null). Call the tool."
+                )
+            ],
+            tools=[tool],
+            reasoning={"effort": "none"},
+            max_output_tokens=1024,
+        )
+        response, _ = await self.stream(client, body)
+        check(response["status"] == "completed", f"strict call: {response['status']}")
+        calls = [i for i in response["output"] if i["type"] == "function_call"]
+        check(calls, "the model did not call the strict tool")
+        for call in calls:
+            violation = value_violation(json.loads(call["arguments"]), CITY_SCHEMA)
+            check(violation is None, f"strict call: {violation}")
+        self.record("structured", passed=True)
+        emit("READY", "Structured output passed: text.format (none, medium) and a strict call.")
+
     async def runtime_status(self, client):
         status = await self.runtime(client)
         worker = status.get("worker")
@@ -614,6 +678,7 @@ async def main() -> int:
             ("effort_switch", validator.effort_switch(client)),
             ("speculative", validator.speculative(client)),
             ("lookup", validator.lookup(client)),
+            ("structured", validator.structured(client)),
             ("runtime", validator.runtime_status(client)),
         ]
         for name, coroutine in checks:

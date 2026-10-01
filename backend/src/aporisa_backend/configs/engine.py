@@ -39,6 +39,9 @@ class EngineConfig:
     lookup_min_match: int = 3
     lookup_max_match: int = 8
     lookup_cooldown: int = 2
+    # A match this long is a copy in progress; a shorter one drafts only when the MTP head
+    # predicts the same next token (ordinary text repeats short phrases, P3.5 validation).
+    lookup_trust_match: int = 6
     ple_threads: int = 64
     # Soft RLIMIT_NOFILE the gateway and worker raise themselves to. launchd's default is 256;
     # the external PLE table alone holds 384 memmaps (128 shards x 3 tensors).

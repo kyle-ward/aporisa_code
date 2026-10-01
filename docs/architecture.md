@@ -63,7 +63,7 @@ launchd (LaunchDaemon, KeepAlive=false)
 
 ## 5. worker 内部
 
-- **加载**（`engine/runtime.py`）：先设置 MLX wired 上限和 0.5 GiB 的缓冲缓存上限，再惰性加载模型，逐层求值并逐层释放权重文件的页缓存（加载时不再需要两份权重的内存）；再加载 MTP 草稿模型（绑定目标模型的 embedding 和 lm_head，同样释放页缓存）；随后装上 PLE 预取，运行覆盖所有请求路径的预热（包括确认验证过草稿）。
+- **加载**（`engine/runtime.py`）：先设置 MLX wired 上限和 0.5 GiB 的缓冲缓存上限，再惰性加载模型，逐层求值并逐层释放权重文件的页缓存（加载时不再需要两份权重的内存）；再加载 MTP 草稿模型（绑定目标模型的 embedding 和 lm_head，同样释放页缓存）；然后用 `mlock` 锁定全部权重缓冲区（MLX 的 wired 上限只在 GPU 工作时保持常驻，长时间空闲后系统会把模型解锁并压缩；锁定失败则启动失败）；随后装上 PLE 预取，运行覆盖所有请求路径的预热（包括确认验证过草稿）。
 - **模型适配层**（`engine/adapters/qwen38.py`）：
   - 渲染：与官方 chat template 逐 token 一致；中途的 `developer` 和 `configuration_update` 渲染为 system 段。
   - token 映射：记住「assistant 回合的渲染文本 → 生成时的 token id」，重新渲染历史时复现生成时的 id。
@@ -72,6 +72,7 @@ launchd (LaunchDaemon, KeepAlive=false)
 - **内存预算**：所有会话的 KV 与快照可用的内存，每次请求前按当前实际余量计算（可用内存 + 会话已占用 + 缓冲缓存 − 激活预留 − 缓冲缓存上限 − 给桌面的余量），并且不超过按 wired 上限算出的值；不够时按 LRU 整个淘汰空闲会话。另外按内核的内存压力等级兜底：请求开始时若处于警告（活动监视器里的黄色），先丢掉全部空闲会话；worker 空闲时每 5 秒检查一次，处于警告就丢掉一个最久未用的空闲会话。
 - **生成**（`engine/generate.py`）：预填充按 2048 分块，并在快照点切开，每块顺带喂给草稿模型；外置 PLE 表的页由线程池预取，与当前块的 GPU 计算重叠（`engine/ple_prefetch.py`）；解码使用模型卡片的采样参数，presence penalty 作用于全部已生成 token。
 - **投机解码**（`engine/speculative.py`，B2-2）：解码按轮进行，采样出的 token 加上草稿模型的 argmax 草稿（上下文 16K 以下 2 个，以上 1 个：长上下文下一次验证 3 个 token 的开销陡增，见 validation.md），由目标模型一次前向验证；逐位置用请求的采样器采样，与草稿相同就继续。每个输出 token 都是目标模型的采样，草稿只决定一次前向覆盖几个位置，因此输出分布不变；与逐 token 解码之间只有 kernel 级的浮点差异（validation.md 的 B2 P1）。草稿有两个来源：上下文的末尾在更早处出现过（至少 3 个 token）时，复制那里之后的 token（提示词查找，B2-3，每轮最多 32 个）；否则用 MTP。验证 token 较多的轮次（16K 起 3 个以上，以下 8 个以上）走预填充路径，因为解码路径在长上下文把多 token 验证拆成一对一对计算，开销随 token 数陡增。
+- **结构化输出**（`engine/structured.py`，B2-4）：带 `text.format` 或 strict 工具的请求，回答部分（`</think>` 之后）按一份 Lark 语法约束解码（llguidance），每个 token 采样前加上允许 token 的掩码，受约束区域不投机；推理不受约束。完成的受约束 item 再按 schema 校验一次，不通过以 `structured_output_invalid` 结束（协议第 8.4 节）。
 
 ## 6. 模型配置、权重与生命周期
 

@@ -52,5 +52,6 @@ doctor、prepare、run 共用同一套检查（`backend/src/aporisa_backend/life
 - `start` 超时或服务在就绪前退出时，脚本**不会**自动停止服务：先看 `status` 和控制台日志，再显式 `stop`。
 - `stop` 只追踪服务自己的进程树（PID/PPID），从不按进程名结束进程。
 - 运行状态：`curl -s -H "authorization: Bearer <key>" http://127.0.0.1:18080/health/runtime` 返回网关和 worker 的状态（会话、内存、最近一次请求的计量），只含数字和枚举。
+- 内存占用：服务运行期间，模型权重（约 68 GB，含 MTP 草稿模型）在加载时用 `mlock` 锁定在内存里，系统不会压缩或换出它们，worker 就绪日志中的 `locked_bytes` 是锁定的字节数。需要这部分内存时，用 `./backend_service.sh stop` 停止服务即可释放；服务不会因为空闲而自动卸载模型（用户决定）。
 - 真实生成验证：`backend/.venv/bin/python scripts/validate_runtime.py`（见 [development.md](development.md)）。
 - 服务只监听 `127.0.0.1:18080`。从其他机器访问（例如 I1 集成时 Air 上的 native driver）由用户在 Studio 上现有的 Cloudflare Tunnel 转发到这个地址；后端不新增监听地址。

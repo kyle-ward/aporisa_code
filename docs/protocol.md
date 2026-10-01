@@ -1,8 +1,8 @@
 # Aporisa 协议 v0
 
-> **状态：v0 已定稿。** 前端的 SDK（native driver）和 mock server 已按本文实现，并通过了 wire 层一致性测试（见 [validation.md](validation.md)）。后端尚未实现。本文是 harness（Aporisa SDK）和推理后端之间的唯一合同。任何代码、schema 或 mock 与本文不一致时，以本文为准，并按第 13 节的流程同步。
+> **状态：v0 已定稿。** 前端的 SDK（native driver）和 mock server 已按本文实现，并通过了 wire 层一致性测试；后端已实现，对真实服务的一致性测试见 [validation.md](validation.md)。本文是 harness（Aporisa SDK）和推理后端之间的唯一合同。任何代码、schema 或 mock 与本文不一致时，以本文为准，并按第 13 节的流程同步。
 >
-> 修订日期：2026-09-30（v0 修订：2026-09-29 新增 `configuration_update` 输入 item 和 `reasoning_effort_updates` 能力，见第 6.1 节；2026-09-30 明确 `function_call` 的保证范围，新增流中错误码 `tool_call_invalid`，见第 7.1、9.2 节；同日明确 function 工具的 `strict: true` 需要 `structured_output` 能力，见第 5、8.3 节）。协议路径版本：`/v1`。
+> 修订日期：2026-09-30（v0 修订：2026-09-29 新增 `configuration_update` 输入 item 和 `reasoning_effort_updates` 能力，见第 6.1 节；2026-09-30 明确 `function_call` 的保证范围，新增流中错误码 `tool_call_invalid`，见第 7.1、9.2 节；同日明确 function 工具的 `strict: true` 需要 `structured_output` 能力，见第 5、8.3 节；2026-10-01 新增第 8.4 节，明确结构化输出的约束范围、与工具调用的关系和未完成时的处理）。协议路径版本：`/v1`。
 
 ## 1. 范围与原则
 
@@ -401,6 +401,21 @@ v0 只支持 `format.type = "text"`，带语法约束的格式留待后续版本
 - 超出子集的关键字，返回 400 `unsupported_schema`。
 - `strict: true` 时，服务端在生成阶段就对参数做约束，并在完成后再校验一次。校验失败时，以 `response.failed` 结束，错误码为 `structured_output_invalid`。
 - `strict: true` 和 `text.format` 依赖同一种约束生成能力，需要 `capabilities.structured_output`。模型没有声明时，带 `strict: true` 的工具返回 400 `unsupported_parameter`（`param` 为 `tools[i].strict`）；`strict: false` 或省略总是允许。
+- 约束生成的具体语义见第 8.4 节。
+
+### 8.4 结构化输出
+
+以下规则只在模型声明了 `capabilities.structured_output`、请求带 `text.format` 或 `strict: true` 的工具时适用。
+
+- **约束范围**：
+  - `text.format`：约束回答的 `message`。它的 `output_text` 是**一个** JSON 值，符合 `text.format.schema`。
+  - `strict: true` 的工具：约束对这个工具的 `function_call` 的 `arguments`。它只含 schema 中声明的属性，`required` 中的属性一个不少，每个值符合对应的子 schema。
+  - 两者都按「封闭」理解对象：只出现 schema 声明的属性（该对象的 schema 明确写了 `additionalProperties: true` 时除外），`required` 中的属性一个不少。
+  - 推理（`reasoning` item）**不受约束**。没有声明 `strict` 的工具，参数仍按第 7.1 节处理。
+- **与工具调用的关系**：带 `text.format` 时，一次回复的回答部分**要么**是一个符合 schema 的 `message`（`phase` 为 `final_answer`），**要么**是工具调用，不会在工具调用之前输出评论性的 `message`（它无法满足 schema）。工具调用之后，harness 带着 output 再次请求，最终回答同样受 `text.format` 约束。
+- **未完成**：因为 `max_output_tokens` 或中断以 `response.incomplete` 结束时，写到一半的受约束 item 被丢弃，不出现在 `output` 中；之前已经完成的 item 保留。harness 不会收到半截 JSON。
+- **最终校验**：生成完成后，服务端按 schema 再校验一次受约束的 item。不通过时以 `response.failed` 结束，错误码 `structured_output_invalid`，在它之前已经完成的 item 保留，不通过的 item 被丢弃。约束生成正常工作时这不会发生，它是兜底。
+- 约束只保证结构和类型，不保证内容正确；内容是否合理由 harness 判断。
 
 ## 9. 错误
 

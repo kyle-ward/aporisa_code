@@ -110,3 +110,85 @@ function visit(node: unknown, depth: number, isRoot: boolean): string | null {
   if ("items" in node) return "'items' is only valid on array schemas";
   return null;
 }
+
+/**
+ * Checks a JSON value against a schema inside the portable subset (§8.3) with the
+ * structured-output reading of §8.4: objects are closed unless their schema says
+ * `additionalProperties: true`. Returns null when the value conforms, otherwise a short
+ * reason naming the offending path.
+ */
+export function schemaValueViolation(value: unknown, schema: unknown, path = "$"): string | null {
+  if (!isPlainObject(schema)) return `${path}: schema is not an object`;
+  if (Array.isArray(schema.anyOf)) {
+    return schema.anyOf.some((branch) => schemaValueViolation(value, branch, path) === null)
+      ? null
+      : `${path}: matches no anyOf branch`;
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((option) => option === value)) {
+    return `${path}: not one of the enum values`;
+  }
+  switch (schema.type) {
+    case "null":
+      return value === null ? null : `${path}: expected null`;
+    case "boolean":
+      return typeof value === "boolean" ? null : `${path}: expected a boolean`;
+    case "string":
+      return typeof value === "string" ? null : `${path}: expected a string`;
+    case "number":
+      return typeof value === "number" && Number.isFinite(value) ? null : `${path}: expected a number`;
+    case "integer":
+      return Number.isInteger(value) ? null : `${path}: expected an integer`;
+    case "array": {
+      if (!Array.isArray(value)) return `${path}: expected an array`;
+      for (const [index, element] of value.entries()) {
+        const violation = schemaValueViolation(element, schema.items, `${path}[${index}]`);
+        if (violation) return violation;
+      }
+      return null;
+    }
+    case "object": {
+      if (!isPlainObject(value)) return `${path}: expected an object`;
+      const properties = isPlainObject(schema.properties) ? schema.properties : {};
+      const required = Array.isArray(schema.required) ? schema.required : [];
+      for (const name of required) {
+        if (typeof name === "string" && !(name in value)) return `${path}: missing '${name}'`;
+      }
+      for (const [name, element] of Object.entries(value)) {
+        if (name in properties) {
+          const violation = schemaValueViolation(element, properties[name], `${path}.${name}`);
+          if (violation) return violation;
+        } else if (schema.additionalProperties !== true) {
+          return `${path}: unexpected property '${name}'`;
+        }
+      }
+      return null;
+    }
+    default:
+      return `${path}: unsupported schema type`;
+  }
+}
+
+/** A deterministic value satisfying `schema` (subset of §8.3): what the mock outputs. */
+export function schemaInstance(schema: unknown): unknown {
+  if (!isPlainObject(schema)) return null;
+  if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) return schemaInstance(schema.anyOf[0]);
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum[0];
+  switch (schema.type) {
+    case "boolean":
+      return true;
+    case "string":
+      return "text";
+    case "number":
+      return 1.5;
+    case "integer":
+      return 1;
+    case "array":
+      return [schemaInstance(schema.items)];
+    case "object": {
+      const properties = isPlainObject(schema.properties) ? schema.properties : {};
+      return Object.fromEntries(Object.entries(properties).map(([name, child]) => [name, schemaInstance(child)]));
+    }
+    default:
+      return null;
+  }
+}

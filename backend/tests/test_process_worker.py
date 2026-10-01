@@ -120,6 +120,7 @@ async def test_runtime_health_includes_worker_status(served):
     # MTP loaded and warmed up with the profile's schedule
     assert worker["draft_schedule"] == [list(step) for step in PROFILE.draft_schedule]
     assert worker["released_cache_bytes"] >= 0 and "sys_swapouts" in worker["startup"]
+    assert worker["locked_bytes"] > 0  # weights mlock'ed at load
     assert worker["system"]["swap_used_bytes"] >= 0 and worker["ple_files_cached_bytes"] >= 0
     last = worker["last"]
     assert last["restore_path"] in ("cold", "live", "snapshot")

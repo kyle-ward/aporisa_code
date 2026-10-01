@@ -2,9 +2,9 @@
 
 Behaves like the frontend mock engine (aporisa_code/src/mock/engine.ts): echoes the last
 user text, counts ~4 bytes per token over canonical request segments, reports prefix-cache
-hits per session, honours prewarm, interrupts, the output budget and the section 6.1
-effective effort. Used by gateway tests and to run the wire conformance suite without a
-model; never imported by production code paths.
+hits per session, honours prewarm, interrupts, the output budget, the section 6.1
+effective effort and section 8.4 structured output. Used by gateway tests and to run the
+wire conformance suite without a model; never imported by production code paths.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from collections.abc import AsyncIterator, Callable
 
 from ..configs.models import ModelProfile, public_model
 from ..gateway.worker_client import Job, WorkerClient
+from ..protocol.structured import instance, value_violation
 from ..protocol.validation import effective_effort
 
 Script = Callable[[dict, int], list[dict]]
@@ -138,7 +139,40 @@ class FakeWorker(WorkerClient):
             calls = [i for i, s in enumerate(kept) if s["type"] == "function_call"]
             if calls:
                 kept = kept[: calls[0] + 1]
-        return kept
+        return self._structure(params, kept)
+
+    def _structure(self, params: dict, steps: list[dict]) -> list[dict]:
+        """Structured output (protocol 8.4) as the mock engine applies it: with text.format
+        the answer is tool calls or one schema instance; a strict call that breaks its
+        schema becomes a structured_output_invalid failure at that step."""
+        if not self.model["capabilities"].get("structured_output"):
+            return steps
+        fmt = (params.get("text") or {}).get("format")
+        strict = {
+            tool["name"]: tool["parameters"]
+            for tool in params.get("tools") or []
+            if tool["type"] == "function" and tool.get("strict") is True
+        }
+        if fmt is not None:
+            calls = any(step["type"] == "function_call" for step in steps)
+            answered, kept = False, []
+            for step in steps:
+                if step["type"] != "message":
+                    kept.append(step)
+                elif not calls and not answered:
+                    answered = True
+                    text = json.dumps(instance(fmt["schema"]), separators=(",", ":"))
+                    kept.append({"type": "message", "text": text, "phase": "final_answer"})
+            steps = kept
+        for index, step in enumerate(steps):
+            if step["type"] == "function_call" and step["name"] in strict:
+                try:
+                    violation = value_violation(json.loads(step["arguments"]), strict[step["name"]])
+                except ValueError:
+                    violation = "arguments are not JSON"
+                if violation:
+                    return [*steps[:index], {"type": "structured_output_invalid"}]
+        return steps
 
     async def generate(self, job: Job) -> AsyncIterator[dict]:
         params = job.request
@@ -177,6 +211,9 @@ class FakeWorker(WorkerClient):
                 return
             for step in self._plan(params):
                 kind = step["type"]
+                if kind == "structured_output_invalid":
+                    yield {"type": "failed", "code": "structured_output_invalid"}
+                    return
                 if kind == "malformed_tool_call":
                     # Broken markup: optionally after the call already started streaming.
                     if step.get("name"):

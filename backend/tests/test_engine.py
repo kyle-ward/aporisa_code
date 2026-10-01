@@ -9,7 +9,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import ALIAS, request, user, worker_init
+from conftest import ALIAS, patch_sampler, request, user, worker_init
 
 from aporisa_backend.engine import generate as gen
 from aporisa_backend.engine.adapters.qwen38 import END_OF_TEXT
@@ -37,7 +37,7 @@ def script(monkeypatch, engine):
             state["index"] += 1
             return token
 
-        monkeypatch.setattr(gen.Sampler, "__call__", sample)
+        patch_sampler(monkeypatch, sample)
         return tokens
 
     return use
@@ -373,3 +373,12 @@ def test_memory_pressure_drops_idle_sessions(engine, script, monkeypatch):
     assert {"p4", "p5"} <= set(store.sessions)
     store.release("p4")
     store.release("p5")
+
+
+def test_weights_are_locked_in_memory(engine):
+    """Every weight buffer is mlock'ed at load, so the system cannot compress or swap the
+    model while the service is idle (B2: an idle night had compressed 53 GB of it)."""
+    from mlx.utils import tree_flatten
+
+    total = sum(a.nbytes for _, a in tree_flatten(engine.model_ref.parameters()))
+    assert engine.info["locked_bytes"] == total > 0

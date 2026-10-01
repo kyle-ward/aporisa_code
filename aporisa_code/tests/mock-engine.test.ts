@@ -130,3 +130,67 @@ describe("mock engine", () => {
     expect(real.response.usage?.input_tokens_details.cached_tokens).toBe(real.response.usage?.input_tokens);
   });
 });
+
+describe("mock engine structured output (§8.4)", () => {
+  const schema = {
+    type: "object",
+    properties: { city: { type: "string" }, days: { type: "integer" } },
+    required: ["city", "days"],
+    additionalProperties: false,
+  };
+  const format = { format: { type: "json_schema" as const, name: "weather", schema, strict: true as const } };
+  const strictTools: ToolSpec[] = [{ type: "function", name: "weather", parameters: schema, strict: true }];
+
+  it("answers text.format with one JSON message and drops commentary before calls", async () => {
+    const answer = await run(
+      () => ({ steps: [{ type: "message", text: "a", phase: "commentary" }, { type: "message", text: "b" }] }),
+      { text: format },
+    );
+    expect(answer.response.status).toBe("completed");
+    expect(answer.response.output).toHaveLength(1);
+    const [message] = answer.response.output;
+    expect(message).toMatchObject({ type: "message", phase: "final_answer" });
+    const text = message?.type === "message" ? message.content[0]?.text : "";
+    expect(JSON.parse(text ?? "")).toEqual({ city: "text", days: 1 });
+
+    const calls = await run(
+      () => ({
+        steps: [
+          { type: "message", text: "Running ls.", phase: "commentary" },
+          { type: "function_call", name: "exec_command", arguments: '{"cmd":"ls"}' },
+        ],
+      }),
+      { text: format },
+    );
+    expect(calls.response.output.map((item) => item.type)).toEqual(["function_call"]);
+  });
+
+  it("fails strict calls that break their schema with structured_output_invalid", async () => {
+    const ok = await run(() => ({ steps: [{ type: "function_call", name: "weather", arguments: '{"city":"Oslo","days":2}' }] }), {
+      tools: strictTools,
+    });
+    expect(ok.response.status).toBe("completed");
+    const bad = await run(
+      () => ({
+        steps: [
+          { type: "message", text: "Checking.", phase: "commentary" },
+          { type: "function_call", name: "weather", arguments: '{"city":"Oslo","days":"two"}' },
+        ],
+      }),
+      { tools: strictTools },
+    );
+    expect(bad.response.status).toBe("failed");
+    expect(bad.response.error?.code).toBe("structured_output_invalid");
+    expect(bad.response.output.map((item) => item.type)).toEqual(["message"]); // earlier items stay
+  });
+
+  it("drops an unfinished constrained item at the output limit", async () => {
+    const { response, events } = await run(() => ({ steps: [{ type: "message", text: "x" }] }), {
+      text: format,
+      max_output_tokens: 2,
+    });
+    expect(response.status).toBe("incomplete");
+    expect(response.output).toEqual([]);
+    expect(events.some((event) => event.type === "response.output_item.done")).toBe(false);
+  });
+});

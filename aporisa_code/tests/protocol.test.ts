@@ -5,7 +5,9 @@ import {
   InputItem,
   requestViolation,
   parseStrictJson,
+  schemaInstance,
   schemaSubsetViolation,
+  schemaValueViolation,
   StreamValidator,
   StreamViolation,
   StrictJsonError,
@@ -208,5 +210,36 @@ describe("reasoning effort updates (§6.1)", () => {
     expect(effectiveReasoningEffort(params([user, update("low"), user, update("high")], { reasoning: { effort: "none" } }), model)).toBe("high");
     expect(effectiveReasoningEffort(params([user], { reasoning: { effort: "none" } }), model)).toBe("none");
     expect(effectiveReasoningEffort(params([user]), model)).toBe(model.reasoning.default_effort);
+  });
+});
+
+describe("structured output values (§8.4)", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      name: { type: "string" },
+      count: { type: "integer" },
+      ratio: { type: "number" },
+      tags: { type: "array", items: { type: "string", enum: ["a", "b"] } },
+      note: { anyOf: [{ type: "string" }, { type: "null" }] },
+      extra: { type: "object", properties: {}, additionalProperties: true },
+    },
+    required: ["name", "count"],
+  };
+
+  it("accepts conforming values and names the first violation", () => {
+    expect(schemaValueViolation({ name: "x", count: 2, tags: ["a"], note: null, extra: { any: 1 } }, schema)).toBeNull();
+    expect(schemaValueViolation({ name: "x" }, schema)).toMatch(/missing 'count'/);
+    expect(schemaValueViolation({ name: "x", count: 1.5 }, schema)).toMatch(/\$\.count: expected an integer/);
+    expect(schemaValueViolation({ name: "x", count: 1, tags: ["c"] }, schema)).toMatch(/\$\.tags\[0\]: not one of/);
+    expect(schemaValueViolation({ name: "x", count: 1, note: 3 }, schema)).toMatch(/anyOf/);
+    expect(schemaValueViolation({ name: "x", count: 1, other: 1 }, schema)).toMatch(/unexpected property 'other'/);
+    expect(schemaValueViolation([], schema)).toMatch(/expected an object/);
+  });
+
+  it("generates instances that conform", () => {
+    const value = schemaInstance(schema);
+    expect(schemaValueViolation(value, schema)).toBeNull();
+    expect(value).toMatchObject({ name: "text", count: 1, tags: ["a"], note: "text" });
   });
 });

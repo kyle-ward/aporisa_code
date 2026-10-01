@@ -108,10 +108,11 @@ def test_strict_tools_need_structured_output():
     def tool(**extra):
         return {"type": "function", "name": "f", "parameters": {"type": "object"}, **extra}
 
+    incapable = model_with(structured_output=False)
     with pytest.raises(ProtocolError) as strict:
-        request_violation({**request(), "tools": [tool(strict=True)]}, MODEL)
+        request_violation({**request(), "tools": [tool(strict=True)]}, incapable)
     assert (strict.value.code, strict.value.param) == ("unsupported_parameter", "tools[0].strict")
-    request_violation({**request(), "tools": [tool(strict=False), tool(name="g")]}, MODEL)
+    request_violation({**request(), "tools": [tool(strict=False), tool(name="g")]}, incapable)
     capable = model_with(structured_output=True)
     request_violation({**request(), "tools": [tool(strict=True)]}, capable)
 

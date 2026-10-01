@@ -41,7 +41,7 @@
 | `parallel_tool_calls` | 映射 | 待实测，看各模型实际是否遵守 |
 | `reasoning.effort` | 映射 | OpenRouter 允许的取值是 `minimal`、`low`、`medium`、`high`。Aporisa 的 `none` 映射为不发送 `reasoning`（待实测） |
 | `configuration_update`（input item） | **模拟** | OpenRouter 没有对应的机制。driver 按 [protocol.md](protocol.md) 第 6.1 节算出生效强度，把它作为请求级的 `reasoning.effort` 发送，并从发往上游的 `input` 中移除全部 `configuration_update`；harness 保存的历史不变。这和 codex 对不支持换档的模型的做法相同。代价是上游的前缀缓存可能失效，对结果语义没有影响。能力上声明 `reasoning_effort_updates: emulated` |
-| `text.format` | 映射 | 待实测，看各模型实际支持情况 |
+| `text.format` | 映射 | 待实测，看各模型实际支持情况。协议第 8.4 节的语义（回答要么是一个符合 schema 的 JSON，要么是工具调用；未完成时丢弃写到一半的受约束 item）在 OpenRouter 上是否成立，也要实测 |
 | `prompt_cache_key` | 映射 | 按原样透传，是否生效取决于上游，待实测。`cached_tokens` 以返回的 usage 为准 |
 | `generate:false`（X2） | **不支持** | `capabilities.prewarm = false` |
 | `stream: true` | 映射 | |

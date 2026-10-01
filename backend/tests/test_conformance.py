@@ -1,6 +1,6 @@
 """The frontend's wire conformance suite against the real gateway and the fake worker.
 
-The same W01-W24 cases later judge the real backend (DEVELOPMENT_PLAN.md B1 acceptance).
+The same W01-W26 cases also judge the real backend (DEVELOPMENT_PLAN.md B1 acceptance).
 Needs the project's Node and npm dependencies (./frontend.sh prepare); skipped otherwise.
 """
 
@@ -21,7 +21,7 @@ NODE = FRONTEND / ".tools" / "node" / "bin" / "node"
     not NODE.is_file() or not (FRONTEND / "node_modules").is_dir(),
     reason="project Node or frontend dependencies missing; run ./frontend.sh prepare",
 )
-def test_wire_conformance_w01_to_w24(harness_factory):
+def test_wire_conformance_w01_to_w26(harness_factory):
     harness = harness_factory(chunk_delay_s=0.002)
     env = {
         "PATH": f"{NODE.parent}:/usr/bin:/bin",
@@ -43,4 +43,4 @@ def test_wire_conformance_w01_to_w24(harness_factory):
     assert result.returncode == 0 and not failed, (
         "\n".join(failed) or result.stdout[-2000:] + result.stderr[-2000:]
     )
-    assert len(lines) == 24
+    assert len(lines) == 26

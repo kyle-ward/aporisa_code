@@ -60,6 +60,13 @@ TOOLS_FOOTER = (
     "no function call available, answer the question like normal with your current knowledge "
     "and do not tell the user about function calls\n</IMPORTANT>"
 )
+# text.format (protocol 8.4): told to the model as a system segment right before the
+# generation prompt, so the history's prefix stays cacheable; decoding also enforces it.
+FORMAT_TEXT = (
+    "Answer with a single JSON value and nothing else (no code fence, no commentary). "
+    "It must follow this JSON schema:\n{schema}"
+)
+
 GENERATION_PROMPT = {
     True: "<|im_start|>assistant\n<think>\n",
     False: "<|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -92,6 +99,8 @@ class RenderPlan:
     banned_ids: tuple[int, ...]
     stop_after_call: bool
     tool_schemas: dict[str, dict] = field(default_factory=dict)
+    text_format: dict | None = None  # the text.format schema (protocol 8.4)
+    strict_schemas: dict[str, dict] = field(default_factory=dict)  # strict function tools
 
     @property
     def generation_prompt(self) -> list[int]:
@@ -306,6 +315,9 @@ class Qwen38Adapter:
             else:
                 raise ValueError(f"input item {kind!r} is not supported by this adapter")
         flush()
+        fmt = (request.get("text") or {}).get("format")
+        if fmt is not None:
+            add(system_segment(FORMAT_TEXT.format(schema=_json(fmt["schema"]))))
 
         thinking = effective != "none"
         prompt_start = len(tokens)
@@ -326,6 +338,12 @@ class Qwen38Adapter:
                 tool["name"]: tool["parameters"]
                 for tool in request.get("tools") or []
                 if tool["type"] == "function"
+            },
+            text_format=fmt["schema"] if fmt is not None else None,
+            strict_schemas={
+                tool["name"]: tool["parameters"]
+                for tool in request.get("tools") or []
+                if tool["type"] == "function" and tool.get("strict") is True
             },
         )
 

@@ -52,6 +52,7 @@ FIELDS = {
     "major_faults",
     "compressor_bytes",
     "released_cache_bytes",
+    "locked_bytes",
     "prefill_max_chunk_ms",
     "active",
     "queued",

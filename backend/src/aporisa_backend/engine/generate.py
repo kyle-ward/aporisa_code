@@ -13,6 +13,7 @@ is off for a session) a round is a single token, which is plain decoding.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable
@@ -22,9 +23,10 @@ from dataclasses import dataclass, field
 import mlx.core as mx
 
 from .. import vmstats
+from ..protocol.structured import value_violation
 from .adapters.qwen38 import CALL_CLOSE, STOP_IDS, Qwen38Adapter, RenderPlan, TokenMap
 from .sessions import Session, SessionStore, cache_offset
-from .speculative import lookup_drafts
+from .speculative import lookup_match
 
 PREFILL_CHUNK = 2048
 
@@ -69,15 +71,45 @@ class Sampler:
         self.mask = mask
         self.seen = mx.zeros((vocab_rows,), dtype=mx.float32) if self.presence else None
 
-    def __call__(self, logits: mx.array) -> int:
+    def _logprobs(self, logits: mx.array, seen: mx.array | None) -> mx.array:
         logits = logits.astype(mx.float32) + self.mask
-        if self.seen is not None:
-            logits = logits - self.presence * self.seen
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        token = int(self.sample(logprobs[None])[0].item())
-        if self.seen is not None:
-            self.seen[token] = 1.0
+        if seen is not None:
+            logits = logits - self.presence * seen
+        return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    def __call__(self, logits: mx.array, bias: mx.array | None = None) -> int:
+        """One token (and remembers it); `bias` (0 or -inf per row) restricts it to what
+        a grammar allows."""
+        if bias is not None:
+            logits = logits.astype(mx.float32) + bias
+        token = int(self.sample(self._logprobs(logits, self.seen)[None])[0].item())
+        self.accept([token])
         return token
+
+    def rows(self, logits: mx.array, drafts: list[int]) -> list[int]:
+        """A round's tokens in one draw: row j of `logits` ([len(drafts) + 1, vocab]) is
+        sampled as if drafts[:j] had been emitted, which is the only case in which row j is
+        used (the walk stops at the first sample that differs from its draft). One batched
+        top-k / top-p / categorical and one sync instead of one per row (B2 P3.5: ~1.1 ms
+        each, ~35 of ~150 ms in a 32-draft lookup round). Does not remember the tokens:
+        accept() takes the ones actually emitted."""
+        seen = None
+        if self.seen is not None:
+            count = logits.shape[0]
+            extra = mx.zeros((count, self.seen.shape[0]), dtype=mx.float32)
+            pairs = [
+                (row, draft)
+                for index, draft in enumerate(drafts[: count - 1])
+                for row in range(index + 1, count)
+            ]
+            if pairs:
+                extra[mx.array([r for r, _ in pairs]), mx.array([d for _, d in pairs])] = 1.0
+            seen = mx.minimum(self.seen[None] + extra, 1.0)
+        return self.sample(self._logprobs(logits, seen)).tolist()
+
+    def accept(self, tokens: list[int]) -> None:
+        if self.seen is not None and tokens:
+            self.seen[mx.array(tokens)] = 1.0
 
 
 @dataclass
@@ -92,6 +124,7 @@ class Settings:
     lookup_min_match: int = 3
     lookup_max_match: int = 8
     lookup_cooldown: int = 2
+    lookup_trust_match: int = 6
     # (context length from which it applies, fewest tokens verified via the prefill path)
     verify_prefill_schedule: tuple[tuple[int, int], ...] = ((0, 0),)
 
@@ -118,10 +151,12 @@ class Engine:
         settings: Settings,
         prefetcher=None,
         drafter=None,
+        structured=None,
     ):
         self.lm, self.adapter, self.sessions = lm, adapter, sessions
         self.token_map, self.settings, self.prefetcher = token_map, settings, prefetcher
         self.drafter = drafter
+        self.structured = structured  # structured.Structured: constrained decoding
         self.vocab_rows = int(lm.args.vocab_size)
         self.metrics: dict = {}
         self.info: dict = {}
@@ -296,12 +331,21 @@ class Engine:
                 status, reason = ("completed", None) if complete else ("incomplete", "interrupted")
                 emit(self._finished(status, reason, usage_base, 0, 0, self.metrics))
                 return
-            self._decode(plan, session, emit, flags, usage_base, match, prefill_s, started)
+            self._decode(request, plan, session, emit, flags, usage_base, match, prefill_s, started)
         finally:
             self.sessions.done(session)
 
-    def _decode(self, plan, session, emit, flags, usage_base, match, prefill_s, started) -> None:
+    def _decode(
+        self, request, plan, session, emit, flags, usage_base, match, prefill_s, started
+    ) -> None:
         parser = self.adapter.parser(plan)
+        # Structured output (protocol 8.4): the answer is decoded under a grammar, one token
+        # per round (no drafts); reasoning stays free and keeps its drafts.
+        constraint = None
+        if self.structured is not None and (plan.text_format is not None or plan.strict_schemas):
+            constraint = self.structured.constraint(request)
+        active = constraint is not None and not plan.thinking
+        invalid = None
         sampler = Sampler(plan, self.vocab_rows, self.adapter.codec.vocab_size)
         generated: list[int] = []
         first_token_s = None
@@ -313,6 +357,33 @@ class Engine:
             self.prefetcher.touch_before_read = True
         status, reason = "completed", None
 
+        def deliver(message: dict) -> None:
+            """Emits a parser message; a finished item under a constraint is checked first
+            and, when it breaks its schema, withheld (structured_output_invalid)."""
+            nonlocal invalid
+            if invalid:
+                return
+            if constraint is not None and message["type"] == "item_done":
+                invalid = _structured_violation(plan, message["item"])
+                if invalid:
+                    return
+            emit(message)
+
+        def draw(logits: mx.array) -> int:
+            if not active:
+                return sampler(logits)
+            token = sampler(logits, constraint.bias())
+            constraint.consume(token)
+            return token
+
+        def activate() -> bool:
+            """True when this token closed the reasoning and the answer is constrained."""
+            nonlocal active
+            if constraint is None or active or parser.state == "reasoning":
+                return False
+            active = True
+            return True
+
         def take(token: int) -> bool:
             """Emits one sampled token; True when generation ends with it."""
             nonlocal first_token_s, status, reason
@@ -321,15 +392,15 @@ class Engine:
                 first_token_s = time.monotonic() - started
             if token in STOP_IDS:
                 for message in parser.finish():
-                    emit(message)
+                    deliver(message)
                 return True
             for message in parser.feed(token):
-                emit(message)
-            if parser.failed:
+                deliver(message)
+            if parser.failed or invalid:
                 return True
             if plan.stop_after_call and token == CALL_CLOSE:
                 for message in parser.finish():
-                    emit(message)
+                    deliver(message)
                 return True
             if len(generated) >= plan.max_output_tokens:
                 status, reason = "incomplete", "max_output_tokens"
@@ -338,8 +409,9 @@ class Engine:
 
         draft = session.draft
         try:
-            token = sampler(session.logits)
+            token = draw(session.logits)
             done = take(token)
+            activate()
             while not done:
                 if flags.cancel.is_set():
                     raise Cancelled
@@ -349,7 +421,9 @@ class Engine:
                 # [token, drafts...] never runs past max_output_tokens: the last position
                 # verified is the last one that could still be emitted.
                 room = plan.max_output_tokens - len(generated) - 1
-                drafts, source = self._drafts(session, token, room, cooldown)
+                drafts, source = (
+                    ([], None) if active else self._drafts(session, token, room, cooldown)
+                )
                 inputs = [token, *drafts]
                 transaction = None
                 if drafts:
@@ -359,13 +433,20 @@ class Engine:
                 try:
                     logits, hidden = self._verify(session.cache, inputs)
                     mx.eval(logits)
-                    keep = 0
-                    while True:
-                        sampled = sampler(logits[keep])
+                    constrained = active
+                    choices = [draw(logits[0])] if constrained else sampler.rows(logits, drafts)
+                    keep, emitted = 0, []
+                    for sampled in choices:
+                        emitted.append(sampled)
                         done = take(sampled)
                         keep += 1
-                        if done or keep > len(drafts) or sampled != drafts[keep - 1]:
+                        # A token that opens the constrained answer ends the round: later
+                        # positions were sampled without the grammar's mask.
+                        switched = activate()
+                        if done or switched or keep > len(drafts) or sampled != drafts[keep - 1]:
                             break
+                    if not constrained:
+                        sampler.accept(emitted)
                     if transaction is not None:
                         transaction.commit(keep)
                 except BaseException:
@@ -406,6 +487,9 @@ class Engine:
         if parser.failed:
             emit({"type": "failed", "code": "tool_call_invalid", "detail": parser.failed})
             return
+        if invalid:
+            emit({"type": "failed", "code": "structured_output_invalid"})
+            return
         if status == "completed":
             self.adapter.record(self.token_map, plan, parser.items, generated)
         reasoning = parser.reasoning_tokens if plan.thinking else 0
@@ -413,22 +497,33 @@ class Engine:
 
     def _drafts(self, session, token: int, room: int, cooldown: int):
         """(drafts, source) for the next round: a prompt-lookup copy when the context's tail
-        recurs (and lookup is not cooling down after a miss), else MTP drafts, else none."""
+        recurs (and lookup is not cooling down after a miss), else MTP drafts, else none.
+
+        A long match is a copy in progress and is trusted. A short one also happens in
+        ordinary text, where its drafts were rarely accepted (P3.5 validation: 13 lookup
+        rounds at 0.16 in a 384-token answer, ~6% slower than MTP alone), so it is used only
+        when the MTP head predicts the same next token."""
         context = len(session.tokens)
         settings = self.settings
+        count = min(settings.drafts_at(context), room)
+        mtp = session.draft is not None and count > 0
         lookups = min(settings.lookups_at(context), room)
         if lookups > 0 and not cooldown:
-            drafts = lookup_drafts(
+            drafts, matched = lookup_match(
                 session.token_array(),
                 token,
                 lookups,
                 settings.lookup_min_match,
                 settings.lookup_max_match,
             )
-            if drafts:
+            if drafts and (matched >= settings.lookup_trust_match or not mtp):
                 return drafts, "lookup"
-        count = min(settings.drafts_at(context), room)
-        if session.draft is not None and count > 0:
+            if drafts:
+                predicted = self.drafter.propose(session.draft, token, count)
+                if predicted[:1] == drafts[:1]:
+                    return drafts, "lookup"  # the drafter's pairs stay consistent (observe)
+                return predicted, "mtp"
+        if mtp:
             return self.drafter.propose(session.draft, token, count), "mtp"
         return [], None
 
@@ -481,3 +576,17 @@ class Engine:
             "duration_ms": round((time.monotonic() - started) * 1000),
             "peak_memory_bytes": mx.get_peak_memory(),
         }
+
+
+def _structured_violation(plan: RenderPlan, item: dict) -> str | None:
+    """The final check of protocol 8.4 for one finished item (None when it conforms)."""
+    if item["type"] == "message" and plan.text_format is not None:
+        text = "".join(part["text"] for part in item["content"])
+        try:
+            value = json.loads(text)
+        except ValueError:
+            return "the answer is not JSON"
+        return value_violation(value, plan.text_format)
+    if item["type"] == "function_call" and item["name"] in plan.strict_schemas:
+        return value_violation(json.loads(item["arguments"]), plan.strict_schemas[item["name"]])
+    return None
