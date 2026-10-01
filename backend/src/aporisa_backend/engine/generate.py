@@ -122,7 +122,14 @@ class Sampler:
 class Settings:
     context_window: int
     max_output_tokens: int
-    prefill_chunk: int = PREFILL_CHUNK
+    # (context length from which it applies, most tokens per prefill forward)
+    prefill_chunks: tuple[tuple[int, int], ...] = ((0, PREFILL_CHUNK),)
+    # Pieces shorter than this are not cut off a prefill (each forward has a fixed cost)
+    snapshot_min_piece: int = 256
+    # From this context length on, the MLX buffer cache may hold decode_cache_bytes while a
+    # request decodes (0: never); the engine's usual cap comes back when it ends.
+    decode_cache_from: int = 0
+    decode_cache_bytes: int = 0
     # (context length from which it applies, drafts per decode round); 0 drafts: plain decoding
     draft_schedule: tuple[tuple[int, int], ...] = ((0, 0),)
     # (context length from which it applies, most prompt-lookup drafts per round)
@@ -137,6 +144,10 @@ class Settings:
     def drafts_at(self, context: int) -> int:
         """MTP drafts for a round starting with `context` tokens in the cache."""
         return _at(self.draft_schedule, context)
+
+    def chunk_at(self, context: int) -> int:
+        """Most tokens one prefill forward takes when it starts at `context`."""
+        return _at(self.prefill_chunks, context)
 
     def lookups_at(self, context: int) -> int:
         """Most prompt-lookup drafts for a round starting with `context` tokens cached."""
@@ -251,13 +262,7 @@ class Engine:
         features: dict[int, mx.array] = {}  # image index -> vision features, while needed
         start = len(session.tokens)
         cuts = sorted({s for s in stops if start < s <= len(tokens)} | {len(tokens)})
-        pieces: list[tuple[int, int]] = []
-        begin = start
-        for cut in cuts:
-            while begin < cut:
-                end = min(begin + self.settings.prefill_chunk, cut)
-                pieces.append((begin, end))
-                begin = end
+        pieces = self._pieces(start, cuts)
         prefetch = self._prefetch(tokens, *pieces[0]) if pieces else None
         for index, (begin, end) in enumerate(pieces):
             if flags.cancel.is_set():
@@ -300,6 +305,31 @@ class Engine:
                 session.snapshot(limit, self.drafter.snapshot(draft) if draft else None)
             mx.clear_cache()
         return True
+
+    def _pieces(self, start: int, cuts: list[int]) -> list[tuple[int, int]]:
+        """Prefill forwards from `start` up to each cut: at most the schedule's chunk at the
+        piece's offset, and never a last piece under snapshot_min_piece (the two last ones
+        are halved instead)."""
+        pieces: list[tuple[int, int]] = []
+        begin = start
+        for cut in cuts:
+            while begin < cut:
+                chunk = self.settings.chunk_at(begin)
+                left = cut - begin
+                if chunk < left < chunk + self.settings.snapshot_min_piece:
+                    chunk = (left + 1) // 2
+                end = min(begin + chunk, cut)
+                pieces.append((begin, end))
+                begin = end
+        return pieces
+
+    def _stops(self, plan: RenderPlan, cached: int) -> list[int]:
+        """Snapshot points besides the prompt end (B2-5 decision 2): the latest item
+        boundary that cuts no piece shorter than snapshot_min_piece. Every cut costs a
+        forward's fixed cost (P6 profile: an increment in 3 pieces took 12-16% longer)."""
+        least = self.settings.snapshot_min_piece
+        end = len(plan.tokens)
+        return [b for b in plan.boundaries if b - cached >= least and end - b >= least][-1:]
 
     def _image_inputs(self, plan: RenderPlan | None, begin: int, end: int, features: dict):
         """(positions, embeddings) for prefill chunk [begin, end): None, None without images.
@@ -402,10 +432,8 @@ class Engine:
                 }
             )
             limit = self.sessions.snapshot_limit(session, total)
-            # Snapshot points: the latest item boundaries of the newly prefilled region, and
-            # the prompt end (where the next continuation or retry diverges).
-            fresh = [b for b in plan.boundaries if b > match.cached]
-            stops = fresh[-(self.sessions.max_snapshots - 1) :] if fresh else []
+            # The prompt end (where a retry or the next turn diverges) is always a snapshot.
+            stops = self._stops(plan, match.cached)
             prefill_started = time.monotonic()
             complete = self._prefill(session, plan.tokens, stops, flags, limit, plan)
             prefill_s = time.monotonic() - prefill_started
@@ -492,6 +520,13 @@ class Engine:
             return False
 
         draft = session.draft
+        # A long context's rounds allocate more temporaries than the usual buffer cache
+        # keeps; without reuse every round hands ~1 GB back to the system and asks for it
+        # again (B2-5: 222K decoded 24.1 tok/s with a 0.5 GiB cache, 33.2 with 2 GiB).
+        settings = self.settings
+        widened = None
+        if settings.decode_cache_from and len(session.tokens) >= settings.decode_cache_from:
+            widened = mx.set_cache_limit(settings.decode_cache_bytes)
         try:
             token = draw(session.logits)
             done = take(token)
@@ -555,6 +590,9 @@ class Engine:
         finally:
             if self.prefetcher is not None:
                 self.prefetcher.touch_before_read = False
+            if widened is not None:
+                mx.set_cache_limit(widened)
+                mx.clear_cache()
         if draft is not None:
             self.drafter.flush(draft)
             mx.eval(draft.arrays())

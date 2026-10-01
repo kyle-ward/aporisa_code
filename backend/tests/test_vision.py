@@ -104,7 +104,8 @@ def test_prefill_with_images_matches_mlx_vlm(engine, monkeypatch):
     reference = np.array(reference.astype(mx.float32))
 
     def prefill(chunk: int) -> np.ndarray:
-        monkeypatch.setattr(engine.settings, "prefill_chunk", chunk)
+        monkeypatch.setattr(engine.settings, "prefill_chunks", ((0, chunk),))
+        monkeypatch.setattr(engine.settings, "snapshot_min_piece", 0)
         match = engine.sessions.acquire(None, plan.cache_keys)
         engine._prefill(match.session, plan.tokens, [], gen.JobFlags(), 16, plan)
         logits = np.array(match.session.logits.astype(mx.float32))

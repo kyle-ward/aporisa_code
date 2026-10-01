@@ -4,6 +4,7 @@
     backend/.venv/bin/python scripts/validate_runtime.py [--long TOKENS]
     backend/.venv/bin/python scripts/validate_runtime.py --restart-prepare TOKENS
     backend/.venv/bin/python scripts/validate_runtime.py --restart-resume
+    backend/.venv/bin/python scripts/validate_runtime.py --agent-loop
 
 Run explicitly by the user against a started service (./backend_service.sh start); never
 part of scripts/check.sh. Uses the Aporisa protocol directly (HTTP/SSE and WebSocket),
@@ -46,6 +47,12 @@ never does itself; its two halves run alone (no default checks):
   --restart-resume          sends that prompt again: it must be restored from the SSD
                             cache (restore_path ssd, every token cached), first token
                             within RESTART_TTFT_REQUIRED_S
+
+--agent-loop (B2-5) runs alone too: a scripted coding-agent session of AGENT_TURNS turns,
+each adding a read_file call and its output (repository files at the pinned commit
+AGENT_COMMIT, so every run sends exactly the same tokens) to one prompt_cache_key. It
+records, per turn, the new tokens prefilled, the first-token time and the server's
+prefill metrics, and summarizes them: the before/after measure of the tuning.
 """
 
 from __future__ import annotations
@@ -55,6 +62,8 @@ import asyncio
 import hashlib
 import json
 import math
+import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -107,6 +116,62 @@ SWAP_GROWTH_ALLOWED = 256 * 1024**2
 RESTART_TTFT_REQUIRED_S = 10
 RESTART_RECORD = ROOT / ".runtime" / "validation" / "restart.json"
 LONG_QUESTION = "\n\nIn one sentence, what is this text about?"
+# B2-5 agent loop: files read at a fixed commit, cut to these sizes (characters), in turn.
+AGENT_COMMIT = "aa734fd"
+AGENT_TURNS = 20
+AGENT_FILES = (
+    "backend/src/aporisa_backend/engine/sessions.py",
+    "aporisa_code/src/protocol/validation.ts",
+    "backend/src/aporisa_backend/engine/generate.py",
+    "docs/architecture.md",
+    "backend/src/aporisa_backend/engine/speculative.py",
+    "aporisa_code/src/mock/engine.ts",
+    "backend/src/aporisa_backend/engine/vision.py",
+    "docs/protocol.md",
+    "backend/src/aporisa_backend/gateway/runtime.py",
+    "backend/src/aporisa_backend/engine/disk_cache.py",
+)
+AGENT_SIZES = (1500, 4000, 800, 6000, 2500, 9000, 1200, 3000)
+AGENT_INSTRUCTIONS = (
+    "You are a coding agent working in a local repository. Read files with read_file, run "
+    "commands with run_command and edit files with apply_patch. Keep answers short; prefer "
+    "reading the code before changing it."
+)
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "name": "read_file",
+        "description": "Read a text file from the repository and return its contents.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Repository path"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "run_command",
+        "description": "Run a shell command in the repository and return its output.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string"},
+                "timeout_s": {"type": "integer", "description": "Seconds before it is stopped"},
+            },
+            "required": ["cmd"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "apply_patch",
+        "description": "Apply a unified diff to the repository.",
+        "parameters": {
+            "type": "object",
+            "properties": {"patch": {"type": "string"}},
+            "required": ["patch"],
+        },
+    },
+]
 
 TOOLS = [
     {
@@ -752,6 +817,89 @@ class Validator:
             ("runtime", self.runtime_status(client)),
         ]
 
+    async def agent_loop(self, client):
+        key = f"validate-agent-{time.time_ns()}"
+        history = [user("Find how sessions are matched and restored, then summarize it.")]
+        turns: list[dict] = []
+        for turn in range(AGENT_TURNS + 1):
+            if turn:
+                path = AGENT_FILES[(turn - 1) % len(AGENT_FILES)]
+                size = AGENT_SIZES[(turn - 1) % len(AGENT_SIZES)]
+                call_id = f"call_{turn}"
+                arguments = json.dumps({"path": path})
+                history.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": "read_file",
+                        "arguments": arguments,
+                    }
+                )
+                history.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": _pinned(path)[:size],
+                    }
+                )
+                if turn % 5 == 0:
+                    history.append(user("Keep going: read the next file that matters."))
+            body = self.request(
+                list(history),
+                instructions=AGENT_INSTRUCTIONS,
+                tools=AGENT_TOOLS,
+                reasoning={"effort": "none"},
+                max_output_tokens=32,
+                prompt_cache_key=key,
+            )
+            response, ttft = await self.stream(client, body)
+            check(response["status"] != "failed", f"turn {turn}: failed")
+            last = (await self.runtime(client))["worker"]["last"]
+            usage = response["usage"]
+            prefilled = last.get("prefill_tokens") or 0
+            speed = last.get("prefill_tok_s")
+            row = {
+                "turn": turn,
+                "input_tokens": usage["input_tokens"],
+                "cached_tokens": usage["input_tokens_details"]["cached_tokens"],
+                "prefill_tokens": prefilled,
+                "prefill_ms": round(prefilled / speed * 1000) if speed else 0,
+                "ttft_ms": round((ttft or 0) * 1000),
+                "server_first_token_ms": last.get("first_token_ms"),
+                "restore_path": last.get("restore_path"),
+                "snapshot_count": last.get("snapshot_count"),
+                "ple_lookup_ms": last.get("ple_lookup_ms"),
+                "sys_compressions": last.get("sys_compressions"),
+            }
+            turns.append(row)
+            self.record("agent_loop.turn", **row)
+        later = [t for t in turns if t["turn"]]
+        # The server's first-token time: a client sees no delta when a turn opens with a
+        # call whose arguments come in one piece.
+        ttfts = sorted(t["server_first_token_ms"] or 0 for t in later)
+        prefilled = sum(t["prefill_tokens"] for t in later)
+        prefill_ms = sum(t["prefill_ms"] for t in later)
+        summary = {
+            "turns": len(later),
+            "final_input_tokens": turns[-1]["input_tokens"],
+            "cold_ttft_ms": turns[0]["server_first_token_ms"],
+            "ttft_median_ms": round(statistics.median(ttfts)),
+            "ttft_p90_ms": ttfts[min(len(ttfts) - 1, int(len(ttfts) * 0.9))],
+            "ttft_total_ms": sum(ttfts),
+            "increment_median_tokens": round(statistics.median(t["prefill_tokens"] for t in later)),
+            "prefill_tok_s": round(prefilled / prefill_ms * 1000, 1) if prefill_ms else None,
+            "cache_misses": sum(1 for t in later if t["cached_tokens"] == 0),
+        }
+        self.record("agent_loop", passed=summary["cache_misses"] == 0, **summary)
+        check(summary["cache_misses"] == 0, f"{summary['cache_misses']} turns missed the cache")
+        emit(
+            "READY",
+            f"Agent loop: {summary['turns']} turns to {summary['final_input_tokens']} tokens; "
+            f"first token median {summary['ttft_median_ms']} ms, p90 {summary['ttft_p90_ms']} ms "
+            f"(increments of ~{summary['increment_median_tokens']} tokens prefilled at "
+            f"{summary['prefill_tok_s']} tok/s); cold start {summary['cold_ttft_ms']} ms.",
+        )
+
     async def restart_prepare(self, client, tokens: int):
         key = f"validate-restart-{time.time_ns()}"
         body, count, chars = await self.long_prompt(client, tokens, key)
@@ -843,6 +991,18 @@ def _answer(response: dict) -> str:
     )
 
 
+def _pinned(path: str) -> str:
+    """A repository file as it is at AGENT_COMMIT (unaffected by later edits)."""
+    result = subprocess.run(
+        ["git", "show", f"{AGENT_COMMIT}:{path}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
 def _digest(body: dict) -> str:
     return hashlib.sha256(json.dumps(body["input"], sort_keys=True).encode()).hexdigest()
 
@@ -888,14 +1048,16 @@ async def main() -> int:
         "--restart-prepare", type=int, metavar="TOKENS", help="B2-1, before a restart"
     )
     restart.add_argument("--restart-resume", action="store_true", help="B2-1, after a restart")
+    restart.add_argument("--agent-loop", action="store_true", help="B2-5 agent-turn benchmark")
     args = parser.parse_args()
     for name in ("long", "restart_prepare"):
         value = getattr(args, name)
         if value is not None and not 4096 <= value <= 250_000:
             emit("ERROR", f"--{name.replace('_', '-')} must be between 4096 and 250000 tokens.")
             return 2
-    if args.long is not None and (args.restart_prepare is not None or args.restart_resume):
-        emit("ERROR", "--long does not combine with the restart checks.")
+    alone = args.restart_prepare is not None or args.restart_resume or args.agent_loop
+    if args.long is not None and alone:
+        emit("ERROR", "--long does not combine with the restart or agent-loop checks.")
         return 2
     settings = Settings.read()
     alias, _ = active_pointer()
@@ -916,10 +1078,15 @@ async def main() -> int:
                 ("ready", validator.ready(client)),
                 ("restart_resume", validator.restart_resume(client)),
             ]
+        elif args.agent_loop:
+            checks = [
+                ("ready", validator.ready(client)),
+                ("agent_loop", validator.agent_loop(client)),
+            ]
         else:
             checks = validator.default_checks(client)
         for name, coroutine in checks:
-            timeout = LONG_TIMEOUT_S if name.startswith("restart") else TIMEOUT_S
+            timeout = LONG_TIMEOUT_S if name.startswith(("restart", "agent")) else TIMEOUT_S
             await validator.run(name, coroutine, timeout)
         if args.long is not None:
             checks.append(("long_context", None))

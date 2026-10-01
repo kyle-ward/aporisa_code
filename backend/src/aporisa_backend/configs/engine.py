@@ -9,8 +9,18 @@ GIB = 1024**3
 
 @dataclass(frozen=True)
 class EngineConfig:
-    # B0-5: 2048 was the fastest chunk; 4096 costs ~2.8 GiB more peak for no gain.
-    prefill_chunk: int = 2048
+    # (context length from which it applies, most tokens per prefill forward). B0-5: 2048
+    # was the fastest chunk at a short context; 4096 costs ~2.8 GiB more peak for no gain.
+    # B2-5 profile (one forward on top of a context): per token, 1024 and 2048 cost the
+    # same from 64K on (1.38/1.42 ms at 67K, 1.62/1.61 at 129K, 2.00/1.96 at 222K) and 256
+    # costs 2.02 at 222K, while the forward's peak above the session is 2.2/3.2, 2.6/4.1
+    # and 3.5/5.7 GB (1.6 GB for 256 at 222K): a cold 222K prefill in 2048-token chunks
+    # peaked 17.7 GB above the weights and wrote 1.2 GB of swap.
+    prefill_chunk_schedule: tuple = ((0, 2048), (65_536, 1024), (196_608, 512))
+    # A prefill is cut (for a snapshot, or the last chunk) only where both pieces keep at
+    # least this many tokens: a forward costs ~90 ms at 16 tokens, ~200 at 64, ~440 at 256
+    # (B2-5 profile at 34K), so a tiny piece costs about as much as hundreds of tokens.
+    snapshot_min_piece: int = 256
     # B0-8: one snapshot is ~110 MiB on the real model; 16 is ~1.8 GiB (6.6, B2-5 tunes).
     max_snapshots: int = 16
     # Session budget (KV + snapshots of all sessions), evaluated before every request (6.6, C1):
@@ -26,6 +36,15 @@ class EngineConfig:
     # machine holding 67 GiB of weights, every GiB returned to macOS matters more than the
     # small reallocation cost.
     cache_limit_bytes: int = GIB // 2
+    # While a request decodes at this context length or more, the buffer cache may hold
+    # decode_cache_bytes instead; back to cache_limit_bytes (and emptied) when it ends. A
+    # decode round's temporaries grow with the context (one-token forward peak: 0.13 GB at
+    # 2K, 0.41 at 67K, 0.68 at 129K, 0.86 at 222K) and above the cap every round returns
+    # them to the system and allocates them again: at 222K, two drafts decoded 24.1 tok/s
+    # with 0.5 GiB and 33.2 with 2 GiB, one draft 20.7 and 28.9 (B2-5 profile; ~1 GB of
+    # other memory compressed once with 2 GiB). Covered by activation_reserve_bytes.
+    decode_cache_from: int = 65_536
+    decode_cache_bytes: int = 2 * GIB
     # The budget above is evaluated when a request starts; between requests the desktop can
     # grow back into the memory idle sessions hold (B2 P1: after a 125K session the idle
     # worker kept ~4.7 GB and the desktop went yellow). While idle, the worker checks the

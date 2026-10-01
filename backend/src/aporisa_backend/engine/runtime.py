@@ -73,7 +73,10 @@ def load(init: dict) -> Engine:
         Settings(
             context_window=init["model"]["context_window"],
             max_output_tokens=init["model"]["max_output_tokens"],
-            prefill_chunk=config.prefill_chunk,
+            prefill_chunks=tuple(tuple(step) for step in config.prefill_chunk_schedule),
+            snapshot_min_piece=config.snapshot_min_piece,
+            decode_cache_from=config.decode_cache_from,
+            decode_cache_bytes=config.decode_cache_bytes,
             draft_schedule=tuple(tuple(step) for step in init.get("draft_schedule") or ())
             if drafter is not None
             else ((0, 0),),

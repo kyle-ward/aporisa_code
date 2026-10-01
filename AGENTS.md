@@ -32,7 +32,7 @@
 ## 当前阶段
 
 - 前端：F0（合同 v0）和 F1（SDK、mock、一致性测试）已经完成，下一阶段是 F2（OpenRouter 兼容 driver）。
-- 后端：B0（探路与实测）和 B1（协议核心）已经完成；集成节点 I1（Air 上的 native driver 经 Studio 的 Cloudflare Tunnel 连接后端，重跑 F1 测试）待在 Air 上进行。B2（性能与本地专属能力）进行中：P1（MTP 投机解码）、P2（提示词查找投机）、P3（结构化输出）、P4（SSD 溢出与重启恢复）和 P5（图片输入）已完成，下一步是调优（B2-5，开始前与用户确认方案）。图片输入的前端部分（OpenRouter 映射、harness 的 `view_image`、UI 上传）登记在 `backend/DEVELOPMENT_PLAN.md` 的 P5 要点中，按前端阶段实现。架构见 `docs/architecture.md`，开发计划见 `backend/DEVELOPMENT_PLAN.md`。
+- 后端：B0（探路与实测）和 B1（协议核心）已经完成；集成节点 I1（Air 上的 native driver 经 Studio 的 Cloudflare Tunnel 连接后端，重跑 F1 测试）待在 Air 上进行。B2（性能与本地专属能力）进行中：P1（MTP 投机解码）、P2（提示词查找投机）、P3（结构化输出）、P4（SSD 溢出与重启恢复）、P5（图片输入）和 P6（调优，B2-5）已完成，下一步是 soak（B2-7，开始前与用户确认方案）。图片输入的前端部分（OpenRouter 映射、harness 的 `view_image`、UI 上传）登记在 `backend/DEVELOPMENT_PLAN.md` 的 P5 要点中，按前端阶段实现。架构见 `docs/architecture.md`，开发计划见 `backend/DEVELOPMENT_PLAN.md`。
 - 已验证的范围见 `docs/validation.md`。
 - 新能力在实现并验收之前，一律不得声称已经实现。文档中「目标规范」和「当前实现状态」必须分开写。
 

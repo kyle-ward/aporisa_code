@@ -3,10 +3,15 @@
 The upstream external-PLE reader gathers each lookup's rows with numpy fancy indexing over
 memmaps, faulting pages in one at a time. Row ids are a pure function of the tokens, so:
 
-- prefill: while the GPU runs chunk i, a thread pool preads the pages chunk i+1 will read;
-  the upstream reader then hits the page cache;
-- decode: the next token is unknown until sampled, so each lookup first touches its pages
-  concurrently (queue depth > 1) before the upstream reader runs (B0's approach).
+- prefill: while the GPU runs chunk i, the pages chunk i+1 will read are requested;
+- decode: the next token is unknown until sampled, so each lookup first requests its pages
+  before the upstream reader runs (B0's approach).
+
+A request is fcntl(F_RDADVISE): the kernel starts reading the page and returns at once, so
+all of a lookup's pages (16 rows x 3 tensors per token, ~48 random pages) are in flight
+together and the reader waits only for the slowest. Reading them with 64 threads of pread
+cost ~11 us of Python per page whether cached or not (B2-5: 19,200 pages 234 ms cold,
+209 ms warm, against 94 ms to advise and gather them cold); pread stays as the fallback.
 
 `row_ids` replicates Qwen4ExpNGramEmbedding's id computation in numpy (multipliers, per-head
 prime vocab sizes and offsets, the window reset after <|endoftext|>); a test checks it
@@ -15,13 +20,17 @@ against the ids the model itself asks for.
 
 from __future__ import annotations
 
+import fcntl
 import os
+import struct
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 
 PAGE_BYTES = 16 * 1024
+F_RDADVISE = getattr(fcntl, "F_RDADVISE", 44)  # macOS <sys/fcntl.h>
+ADVICE = struct.Struct("qi4x")  # struct radvisory {off_t ra_offset; int ra_count;}
 
 
 def external_ple(lm):
@@ -93,6 +102,7 @@ class PlePrefetcher:
         files = {a.filename for _, _, arrays in self.table._shards for a in arrays.values()}
         self.fds = {name: os.open(name, os.O_RDONLY) for name in files}
         self.touch_before_read = False
+        self.advise = True  # False after the first refusal: pread instead
         self.seconds = 0.0
         self._lock = threading.Lock()
         original = self.table._read_rows
@@ -121,7 +131,14 @@ class PlePrefetcher:
 
         started = time.perf_counter()
         jobs = self.pages(np.unique(rows))
-        list(self.pool.map(lambda job: os.pread(job[0], PAGE_BYTES, job[1]), jobs))
+        if self.advise:
+            try:
+                for fd, offset in jobs:
+                    fcntl.fcntl(fd, F_RDADVISE, ADVICE.pack(offset, PAGE_BYTES))
+            except OSError:
+                self.advise = False
+        if not self.advise:
+            list(self.pool.map(lambda job: os.pread(job[0], PAGE_BYTES, job[1]), jobs))
         with self._lock:
             self.seconds += time.perf_counter() - started
 

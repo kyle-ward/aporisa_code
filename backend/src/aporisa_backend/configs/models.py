@@ -40,7 +40,9 @@ class ModelProfile:
     # any length (39/44 ms at 32K, 49/54 ms at 111K), but 3 tokens cost 54 ms at 32K and
     # ~200 ms at 111K. Decoding 128 tokens (one run each, +-15% sampling noise): at 16K one
     # draft 34.4 tok/s vs two 29.3/31.1; at 32K 29.7 vs 26.7/32.1; at 113K 26.4 vs 9.1. So
-    # from 16K on a round drafts one token; below, two (B0-10's short-context winner).
+    # from 16K on a round drafted one token; below, two (B0-10's short-context winner).
+    # Since P2 wide rounds verify through the prefill path (verify_prefill_schedule), which
+    # made more drafts pay off at long context again: B2-5 set the schedule anew (PROFILES).
     draft_identity: str | None = None
     draft_schedule: tuple[tuple[int, int], ...] = ()
     # Prompt lookup (B2-3): (context length from which it applies, most lookup drafts one
@@ -139,7 +141,11 @@ PROFILES: dict[str, ModelProfile] = {
         capabilities=dict(_FLASH_NEXT_CAPABILITIES),
         wired_limit_mb=87_040,
         draft_identity="Qwen3.8-Flash-Next-affine4g64-mtp",
-        draft_schedule=((0, 2), (16_384, 1)),
+        # B2-5 profile (4 seeds x 192 tokens, effort none, lookup off; tok/s for 1 / 2 / 3
+        # drafts, wide rounds through the prefill path from 16K): 2K 41.9 / 45.5 / 46.2,
+        # 34K 36.2 / 38.7 / 41.0, 67K 35.0 / 37.9 / 39.9, 129K 27.6 / 28.7 / 27.1 (and 100K,
+        # 2 seeds: 28.2 / 34.7 / 28.7). Two drafts below 16K, three to 96K, two beyond.
+        draft_schedule=((0, 2), (16_384, 3), (98_304, 2)),
         # P2 profile (code edit, ~730 copied tokens): at most 32 lookup drafts beat 16 by
         # ~12% at every length (138/129/116 tok/s at short/16K/111K context).
         lookup_schedule=((0, 32),),

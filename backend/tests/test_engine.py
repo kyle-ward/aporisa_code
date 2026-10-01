@@ -382,3 +382,102 @@ def test_weights_are_locked_in_memory(engine):
 
     total = sum(a.nbytes for _, a in tree_flatten(engine.model_ref.parameters()))
     assert engine.info["locked_bytes"] == total > 0
+
+
+def test_prefill_pieces_follow_the_chunk_schedule(engine, monkeypatch):
+    """B2-5: smaller chunks at long context; never a tiny last piece."""
+    settings = engine.settings
+    monkeypatch.setattr(settings, "prefill_chunks", ((0, 2048), (65_536, 1024), (196_608, 512)))
+    monkeypatch.setattr(settings, "snapshot_min_piece", 256)
+    sizes = lambda pieces: [e - b for b, e in pieces]  # noqa: E731
+    assert sizes(engine._pieces(0, [5000])) == [2048, 2048, 904]
+    assert sizes(engine._pieces(0, [2100])) == [1050, 1050]  # not 2048 + 52
+    # the chunk is the schedule's at the piece's start
+    assert sizes(engine._pieces(65_000, [68_000])) == [2048, 952]
+    assert sizes(engine._pieces(66_000, [68_500])) == [1024, 1024, 452]
+    assert sizes(engine._pieces(200_000, [201_100])) == [512, 294, 294]  # not 512, 512, 76
+    # every cut ends a piece
+    assert engine._pieces(0, [300, 2400]) == [(0, 300), (300, 1350), (1350, 2400)]
+
+
+def test_snapshot_points_skip_tiny_pieces(engine):
+    """B2-5 decision 2: besides the prompt end, only the latest item boundary that leaves
+    at least snapshot_min_piece tokens on both sides of the cut."""
+    least = engine.settings.snapshot_min_piece
+
+    class Plan:
+        def __init__(self, boundaries, length):
+            self.boundaries, self.tokens = boundaries, [0] * length
+
+    # an agent turn: a short call, a tool output, the generation prompt -> one piece
+    assert engine._stops(Plan([1030, 1600], 1606), 1000) == []
+    # a long history: the last boundary that leaves enough after it
+    assert engine._stops(Plan([500, 4000, 9000, 9900, 9990], 9996), 0) == [9000]
+    assert engine._stops(Plan([least, 2 * least], 3 * least), 0) == [2 * least]
+
+
+def test_ple_pages_are_requested_with_read_advice(engine, monkeypatch):
+    """Prefetch asks the kernel for every page at once (F_RDADVISE) and falls back to
+    pread when advice is refused; the rows read are the same either way."""
+    import fcntl
+
+    from aporisa_backend.engine import ple_prefetch
+
+    prefetcher = engine.prefetcher
+    tokens = engine.adapter.codec.encode("Advice for the pages of these tokens. " * 8)
+    advised, preads = [], []
+    real_fcntl, real_pread = fcntl.fcntl, ple_prefetch.os.pread
+    monkeypatch.setattr(
+        ple_prefetch.fcntl,
+        "fcntl",
+        lambda fd, op, arg: advised.append(op) or real_fcntl(fd, op, arg),
+    )
+    monkeypatch.setattr(
+        ple_prefetch.os, "pread", lambda fd, n, at: preads.append(at) or real_pread(fd, n, at)
+    )
+    prefetcher.prefetch([], tokens).result()
+    assert advised and set(advised) == {ple_prefetch.F_RDADVISE} and not preads
+
+    def refuse(fd, op, arg):
+        raise OSError(45, "not supported")
+
+    monkeypatch.setattr(ple_prefetch.fcntl, "fcntl", refuse)
+    try:
+        prefetcher.prefetch([], tokens).result()
+        assert preads and prefetcher.advise is False
+    finally:
+        prefetcher.advise = True
+
+
+def test_long_context_decode_widens_the_buffer_cache_then_restores_it(engine, script, monkeypatch):
+    """B2-5: from decode_cache_from on, decoding may keep decode_cache_bytes of buffers;
+    the previous cap is back when the request ends, also when it is cancelled."""
+    calls: list[int] = []
+    real = mx.set_cache_limit
+
+    def record(limit):
+        calls.append(limit)
+        return real(limit)
+
+    monkeypatch.setattr(mx, "set_cache_limit", record)
+    settings = engine.settings
+    monkeypatch.setattr(settings, "decode_cache_bytes", 3 * 1024**3)
+    script("\n</think>\n\nShort.<|im_end|>")
+    monkeypatch.setattr(settings, "decode_cache_from", 10**9)  # never reached
+    run(engine, request("a"))
+    assert calls == []
+    monkeypatch.setattr(settings, "decode_cache_from", 1)
+    run(engine, request("b"))
+    assert calls[0] == 3 * 1024**3 and calls[1] != 3 * 1024**3
+    calls.clear()
+    script("\n</think>\n\nA longer answer than one token.<|im_end|>")  # a fresh script
+    original = engine._verify
+
+    def cancel_first(*args, **kwargs):
+        raise gen.Cancelled
+
+    monkeypatch.setattr(engine, "_verify", cancel_first)
+    with pytest.raises(gen.Cancelled):
+        run(engine, request("c " * 40))
+    monkeypatch.setattr(engine, "_verify", original)
+    assert len(calls) == 2 and calls[1] != 3 * 1024**3
