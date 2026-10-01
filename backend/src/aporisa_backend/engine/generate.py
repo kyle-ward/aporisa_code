@@ -1,9 +1,9 @@
 """One generation on the worker's main thread (DEVELOPMENT_PLAN.md 7, 14.5).
 
-render -> context check -> session match -> accepted -> chunked prefill (2048, split at
-snapshot points, PLE pages of chunk i+1 read while the GPU runs chunk i) -> decode with the
-parser -> finished. Cancel and interrupt flags are checked between prefill chunks and
-between decode rounds. Every forward call passes explicit text positions.
+render -> context check -> session match (memory, then SSD) -> accepted -> chunked prefill
+(2048, split at snapshot points, PLE pages of chunk i+1 read while the GPU runs chunk i) ->
+decode with the parser -> finished. Cancel and interrupt flags are checked between prefill
+chunks and between decode rounds. Every forward call passes explicit text positions.
 
 Decoding runs in rounds (B2-2, speculative.py): the bonus token b is sampled, the drafter
 proposes up to n tokens, one target forward verifies [b, d1..dn], and the target's own
@@ -163,6 +163,7 @@ class Engine:
         self.model_ref = None
         self._ple_start = (0, 0.0, 0.0)
         self._vm_start: dict = {}
+        self._disk_start = (0, 0)
         self._max_chunk_s = 0.0
 
     # --- model calls ----------------------------------------------------------------------
@@ -293,6 +294,7 @@ class Engine:
         mx.reset_peak_memory()  # peak_memory_bytes is per request
         self._ple_start = self._ple_counters()
         self._vm_start = vmstats.sample()
+        self._disk_start = self._disk_counters()
         self._max_chunk_s = 0.0
         request, job_id = job["request"], job["id"]
 
@@ -309,6 +311,7 @@ class Engine:
         try:
             total = input_tokens + plan.max_output_tokens
             self.sessions.make_room(session, total)
+            self.sessions.recall(match, plan.tokens)
             emit(
                 {
                     "type": "accepted",
@@ -552,10 +555,19 @@ class Engine:
         stats = self.prefetcher.table.stats
         return (stats.bytes_read, stats.elapsed_seconds, self.prefetcher.seconds)
 
+    def _disk_counters(self) -> tuple[int, int]:
+        """(sessions spilled, bytes written) by the SSD cache so far."""
+        disk = self.sessions.disk
+        return (disk.stats.spills, disk.stats.written_bytes) if disk is not None else (0, 0)
+
     def _metrics(self, match, input_tokens, prefill_s, output_tokens, decode_s, started) -> dict:
         prefilled = input_tokens - match.cached
         session = match.session
         ple = [now - then for now, then in zip(self._ple_counters(), self._ple_start, strict=True)]
+        spills, written = (
+            now - then for now, then in zip(self._disk_counters(), self._disk_start, strict=True)
+        )
+        disk = self.sessions.disk is not None
         return {
             "ple_bytes_read": int(ple[0]) if self.prefetcher is not None else None,
             "ple_lookup_ms": round(ple[1] * 1000) if self.prefetcher is not None else None,
@@ -566,6 +578,9 @@ class Engine:
             "snapshot_bytes": sum(s.nbytes for s in session.snapshots),
             "session_bytes": session.nbytes(),
             "restore_path": match.path,
+            "ssd_load_ms": match.load_ms,
+            "ssd_spill_count": spills if disk else None,
+            "ssd_bytes_written": written if disk else None,
             "prefill_tokens": prefilled,
             "prefill_tok_s": round(prefilled / prefill_s, 1)
             if prefill_s > 0 and prefilled

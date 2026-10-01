@@ -2,6 +2,8 @@
 """Bounded real-generation checks against the running backend (DEVELOPMENT_PLAN 14.8, P4).
 
     backend/.venv/bin/python scripts/validate_runtime.py [--long TOKENS]
+    backend/.venv/bin/python scripts/validate_runtime.py --restart-prepare TOKENS
+    backend/.venv/bin/python scripts/validate_runtime.py --restart-resume
 
 Run explicitly by the user against a started service (./backend_service.sh start); never
 part of scripts/check.sh. Uses the Aporisa protocol directly (HTTP/SSE and WebSocket),
@@ -30,12 +32,24 @@ decoding. System memory
 (compressor, swap, free) is sampled every second and each check records the memory pressure
 it caused. Results (numbers only, never text) are appended to
 .runtime/validation/validate_<time>.jsonl.
+
+The B2-1 acceptance (SSD cache) needs a service restart in the middle, which this script
+never does itself; its two halves run alone (no default checks):
+
+  --restart-prepare TOKENS  builds a session of about TOKENS tokens and records how to
+                            send the same prompt again (key, length and a hash of the
+                            prompt, never its text) in .runtime/validation/restart.json
+  (the user runs ./backend_service.sh restart: the graceful stop writes the session)
+  --restart-resume          sends that prompt again: it must be restored from the SSD
+                            cache (restore_path ssd, every token cached), first token
+                            within RESTART_TTFT_REQUIRED_S
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import sys
@@ -86,6 +100,10 @@ CITY_SCHEMA = {
     "required": ["city", "population", "capital", "languages", "size", "mayor"],
 }
 SWAP_GROWTH_ALLOWED = 256 * 1024**2
+# B2-1: "首 token 时间在秒级" after a restart, for a 200K session restored from SSD.
+RESTART_TTFT_REQUIRED_S = 10
+RESTART_RECORD = ROOT / ".runtime" / "validation" / "restart.json"
+LONG_QUESTION = "\n\nIn one sentence, what is this text about?"
 
 TOOLS = [
     {
@@ -510,18 +528,20 @@ class Validator:
             f"{worker['session_bytes'] / 1024**3:.2f} GiB of session state.",
         )
 
-    async def long_context(self, client, tokens: int):
-        emit("WAIT", f"Long-context check: building a prompt of about {tokens} tokens...")
-        key = f"validate-long-{time.time_ns()}"
-        question = "\n\nIn one sentence, what is this text about?"
+    def long_request(self, chars: int, key: str) -> dict:
+        return self.request(
+            [user(_corpus(chars) + LONG_QUESTION)],
+            reasoning={"effort": "none"},
+            max_output_tokens=256,
+            prompt_cache_key=key,
+        )
+
+    async def long_prompt(self, client, tokens: int, key: str) -> tuple[dict, int, int]:
+        """(request, its input tokens, corpus characters) for a prompt of about `tokens`."""
+        emit("WAIT", f"Building a prompt of about {tokens} tokens...")
         chars = tokens * 3
         for _ in range(3):
-            body = self.request(
-                [user(_corpus(chars) + question)],
-                reasoning={"effort": "none"},
-                max_output_tokens=256,
-                prompt_cache_key=key,
-            )
+            body = self.long_request(chars, key)
             counted = await client.post(
                 f"{self.base}/v1/responses/input_tokens", json=body, headers=self.headers
             )
@@ -530,6 +550,11 @@ class Validator:
             if abs(count - tokens) <= tokens * 0.02:
                 break
             chars = int(chars * tokens / count)
+        return body, count, chars
+
+    async def long_context(self, client, tokens: int):
+        key = f"validate-long-{time.time_ns()}"
+        body, count, _ = await self.long_prompt(client, tokens, key)
         swap_before = psutil.swap_memory().used
         emit("WAIT", f"Cold prefill of {count} tokens (this takes several minutes)...")
         first, ttft = await self.stream(client, body)
@@ -618,6 +643,90 @@ class Validator:
             f"swap growth {swap_growth / 1024**2:.0f} MiB.",
         )
 
+    def default_checks(self, client) -> list:
+        return [
+            ("ready", self.ready(client)),
+            ("text", self.text(client)),
+            ("thinking", self.thinking(client)),
+            ("tool_call", self.tool_call(client)),
+            ("prompt_cache", self.prompt_cache(client)),
+            ("websocket", self.websocket(client)),
+            ("effort_switch", self.effort_switch(client)),
+            ("speculative", self.speculative(client)),
+            ("lookup", self.lookup(client)),
+            ("structured", self.structured(client)),
+            ("runtime", self.runtime_status(client)),
+        ]
+
+    async def restart_prepare(self, client, tokens: int):
+        key = f"validate-restart-{time.time_ns()}"
+        body, count, chars = await self.long_prompt(client, tokens, key)
+        emit("WAIT", f"Cold prefill of {count} tokens (this takes several minutes)...")
+        response, ttft = await self.stream(client, body)
+        check(response["status"] == "completed", f"status {response['status']}")
+        last = (await self.runtime(client))["worker"]["last"]
+        record = {
+            "key": key,
+            "chars": chars,
+            "input_tokens": response["usage"]["input_tokens"],
+            "prompt_sha256": _digest(body),
+            "cold_ttft_ms": round((ttft or 0) * 1000),
+            "prefill_tok_s": last.get("prefill_tok_s"),
+        }
+        RESTART_RECORD.parent.mkdir(parents=True, exist_ok=True)
+        RESTART_RECORD.write_text(json.dumps(record))
+        RESTART_RECORD.chmod(0o600)
+        numbers = {k: v for k, v in record.items() if k not in ("key", "prompt_sha256")}
+        self.record("restart_prepare", passed=True, **numbers)
+        emit(
+            "READY",
+            f"Session of {record['input_tokens']} tokens built (cold TTFT "
+            f"{record['cold_ttft_ms'] / 1000:.1f}s). Now run ./backend_service.sh restart, "
+            "then this script with --restart-resume.",
+        )
+
+    async def restart_resume(self, client):
+        check(RESTART_RECORD.is_file(), "no session recorded: run --restart-prepare first")
+        record = json.loads(RESTART_RECORD.read_text())
+        body = self.long_request(record["chars"], record["key"])
+        check(
+            _digest(body) == record["prompt_sha256"],
+            "the prompt changed since --restart-prepare (repository files differ): prepare again",
+        )
+        response, ttft = await self.stream(client, body)
+        check(response["status"] == "completed", f"status {response['status']}")
+        last = (await self.runtime(client))["worker"]["last"]
+        cached = response["usage"]["input_tokens_details"]["cached_tokens"]
+        ttft = ttft or 0
+        passed = (
+            last.get("restore_path") == "ssd"
+            and cached == response["usage"]["input_tokens"]
+            and ttft <= RESTART_TTFT_REQUIRED_S
+        )
+        self.record(
+            "restart_resume",
+            passed=passed,
+            input_tokens=response["usage"]["input_tokens"],
+            cached_tokens=cached,
+            ttft_ms=round(ttft * 1000),
+            cold_ttft_ms=record["cold_ttft_ms"],
+            ssd_load_ms=last.get("ssd_load_ms"),
+            peak_memory_bytes=last.get("peak_memory_bytes"),
+            swap_growth_bytes=last.get("swap_growth_bytes"),
+        )
+        check(last.get("restore_path") == "ssd", f"restore path {last.get('restore_path')}")
+        check(cached == response["usage"]["input_tokens"], f"only {cached} tokens cached")
+        check(ttft <= RESTART_TTFT_REQUIRED_S, f"first token after {ttft:.1f}s")
+        emit(
+            "READY",
+            f"Restart restore passed: {cached} tokens from SSD in {last.get('ssd_load_ms')} ms, "
+            f"first token after {ttft:.2f}s (cold: {record['cold_ttft_ms'] / 1000:.1f}s).",
+        )
+
+
+def _digest(body: dict) -> str:
+    return hashlib.sha256(json.dumps(body["input"], sort_keys=True).encode()).hexdigest()
+
 
 def _usage(usage: dict) -> dict:
     return {
@@ -655,9 +764,19 @@ def _corpus(chars: int) -> str:
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--long", type=int, metavar="TOKENS", help="add the long-context check")
+    restart = parser.add_mutually_exclusive_group()
+    restart.add_argument(
+        "--restart-prepare", type=int, metavar="TOKENS", help="B2-1, before a restart"
+    )
+    restart.add_argument("--restart-resume", action="store_true", help="B2-1, after a restart")
     args = parser.parse_args()
-    if args.long is not None and not 4096 <= args.long <= 250_000:
-        emit("ERROR", "--long must be between 4096 and 250000 tokens.")
+    for name in ("long", "restart_prepare"):
+        value = getattr(args, name)
+        if value is not None and not 4096 <= value <= 250_000:
+            emit("ERROR", f"--{name.replace('_', '-')} must be between 4096 and 250000 tokens.")
+            return 2
+    if args.long is not None and (args.restart_prepare is not None or args.restart_resume):
+        emit("ERROR", "--long does not combine with the restart checks.")
         return 2
     settings = Settings.read()
     alias, _ = active_pointer()
@@ -668,21 +787,21 @@ async def main() -> int:
     first = vmstats.sample()
     sampler = asyncio.create_task(validator.sample_memory())
     async with httpx.AsyncClient(timeout=TIMEOUT_S, trust_env=False) as client:
-        checks = [
-            ("ready", validator.ready(client)),
-            ("text", validator.text(client)),
-            ("thinking", validator.thinking(client)),
-            ("tool_call", validator.tool_call(client)),
-            ("prompt_cache", validator.prompt_cache(client)),
-            ("websocket", validator.websocket(client)),
-            ("effort_switch", validator.effort_switch(client)),
-            ("speculative", validator.speculative(client)),
-            ("lookup", validator.lookup(client)),
-            ("structured", validator.structured(client)),
-            ("runtime", validator.runtime_status(client)),
-        ]
+        if args.restart_prepare is not None:
+            checks = [
+                ("ready", validator.ready(client)),
+                ("restart_prepare", validator.restart_prepare(client, args.restart_prepare)),
+            ]
+        elif args.restart_resume:
+            checks = [
+                ("ready", validator.ready(client)),
+                ("restart_resume", validator.restart_resume(client)),
+            ]
+        else:
+            checks = validator.default_checks(client)
         for name, coroutine in checks:
-            await validator.run(name, coroutine)
+            timeout = LONG_TIMEOUT_S if name.startswith("restart") else TIMEOUT_S
+            await validator.run(name, coroutine, timeout)
         if args.long is not None:
             checks.append(("long_context", None))
             await validator.run(

@@ -61,6 +61,11 @@ class Layout:
     def staging(self) -> Path:
         return self.runtime / "weight-staging"
 
+    @property
+    def kv_cache(self) -> Path:
+        """The SSD session cache (engine/disk_cache.py), owned by the worker."""
+        return self.runtime / "kv-cache"
+
     def record(self, folder: str) -> Path:
         return self.records / f"{safe_folder(folder)}.json"
 

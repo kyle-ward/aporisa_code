@@ -53,7 +53,7 @@ cd backend && UV_CACHE_DIR=../.cache/uv UV_PYTHON_INSTALL_DIR=../.runtime/python
 | `protocol/` | 合同的 Python 侧：严格 JSON、按已提交的 schema 校验、语义规则、错误码 |
 | `gateway/` | ASGI 网关：准入、HTTP/SSE、WebSocket、事件组装、worker 客户端与恢复 |
 | `ipc/` | 网关与 worker 之间的帧格式 |
-| `engine/` | worker 进程：加载与预热、模型适配层、会话与快照、生成、PLE 预取 |
+| `engine/` | worker 进程：加载与预热、模型适配层、会话与快照、SSD 会话缓存、生成、投机解码、结构化输出、PLE 预取 |
 | `lifecycle/` | doctor/prepare/run、共用检查、收据、身份记录与目录租约、权重维护、转换配方 |
 | `configs/` | 随代码评审的策略：模型指针、资源上限、引擎、部署、服务超时 |
 | `fake/` | 测试用的进程内假 worker |
@@ -66,6 +66,16 @@ cd backend && UV_CACHE_DIR=../.cache/uv UV_PYTHON_INSTALL_DIR=../.runtime/python
 backend/.venv/bin/python scripts/validate_runtime.py
 backend/.venv/bin/python scripts/validate_runtime.py --long 131072
 ```
+
+SSD 缓存的重启验收（B2-1）分两步，中间由用户重启服务；这两种模式只运行这一项检查：
+
+```bash
+backend/.venv/bin/python scripts/validate_runtime.py --restart-prepare 200000
+./backend_service.sh restart
+backend/.venv/bin/python scripts/validate_runtime.py --restart-resume
+```
+
+第一步建立约 200K 的会话，把 key、长度和提示词的 sha256（不含文本）记在 `.runtime/validation/restart.json`；第二步发送同一个请求，要求从 SSD 恢复（`restore_path=ssd`）、全部 token 命中、首 token 在 10 秒内。两步之间仓库文件有改动时，提示词会变，第二步会要求重新准备。
 
 `--long` 增加长上下文检查（B1-10 的验收）：一次冷预填充，服务端预填充速度要达到 B0-5 同长度「纯计算」速度的 80%；紧接着续接一轮，只预填充增量；整个过程 swap 用量不增长。
 

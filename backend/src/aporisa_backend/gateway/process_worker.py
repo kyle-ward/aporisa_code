@@ -53,11 +53,13 @@ class ProcessWorker(WorkerClient):
         stop_timeout_s: float = 15,
         python: str = sys.executable,
         snapshot_budget_bytes: int | None = None,
+        kv_cache: dict | None = None,
     ):
         self.model_dir, self.model, self.profile = Path(model_dir), model, profile
         self.draft_dir = Path(draft_dir) if draft_dir is not None else None
         self.engine, self.stop_timeout_s, self.python = engine, stop_timeout_s, python
         self.snapshot_budget_bytes = snapshot_budget_bytes
+        self.kv_cache = kv_cache  # {"dir", "identity", "draft_identity"}: the SSD cache
         self.proc: asyncio.subprocess.Process | None = None
         self.writer: asyncio.StreamWriter | None = None
         self.reader_task: asyncio.Task | None = None
@@ -111,6 +113,7 @@ class ProcessWorker(WorkerClient):
                 ],
                 "draft_kv_bytes_per_token": self.profile.draft_kv_bytes_per_token,
                 "snapshot_budget_bytes": self.snapshot_budget_bytes,
+                "kv_cache": self.kv_cache,
                 "engine": self.engine.as_dict(),
             }
         )

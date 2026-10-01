@@ -34,7 +34,7 @@ launchd (LaunchDaemon, KeepAlive=false)
 ```
 
 - **网关**持有全部协议语义：认证、严格 JSON、按 schema 与语义校验、FIFO 准入（并发 1、排队 2）、计时与上限、事件组装（所有 id 和 `sequence_number` 都由网关生成）、SSE 与 WebSocket、WebSocket 续接的展开、worker 故障的有限次恢复。
-- **worker** 只持有加速状态：MLX 模型与 MTP 草稿模型、会话缓存与快照、token 映射。它的状态丢失（崩溃、重启、淘汰）只影响速度，不影响结果。
+- **worker** 只持有加速状态：MLX 模型与 MTP 草稿模型、会话缓存与快照、token 映射，以及 SSD 上的会话缓存（`.runtime/kv-cache/`）。它的状态丢失（崩溃、重启、淘汰、缓存文件损坏或被删）只影响速度，不影响结果。
 - 一个 worker 同时只执行一个生成。worker 内有两个线程：
   - **主线程**独占 MLX，按顺序处理 generate、release_session、shutdown；
   - **控制线程**只收消息：interrupt 和 cancel 只设置标志，主线程在预填充块之间、等待 PLE 预取时、解码的每个 token 之间检查；count_tokens 和 status 在控制线程直接回答，不排在生成后面。
@@ -45,12 +45,12 @@ launchd (LaunchDaemon, KeepAlive=false)
 
 | 网关 → worker | 字段 | 说明 |
 |---|---|---|
-| `init` | 模型目录、草稿模型目录与每轮草稿数、公开模型对象、适配层、KV 字节数、引擎策略 | 第一帧；路径不放进命令行 |
+| `init` | 模型目录、草稿模型目录与每轮草稿数、公开模型对象、适配层、KV 字节数、SSD 缓存目录与模型身份、引擎策略 | 第一帧；路径不放进命令行 |
 | `generate` | `id`、`response_id`、`request`（展开后的完整参数）、`session` | `generate:false` 即预热 |
 | `count_tokens` | `id`、`request` | 与生成走同一套渲染 |
 | `interrupt` / `cancel` | `id` | 优雅中断 / 硬取消 |
 | `release_session` | `session` | WebSocket 连接关闭 |
-| `status` / `shutdown` | — | 运行状态 / 停机 |
+| `status` / `shutdown` | — | 运行状态 / 停机（worker 先在 30 秒内把会话写入 SSD 缓存；网关断开时不写） |
 
 | worker → 网关 | 说明 |
 |---|---|
@@ -68,8 +68,9 @@ launchd (LaunchDaemon, KeepAlive=false)
   - 渲染：与官方 chat template 逐 token 一致；中途的 `developer` 和 `configuration_update` 渲染为 system 段。
   - token 映射：记住「assistant 回合的渲染文本 → 生成时的 token id」，重新渲染历史时复现生成时的 id。
   - 增量解析：推理 → 回答 → XML 工具调用，按 schema 转换参数，确定 `phase`。
-- **会话**（`engine/sessions.py`）：一个会话是一份 MLX cache、其中的 token 列表、草稿模型的状态和最多 16 个快照（循环层状态的拷贝加上该位置的目标隐藏状态，KV 通过截断恢复）。匹配顺序：活跃游标（live）→ 最深的可用快照（snapshot）→ 冷启动（cold）。草稿模型跟不上一次恢复时，该会话不再起草，直到下次冷启动。
+- **会话**（`engine/sessions.py`）：一个会话是一份 MLX cache、其中的 token 列表、草稿模型的状态和最多 16 个快照（循环层状态的拷贝加上该位置的目标隐藏状态，KV 通过截断恢复）。匹配顺序：活跃游标（live）→ 最深的可用快照（snapshot）→ SSD 缓存（ssd，比内存多复用至少一块时）→ 冷启动（cold）。草稿模型跟不上一次恢复时，该会话不再起草，直到下次冷启动。
 - **内存预算**：所有会话的 KV 与快照可用的内存，每次请求前按当前实际余量计算（可用内存 + 会话已占用 + 缓冲缓存 − 激活预留 − 缓冲缓存上限 − 给桌面的余量），并且不超过按 wired 上限算出的值；不够时按 LRU 整个淘汰空闲会话。另外按内核的内存压力等级兜底：请求开始时若处于警告（活动监视器里的黄色），先丢掉全部空闲会话；worker 空闲时每 5 秒检查一次，处于警告就丢掉一个最久未用的空闲会话。
+- **SSD 缓存**（`engine/disk_cache.py`，B2-1）：会话因内存预算或内存压力被淘汰时、以及正常停机时，写入 SSD；之后的请求（包括服务重启之后）按内容匹配恢复。KV 按 2048 个 token 分块，文件名是 token 的链式哈希，相同前缀只存一份；检查点保存某个位置的循环层状态、logits、草稿模型隐藏状态和尾部 KV。磁盘上不存 token 列表，文件权限 0600，每次读入都校验 sha256，总量上限 64 GiB（LRU）。目录按布局摘要（模型身份、格式、MLX 版本等）区分，布局变了旧缓存不再读取并在启动时删除。
 - **生成**（`engine/generate.py`）：预填充按 2048 分块，并在快照点切开，每块顺带喂给草稿模型；外置 PLE 表的页由线程池预取，与当前块的 GPU 计算重叠（`engine/ple_prefetch.py`）；解码使用模型卡片的采样参数，presence penalty 作用于全部已生成 token。
 - **投机解码**（`engine/speculative.py`，B2-2）：解码按轮进行，采样出的 token 加上草稿模型的 argmax 草稿（上下文 16K 以下 2 个，以上 1 个：长上下文下一次验证 3 个 token 的开销陡增，见 validation.md），由目标模型一次前向验证；逐位置用请求的采样器采样，与草稿相同就继续。每个输出 token 都是目标模型的采样，草稿只决定一次前向覆盖几个位置，因此输出分布不变；与逐 token 解码之间只有 kernel 级的浮点差异（validation.md 的 B2 P1）。草稿有两个来源：上下文的末尾在更早处出现过（至少 3 个 token）时，复制那里之后的 token（提示词查找，B2-3，每轮最多 32 个）；否则用 MTP。验证 token 较多的轮次（16K 起 3 个以上，以下 8 个以上）走预填充路径，因为解码路径在长上下文把多 token 验证拆成一对一对计算，开销随 token 数陡增。
 - **结构化输出**（`engine/structured.py`，B2-4）：带 `text.format` 或 strict 工具的请求，回答部分（`</think>` 之后）按一份 Lark 语法约束解码（llguidance），每个 token 采样前加上允许 token 的掩码，受约束区域不投机；推理不受约束。完成的受约束 item 再按 schema 校验一次，不通过以 `structured_output_invalid` 结束（协议第 8.4 节）。
@@ -88,7 +89,7 @@ launchd (LaunchDaemon, KeepAlive=false)
 
 ## 7. 不变量
 
-- **语义无状态**：每个请求都是完整输入。续接、预热、快照、token 映射都是尽力而为的加速，都能退化到冷启动且结果一致；快照恢复在真实模型上逐位一致。
+- **语义无状态**：每个请求都是完整输入。续接、预热、快照、SSD 缓存、token 映射都是尽力而为的加速，都能退化到冷启动且结果一致；快照恢复在真实模型上逐位一致，SSD 恢复得到的 cache 与写入时逐位相同。
 - **取消与断连一路传到引擎**，确认之后才释放准入名额。
 - **所有资源都有上限**：正文、准入队列、推理槽位、输出字节、各类超时、IPC 帧、会话内存、worker 恢复次数（2 次）。
 - **停机顺序**：关闭准入 → 唤醒排队中的请求 → 限时 drain → 取消剩余请求 → 结束 worker 进程组。
@@ -104,4 +105,5 @@ launchd (LaunchDaemon, KeepAlive=false)
 | 续接语义由网关持有 | worker 缓存丢失时续接仍然正确，不会出现 `previous_response_not_found` |
 | 会话按 token 前缀匹配，不用哈希链 | 26 万个整数的比较开销可以忽略；哈希链留给 B2 的 SSD 层 |
 | 权重目录不按平台分子目录 | 只支持 macOS |
+| SSD 缓存用按内容寻址的块和检查点、自定格式，而不是计划中「每个 key 一份 safetensors」 | 相同前缀只存一份、同一会话再写只写新增部分（SSD 写入量随新增 token 增长）；重启后 key 会变（WebSocket 的 `conn:<id>`），按内容匹配仍能命中；自定格式带整文件 sha256，读入时校验 |
 | 快照预算按实际余量动态计算 | 96 GiB 的机器上模型占约 70 GiB，按 wired 上限算会把桌面程序挤进压缩（validation.md 的 P4 记录） |

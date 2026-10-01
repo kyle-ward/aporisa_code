@@ -30,6 +30,8 @@ INSTANCE_LOCK = RUNTIME / "instance.lock"
 SERVICE_PID = RUNTIME / "service.json"
 SOURCE_RECEIPT = RUNTIME / "prepared-source.json"
 ASSETS_RECEIPT = RUNTIME / "prepared-assets.json"
+# SSD session cache (engine/disk_cache.py): kept by uninstall like models and logs.
+KV_CACHE = RUNTIME / "kv-cache"
 LOG_DIR = ROOT / "backend" / "logs"
 
 LAUNCHD_LABEL_PREFIX = "com.aporisa.backend"

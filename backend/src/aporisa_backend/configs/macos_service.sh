@@ -3,8 +3,9 @@
 # Quick asset checks + model load + warmup; readiness is never implied. Measured 2026-09-30:
 # load + warmup 21 s with warm page cache; a cold boot reads ~67 GiB from SSD first.
 MAC_SERVICE_BACKEND_START_SECONDS=300
-# launchd ExitTimeOut: drain (30 s) + worker stop (15 s) + margin.
-MAC_SERVICE_BACKEND_EXIT_SECONDS=90
+# launchd ExitTimeOut: graceful HTTP shutdown (30 s) + drain (30 s) + worker stop (45 s,
+# including the SSD session spill) + margin.
+MAC_SERVICE_BACKEND_EXIT_SECONDS=120
 MAC_SERVICE_STOP_MARGIN_SECONDS=20
 MAC_SERVICE_POLL_SECONDS=1
 MAC_SERVICE_HEALTH_SECONDS=2

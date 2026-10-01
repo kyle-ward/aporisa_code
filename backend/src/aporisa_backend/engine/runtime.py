@@ -14,6 +14,7 @@ import mlx.core as mx
 
 from ..configs.engine import EngineConfig
 from .adapters.qwen38 import Qwen38Adapter, TokenMap
+from .disk_cache import DiskCache
 from .generate import Engine, JobFlags, Settings
 from .ple_prefetch import PlePrefetcher, external_ple
 from .sessions import SessionStore
@@ -60,6 +61,7 @@ def load(init: dict) -> Engine:
         kv_bytes_per_token=kv_bytes,
         max_snapshots=config.max_snapshots,
         drafter=drafter,
+        disk=open_disk_cache(init, config),
     )
     engine = Engine(
         lm,
@@ -99,9 +101,34 @@ def load(init: dict) -> Engine:
         "lookup_schedule": [list(step) for step in engine.settings.lookup_schedule],
         "released_cache_bytes": released,
         "locked_bytes": locked,
+        "ssd_cache": sessions.disk is not None,
     }
     engine.model_ref = model  # keeps the vision tower and config alive with the process
     return engine
+
+
+def open_disk_cache(init: dict, config: EngineConfig) -> DiskCache | None:
+    """The SSD session cache (B2-1) when the gateway names its directory. Its layout is
+    every input that decides what a cached state means: the model and draft identities and
+    the MLX versions computing them (disk_cache.py adds the format and block size)."""
+    spec = init.get("kv_cache")
+    if not spec:
+        return None
+    from importlib.metadata import version
+
+    layout = {
+        "model": spec["identity"],
+        "draft": spec.get("draft_identity") if init.get("draft_dir") else None,
+        "adapter": init["adapter"],
+        "mlx": version("mlx"),
+        "mlx_vlm": version("mlx-vlm"),
+    }
+    return DiskCache(
+        Path(spec["dir"]),
+        layout,
+        capacity_bytes=config.ssd_cache_bytes,
+        block_tokens=config.ssd_block_tokens,
+    )
 
 
 def lock_weights(*modules) -> int:

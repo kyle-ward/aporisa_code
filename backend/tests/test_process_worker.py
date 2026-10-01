@@ -10,12 +10,14 @@ import asyncio
 import json
 import os
 import signal
+from dataclasses import replace
 
 import httpx
 import pytest
 from conftest import ALIAS, API_KEY, PROFILE, Server, auth, eventually, limits, post_stream, request
 from streamcheck import check_stream
 
+from aporisa_backend.configs.engine import ENGINE
 from aporisa_backend.configs.models import public_model
 from aporisa_backend.gateway.app import create_app
 from aporisa_backend.gateway.process_worker import ProcessWorker
@@ -125,6 +127,51 @@ async def test_runtime_health_includes_worker_status(served):
     last = worker["last"]
     assert last["restore_path"] in ("cold", "live", "snapshot")
     assert last["ple_bytes_read"] > 0 and last["snapshot_count"] >= 1
+
+
+async def test_sessions_survive_a_restart_on_ssd(tiny_model_dir, tiny_draft_dir, tmp_path):
+    """B2-1: a graceful stop writes the sessions to the SSD cache; the next worker restores
+    the same prompt from there instead of prefilling it."""
+    service_limits = limits(worker_start_timeout_s=120)
+    root = tmp_path / "kv-cache"
+    runtimes: list[Runtime] = []
+
+    def app():
+        worker = ProcessWorker(
+            tiny_model_dir,
+            public_model(ALIAS, PROFILE),
+            PROFILE,
+            draft_dir=tiny_draft_dir,
+            engine=replace(ENGINE, ssd_block_tokens=64),
+            snapshot_budget_bytes=2 * 1024**3,
+            kv_cache={"dir": str(root), "identity": "tiny", "draft_identity": "tiny-mtp"},
+        )
+        runtime = Runtime(ALIAS, PROFILE, lambda: worker, service_limits)
+        runtimes.append(runtime)
+        return create_app(runtime, API_KEY, service_limits)
+
+    body = request(
+        "Remember this sentence for later. " * 30,
+        max_output_tokens=4,
+        prompt_cache_key="restart",
+        reasoning={"effort": "none"},
+    )
+    with Server(app()) as server:
+        status, events = await post_stream(server.base, body)
+        assert status == 200 and check_stream(events)
+    # stopped: the worker wrote its sessions and exited
+    assert await eventually(lambda: runtimes[0].state == "stopped", 60)
+    assert any(root.rglob("*.ckpt"))
+    with Server(app()) as server:
+        status, events = await post_stream(server.base, body)
+        response = check_stream(events)
+        async with httpx.AsyncClient(timeout=30) as client:
+            health = (await client.get(f"{server.base}/health/runtime", headers=auth())).json()
+    usage = response["usage"]
+    assert usage["input_tokens_details"]["cached_tokens"] == usage["input_tokens"]
+    last = health["worker"]["last"]
+    assert last["restore_path"] == "ssd" and last["ssd_load_ms"] is not None
+    assert health["worker"]["ssd_checkpoints"] >= 2 and health["worker"]["ssd_errors"] == 0
 
 
 MARKER = "zq-private-marker-7f3a"

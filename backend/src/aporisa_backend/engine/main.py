@@ -7,7 +7,8 @@ directory, public model, engine policy); `ready` is sent after load and warmup.
 
 Threads:
 - main: owns MLX, the sessions and the token map writes; runs generate / release_session /
-  shutdown one at a time from the inbox.
+  shutdown one at a time from the inbox. A shutdown from the gateway first writes the
+  sessions to the SSD cache (within shutdown_spill_s); losing the gateway does not.
 - control: reads frames; interrupt and cancel only set flags the main thread checks between
   prefill chunks and decoded tokens; count_tokens and status are answered here (own
   tokenizer, thread-safe token map), so they never wait behind a generation.
@@ -24,6 +25,7 @@ import queue
 import socket
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -117,6 +119,9 @@ class Worker:
                 self.engine.sessions.release(message["session"])
                 self._update_view()
             elif op == "shutdown":
+                if message.get("spill", True):
+                    deadline = time.monotonic() + self.init["engine"]["shutdown_spill_s"]
+                    self.engine.sessions.spill_all(deadline)
                 return
 
     def _relieve_pressure(self) -> None:
@@ -211,7 +216,7 @@ class Worker:
     def _abandon(self) -> None:
         """The gateway closed the channel: stop now, hard-exit if MLX does not return."""
         self._cancel_all()
-        self.inbox.put({"op": "shutdown"})
+        self.inbox.put({"op": "shutdown", "spill": False})
         timer = threading.Timer(EXIT_GRACE_S, lambda: os._exit(1))
         timer.daemon = True
         timer.start()

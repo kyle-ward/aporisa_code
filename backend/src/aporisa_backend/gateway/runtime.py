@@ -409,6 +409,9 @@ class ResponseRun:
                     "session_bytes",
                     *PRESSURE_FIELDS,
                     "prefill_max_chunk_ms",
+                    "ssd_load_ms",
+                    "ssd_spill_count",
+                    "ssd_bytes_written",
                 )
             },
         )

@@ -18,6 +18,12 @@ until its next cold start.
 Sessions are keyed by prompt_cache_key, else `conn:<id>` for a WebSocket connection; a
 request without either gets a throwaway session. Everything here is an accelerator: losing
 it only costs time.
+
+With an SSD cache (disk_cache.py) a session leaving memory for the budget or for memory
+pressure is written first, and so is every session at a graceful stop; a released session
+(its client said it is done) and a session whose key moved to an unrelated prompt (after a
+compaction, its old history is never sent again) are not. A request whose prefix on disk is
+at least one block longer than what memory holds restores it from there (path `ssd`).
 """
 
 from __future__ import annotations
@@ -36,7 +42,7 @@ def cache_offset(cache: list) -> int:
     return max(int(getattr(entry, "offset", 0) or 0) for entry in cache)
 
 
-def _recurrent(cache: list) -> dict[int, list]:
+def recurrent_states(cache: list) -> dict[int, list]:
     from mlx_vlm.models.cache import ArraysCache
 
     return {i: list(entry.state) for i, entry in enumerate(cache) if isinstance(entry, ArraysCache)}
@@ -103,7 +109,7 @@ class Session:
         offset = cache_offset(self.cache)
         if self.snapshots and self.snapshots[-1].offset == offset:
             return
-        states = _recurrent(self.cache)
+        states = recurrent_states(self.cache)
         values = [v for state in states.values() for v in state if v is not None]
         logits = self.logits if len(self.tokens) == offset else None
         extra = [a for a in (logits, draft) if a is not None]
@@ -135,7 +141,8 @@ class Session:
 class Match:
     session: Session
     cached: int
-    path: str  # live | snapshot | cold
+    path: str  # live | snapshot | ssd | cold
+    load_ms: int | None = None  # time to read an `ssd` restore
 
 
 class SessionStore:
@@ -147,9 +154,11 @@ class SessionStore:
         kv_bytes_per_token: int,
         max_snapshots: int = 16,
         drafter=None,
+        disk=None,
     ):
         self.make_cache = make_cache
         self.drafter = drafter
+        self.disk = disk  # disk_cache.DiskCache, or None without an SSD cache
         self.budget_bytes = budget_bytes
         self.kv_bytes_per_token = kv_bytes_per_token
         self.max_snapshots = max_snapshots
@@ -204,6 +213,36 @@ class SessionStore:
         session.draft = self._new_draft()
         return self._mark(Match(session, 0, "cold"))
 
+    def recall(self, match: Match, tokens: list[int]) -> None:
+        """Upgrades `match` to an SSD restore when the disk holds a prefix of `tokens` at
+        least one block longer than what memory gave; the session's memory is replaced."""
+        if self.disk is None:
+            return
+        block = self.disk.block_tokens
+        if len(tokens) - match.cached < block:
+            return
+        restored = self.disk.restore(tokens, match.cached + block, self.make_cache, self.drafter)
+        if restored is None:
+            return
+        session = match.session
+        session.cache, session.logits, session.snapshots = restored.cache, restored.logits, []
+        session.draft = restored.draft
+        session.tokens = []
+        session.extend(list(tokens[: restored.offset]))
+        match.cached, match.path, match.load_ms = restored.offset, "ssd", restored.load_ms
+
+    def _spill(self, session: Session, deadline: float | None = None) -> None:
+        if self.disk is not None and not session.busy and session.key is not None:
+            self.disk.spill(session, self.drafter, deadline)
+
+    def spill_all(self, deadline: float) -> None:
+        """Graceful stop: writes the idle sessions, most recently used first, until
+        `deadline` (time.monotonic())."""
+        for session in sorted(self.sessions.values(), key=lambda s: -s.last_used):
+            if time.monotonic() >= deadline:
+                return
+            self._spill(session, deadline)
+
     def _new_draft(self):
         return self.drafter.new_state() if self.drafter is not None else None
 
@@ -224,6 +263,7 @@ class SessionStore:
         if not idle:
             return False
         victim = min(idle, key=lambda s: s.last_used)
+        self._spill(victim)
         self.sessions.pop(victim.key, None)
         self.evictions += 1
         self.pressure_evictions += 1
@@ -255,6 +295,7 @@ class SessionStore:
         while others and used + need > budget:
             victim = others.pop(0)
             used -= victim.nbytes()
+            self._spill(victim)
             self.sessions.pop(victim.key, None)
             self.evictions += 1
         if used + need > budget:
@@ -283,4 +324,5 @@ class SessionStore:
             "budget_bytes": self.budget_bytes,
             "evictions": self.evictions,
             "pressure_evictions": self.pressure_evictions,
+            **(self.disk.status() if self.disk is not None else {}),
         }

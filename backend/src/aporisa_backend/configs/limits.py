@@ -27,7 +27,9 @@ class ServiceLimits:
     ws_max_message_bytes: int = 16 * MIB
     retry_after_s: int = 5
     shutdown_drain_s: float = 30
-    worker_stop_s: float = 15
+    # The worker spends up to shutdown_spill_s (configs/engine.py, 30 s) writing sessions
+    # to the SSD cache before it exits.
+    worker_stop_s: float = 45
     worker_start_timeout_s: float = 1800
     restart_attempts: int = 2
     restart_backoff_s: float = 5

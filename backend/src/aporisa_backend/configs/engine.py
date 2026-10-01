@@ -42,6 +42,17 @@ class EngineConfig:
     # A match this long is a copy in progress; a shorter one drafts only when the MTP head
     # predicts the same next token (ordinary text repeats short phrases, P3.5 validation).
     lookup_trust_match: int = 6
+    # SSD session cache (B2-1, P4; B2 decision 5): sessions leaving memory (budget, memory
+    # pressure) and all sessions at a graceful stop are written to .runtime/kv-cache, at
+    # most this much in total (least recently used checkpoints go first). A 200K-token
+    # session is ~6.5 GB; blocks shared by several sessions are stored once.
+    ssd_cache_bytes: int = 64 * GIB
+    # Tokens per KV block on disk: a session spilled again writes only its new blocks, and a
+    # request restores only from a prefix at least one block longer than memory holds.
+    ssd_block_tokens: int = 2048
+    # Time the worker spends writing sessions at a graceful stop, newest first; the rest are
+    # dropped. Inside the gateway's worker stop timeout (configs/limits.py, 45 s).
+    shutdown_spill_s: float = 30
     ple_threads: int = 64
     # Soft RLIMIT_NOFILE the gateway and worker raise themselves to. launchd's default is 256;
     # the external PLE table alone holds 384 memmaps (128 shards x 3 tensors).

@@ -10,7 +10,7 @@
 - `KeepAlive=false`：launchd 不自动重启服务。恢复由网关内部完成，最多重启 worker 2 次（DEVELOPMENT_PLAN 第 14.4 节）。
 - 服务从 `backend/.env` 读取 API key 和端口，不继承交互式 shell 里导出的变量。
 - launchd 给守护进程的默认文件描述符软上限只有 256；网关和 worker 启动时自己提高到 65536（`configs/engine.py` 的 `open_files`），外置 PLE 表需要 384 个 memmap。
-- 超时在 `backend/src/aporisa_backend/configs/macos_service.sh`：等待就绪 300 秒（实测加载加预热 21 秒，权重在页缓存中；开机后冷启动要先从 SSD 读入约 67 GiB，所以留出余量）、退出 90 秒。
+- 超时在 `backend/src/aporisa_backend/configs/macos_service.sh`：等待就绪 300 秒（实测加载加预热 21 秒，权重在页缓存中；开机后冷启动要先从 SSD 读入约 67 GiB，所以留出余量）、退出 120 秒（HTTP 优雅关闭 30 秒 + drain 30 秒 + worker 停止 45 秒，其中最多 30 秒用于把会话写入 SSD 缓存）。新的退出超时在下一次 `start` 时写入 plist（`start` 会重新生成定义）。
 
 ## 2. 模式
 
@@ -53,5 +53,6 @@ doctor、prepare、run 共用同一套检查（`backend/src/aporisa_backend/life
 - `stop` 只追踪服务自己的进程树（PID/PPID），从不按进程名结束进程。
 - 运行状态：`curl -s -H "authorization: Bearer <key>" http://127.0.0.1:18080/health/runtime` 返回网关和 worker 的状态（会话、内存、最近一次请求的计量），只含数字和枚举。
 - 内存占用：服务运行期间，模型权重（约 68 GB，含 MTP 草稿模型）在加载时用 `mlock` 锁定在内存里，系统不会压缩或换出它们，worker 就绪日志中的 `locked_bytes` 是锁定的字节数。需要这部分内存时，用 `./backend_service.sh stop` 停止服务即可释放；服务不会因为空闲而自动卸载模型（用户决定）。
+- SSD 会话缓存：`.runtime/kv-cache/`，目录 0700、文件 0600，总量不超过 64 GiB（`configs/engine.py` 的 `ssd_cache_bytes`），由 worker 自己管理。会话被淘汰和服务正常停止时写入，内容是由提示词算出来的 KV 和模型状态（不含 token 列表和文本）；`/health/runtime` 的 `ssd_cache_bytes`、`ssd_written_bytes` 可以跟踪大小和累计写入量。要清空它：先 `./backend_service.sh stop`，再删除 `.runtime/kv-cache/` 目录；`uninstall` 不会删除它。缓存只是加速，删掉后下一次请求按冷启动处理。
 - 真实生成验证：`backend/.venv/bin/python scripts/validate_runtime.py`（见 [development.md](development.md)）。
 - 服务只监听 `127.0.0.1:18080`。从其他机器访问（例如 I1 集成时 Air 上的 native driver）由用户在 Studio 上现有的 Cloudflare Tunnel 转发到这个地址；后端不新增监听地址。

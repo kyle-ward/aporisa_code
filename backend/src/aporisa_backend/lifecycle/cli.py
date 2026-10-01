@@ -132,6 +132,11 @@ def run(root: Path) -> None:
                     selection.profile,
                     draft_dir=selection.draft.directory if selection.draft else None,
                     stop_timeout_s=LIMITS.worker_stop_s,
+                    kv_cache={
+                        "dir": str(layout.kv_cache),
+                        "identity": selection.identity,
+                        "draft_identity": selection.draft.identity if selection.draft else None,
+                    },
                 ),
                 LIMITS,
             )
