@@ -1,6 +1,6 @@
 # OpenRouter 兼容映射 v0（草案）
 
-> **状态：F0 草案，尚未实现。** 本文只描述前端兼容 driver 如何把 [Aporisa 协议](protocol.md)（接口集合 C）映射到 OpenRouter 的 Responses API。标注「待实测」的条目只依据 OpenRouter 的公开文档，要在 F2 阶段用真实请求确认，确认后再修改本文。
+> **状态：F0 草案，尚未实现。** 本文只描述前端兼容 driver 如何把 [Aporisa 协议](protocol.md)（接口集合 C）映射到 OpenRouter 的 Responses API。标注「待实测」的条目只依据 OpenRouter 的公开文档，要在 F5 阶段用真实请求确认，确认后再修改本文。
 >
 > 修订日期：2026-09-30（新增 `configuration_update` 的模拟方式；新增不合法工具参数的处理；`strict: true` 跟随 `structured_output`）。
 

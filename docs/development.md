@@ -19,7 +19,7 @@
 
 - `doctor` 只读，检查 Node、npm、lockfile 和依赖是否齐全。
 - `prepare` 是前端唯一联网的模式：下载并校验 Node，然后执行 `npm ci`。
-- `dev`、`build`、`install`、`uninstall` 在 F5 之前尚未实现，调用时会明确报错。
+- `dev`、`build`、`install`、`uninstall` 在 F4 之前尚未实现，调用时会明确报错。
 
 新增或升级依赖属于开发行为，用项目内的 npm 执行，并提交更新后的 lockfile：
 
@@ -106,8 +106,26 @@ backend/.venv/bin/python scripts/soak.py --hours 4 --long-tokens 131072 --restar
 | `src/sdk/` | Aporisa SDK：客户端接口，以及 native driver（WebSocket 默认，HTTP 兜底） | protocol、`ws`、Node 内置模块 |
 | `src/mock/` | 可编排脚本的确定性引擎、mock server（两种传输）、进程内 stub driver | protocol、sdk、`ws` |
 | `src/conformance/` | wire 层一致性测试用例，直接使用 HTTP 和 WebSocket，不依赖 SDK 的 driver | protocol、sdk 的 SSE 解码、`ws` |
+| `src/host/` | harness 接触系统的唯一入口：文件读写（原子写）、进程会话（每条命令一个进程组、头尾截断的输出、有上限）、环境信息。F2 无沙箱，F3 在这一层加 | host、protocol、Node 内置模块 |
+| `src/harness/` | harness core：Thread（会话、回合循环、预热、换档、取消）、工具（`exec_command`、`write_stdin`、`apply_patch`、`view_image`、`update_plan`）、初始上下文（环境与 AGENTS.md）、会话记录。**不能使用 Node 内置模块** | harness、host、sdk、protocol |
+| `src/cli/` | `aporisa` 命令行：`exec` 与交互模式、`.env` 读取、终端渲染 | cli、harness、host、sdk、mock、protocol、Node 内置模块 |
 
-依赖方向由 `tools/check-boundaries.ts` 强制检查。以后新增的 `host/`、`harness/`、`cli/`、`main/`、`preload/`、`ui/` 已经预置了规则；在 `src/` 下新增任何没有规则的顶层目录，检查都会失败。
+依赖方向由 `tools/check-boundaries.ts` 强制检查。以后新增的 `main/`、`preload/`、`ui/` 已经预置了规则；在 `src/` 下新增任何没有规则的顶层目录，检查都会失败。设计与进度见 [前端开发计划](../aporisa_code/DEVELOPMENT_PLAN.md)。
+
+## 命令行（F2）
+
+连接参数放在 `aporisa_code/.env`（从 `.env.example` 复制）：`APORISA_BASE_URL`（含 `/v1`）、`APORISA_API_KEY`（后端的 key）、`APORISA_MODEL`。环境变量优先于文件。
+
+```bash
+cd aporisa_code
+PATH="$PWD/.tools/node/bin:$PATH" npm run aporisa -- exec --cwd <工作目录> "<任务>"
+PATH="$PWD/.tools/node/bin:$PATH" npm run aporisa -- --cwd <工作目录>        # 交互模式
+PATH="$PWD/.tools/node/bin:$PATH" npm run aporisa -- --help
+```
+
+- 默认在每次执行命令、应用补丁之前询问。`--auto` 跳过询问，**只用于一次性的临时目录**：F2 还没有沙箱，命令以当前用户身份运行。
+- 会话记录写在 `~/Library/Application Support/Aporisa Code/sessions/`（目录 0700、文件 0600），包含完整内容；`--resume <id>` 继续，`--no-persist` 不写。
+- `--driver stub` 不需要后端，模型只会回声，用来检查命令行本身。
 
 ## 合同变更
 
@@ -128,6 +146,17 @@ cd aporisa_code && PATH="$PWD/.tools/node/bin:$PATH" npm run schema:export
 前端检查依次执行：TypeScript 类型检查、import 边界检查、Vitest 全部测试（包括对 mock server 的 wire 层一致性测试）。之后还有 Shell 语法检查和 `git diff --check`。整个过程不联网，也不启动真实服务。
 
 agent 只允许运行 `frontend` 范围。后端检查和不带参数的全量检查由用户运行，见 AGENTS.md。
+
+## 真实任务验收（F2）
+
+联网、加载真实模型，由用户在 Studio 上运行，不属于 `check.sh`。每个任务在临时 git 仓库里以不询问的方式运行，任务和判定见前端开发计划第 7.2 节：
+
+```bash
+cd aporisa_code && PATH="$PWD/.tools/node/bin:$PATH" npm run --silent agent-tasks
+cd aporisa_code && PATH="$PWD/.tools/node/bin:$PATH" npm run --silent agent-tasks -- --only many-steps
+```
+
+终端输出每个任务的结果和指标，完整报告（只有指标）写到 `.runtime/agent-tasks/<时间>.json`。
 
 ## 对真实服务运行一致性测试
 

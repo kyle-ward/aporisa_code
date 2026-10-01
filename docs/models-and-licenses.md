@@ -1,5 +1,7 @@
 # 模型、上游来源与许可证
 
+> 前端从 openai/codex（Apache-2.0，Copyright 2025 OpenAI）移植或改写了部分代码和文字：`aporisa_code/src/harness/tools/apply-patch/`（补丁解析与匹配）、`tools/truncate.ts`（输出截断）和 `instructions.ts`（系统指令的结构与部分内容），各文件开头注明了来源。
+
 本文记录后端使用的模型、上游来源、本地派生产物和许可证要点。模型配置指针（`MODEL_LIST` / `POINTERS` / `PROFILES`）和权重维护入口见 [model-management.md](model-management.md)；本地权重的唯一记录是 `.runtime/model-assets/` 下的身份记录。
 
 > **当前状态（2026-09-30，B1 完成）**：本机登记了两个身份，都从上面的 FP8 checkpoint 转换而来，见下一节。官方 FP8 checkpoint、B0 的旧目录和 mxfp4 产物都已删除；需要重新转换时，按身份记录中的仓库和 revision 重新下载 FP8，再用 `model_weights.sh convert`。

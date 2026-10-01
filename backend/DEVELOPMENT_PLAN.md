@@ -172,7 +172,7 @@
 
 **接口**：协议已经预留好了，不需要新增字段。
 - 请求中的 `reasoning.effort` 可以按请求设置，harness 或 UI 每一步都可以换档，对标 Claude Code 和 codex。
-- `/v1/models` 返回 `reasoning.supported_efforts` 和 `default_effort`，前端据此渲染档位选择器（F5）。
+- `/v1/models` 返回 `reasoning.supported_efforts` 和 `default_effort`，前端据此渲染档位选择器（F4）。
 
 | 协议 | 模型 | 采样参数 |
 |---|---|---|
@@ -555,7 +555,7 @@ backend/
 - **预填充**：覆盖图片 token 的块，以 embedding 输入，pad 的位置换成视觉塔的特征（每张图片在第一次需要时编码一次，用完即释放）；一块只装下一张图片的一部分也可以。小模型上整段一块时与 mlx-vlm 自己的图片路径（`get_input_embeddings` 加一次前向）逐位一致，把图片切在两块之间时只差 kernel 级的舍入。
 - **缓存的键**：所有 pad 的 token id 相同，只按 token 比较会让两张同尺寸的不同图片共用 KV。渲染时生成一份「键序列」：每张图片的第一个 pad 换成由图片摘要（内容、`detail`、缩放后的尺寸）得到的负数，其余与 token 相同。会话匹配（live、snapshot）和 SSD 的链式哈希都用键序列，模型仍然收到真实的 token id；纯文本请求的键就是 token，原有的 SSD 缓存仍然有效。提示词查找的草稿遇到图片（负数键或视觉 token）就截断。
 - **计量**：`image_count`、`image_tokens`、`vision_encode_ms`；`/health/runtime` 的 worker 视图增加 `image_input`。预热包括一次图片请求。
-- **前端后续（必做，登记于此，按前端阶段实现）**：OpenRouter driver 的 `input_image` 映射（F2，见 compat-openrouter.md，待实测）；harness 参照 codex 实现 `view_image` 工具（读取本地图片，以工具结果中的 `input_image` 交给模型）；UI 支持在消息中粘贴或拖入图片。
+- **前端后续（必做，登记于此，按前端阶段实现）**：OpenRouter driver 的 `input_image` 映射（F5，见 compat-openrouter.md，待实测）；harness 参照 codex 实现 `view_image` 工具（读取本地图片，以工具结果中的 `input_image` 交给模型）；UI 支持在消息中粘贴或拖入图片。
 
 **P6（B2-5 调优）定稿（2026-10-01，用户确认四项建议）**：
 1. 范围：T1（缩短 agent 每轮的首 token 时间）、T2（长上下文的内存余量）做；T3（解码：长上下文 2 个草稿、短上下文 3 个草稿、解码流水线）先剖析，有收益才做；T4（PLE 行缓存）、T5（快照数量 K 与预算）这次不做。

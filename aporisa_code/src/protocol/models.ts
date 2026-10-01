@@ -47,6 +47,7 @@ export const ModelList = z.strictObject({
 
 export type ReasoningEffort = z.infer<typeof ReasoningEffort>;
 export type WireCapabilities = z.infer<typeof WireCapabilities>;
+export type TruncationPolicy = z.infer<typeof TruncationPolicy>;
 export type Model = z.infer<typeof Model>;
 export type ModelList = z.infer<typeof ModelList>;
 export type CapabilityName = keyof WireCapabilities;

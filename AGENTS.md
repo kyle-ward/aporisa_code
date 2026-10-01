@@ -31,7 +31,7 @@
 
 ## 当前阶段
 
-- 前端：F0（合同 v0）和 F1（SDK、mock、一致性测试）已经完成，下一阶段是 F2（OpenRouter 兼容 driver）。
+- 前端：F0（合同 v0）和 F1（SDK、mock、一致性测试）已经完成。之后的顺序（2026-10-01 调整）：F2 无界面 agent loop（直接对接本地后端）→ F3 执行安全 → F4 Electron UI MVP（从这里开始日常自用）→ F5 OpenRouter 兼容 driver → F6 上下文管理 → F7 评估。F2 已完成（真实任务验收 8/8）；F3 的默认值已定，等用户明确开始。计划见 `aporisa_code/DEVELOPMENT_PLAN.md`。
 - 后端：v0（B0 探路与实测、B1 协议核心、B2 性能与本地专属能力）已经完成。B2-7 的 soak 只写好了脚本 `scripts/soak.py`，需要时再运行（用户决定）。之后的迭代方式是前端完成后边用边反馈；已知事项（集成节点 I1 和 I2、200K 解码余量、图片输入的前端部分等）列在 `backend/DEVELOPMENT_PLAN.md` 的「后端 v0 之后的已知事项」。架构见 `docs/architecture.md`，开发计划见 `backend/DEVELOPMENT_PLAN.md`。
 - 已验证的范围见 `docs/validation.md`。
 - 新能力在实现并验收之前，一律不得声称已经实现。文档中「目标规范」和「当前实现状态」必须分开写。

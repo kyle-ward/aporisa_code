@@ -2,7 +2,7 @@
 
 本文描述 Aporisa Code 各部分的职责划分、进程模型和内部接口。公共协议只在 [protocol.md](protocol.md) 定义，这里只引用；已验证的事实见 [validation.md](validation.md)。
 
-> 状态（2026-10-01）：后端 v0（B0–B2）完成；本文描述的是 B1 的实现加上 B2 的投机解码、结构化输出、SSD 会话缓存、图片输入和调优，均已在真实模型上验收（validation.md）。前端 F1 已完成（SDK、mock、一致性测试），harness 和 UI 从 F2 起逐步加入，届时补充第 2 节。
+> 状态（2026-10-01）：后端 v0（B0–B2）完成；本文描述的是 B1 的实现加上 B2 的投机解码、结构化输出、SSD 会话缓存、图片输入和调优，均已在真实模型上验收（validation.md）。前端 F2 已完成（harness core、host 层、命令行，真实任务验收通过）；执行安全（F3）和 UI（F4）尚未开始，计划见 `aporisa_code/DEVELOPMENT_PLAN.md`。
 
 ## 1. 三块与边界
 
@@ -16,7 +16,17 @@
 
 ## 2. 前端
 
-依赖方向是 `ui → (IPC) → main → harness → sdk → protocol`，由 `check.sh` 的 import 规则强制。F1 已有的目录（`protocol/`、`sdk/`、`mock/`、`conformance/`）及其允许的依赖，见 [development.md](development.md) 的「前端代码结构」。SDK 只有 native、openrouter、stub 三种 driver；OpenRouter 的映射差异只在 [compat-openrouter.md](compat-openrouter.md) 定义。
+依赖方向是 `ui → (IPC) → main → harness → sdk → protocol`，由 `check.sh` 的 import 规则强制。已有的目录及其允许的依赖，见 [development.md](development.md) 的「前端代码结构」。
+
+harness（F2）以 codex 为蓝本，决策记录见前端开发计划（FD-01 至 FD-12）：
+
+- **Thread**：一个会话对应一个 SDK 客户端（WebSocket 续接按连接保持）。请求的 `instructions`、`tools`、`prompt_cache_key`（会话 id）、`reasoning` 基线，以及开头的环境上下文和 AGENTS.md，在整个会话中不变；历史只在尾部追加，换档追加 `configuration_update`。会话开始时预热固定部分。这些规则是为了保住后端的前缀缓存：真实验收中，每次请求都命中上一次请求的全部输入和输出（只差回合结尾的 1 个换行 token）。
+- **回合**：工具调用在各自的 item 完成时开始执行（并行工具同时执行，其余独占），结果按调用顺序写回；输出里没有工具调用时回合结束；每回合最多 200 次请求。`tool_call_invalid` 再请求一次：没有完成的工具调用时丢弃失败响应的 item 原样重发，否则保留 item 和工具结果（后端会把连续的 assistant item 合并渲染，保留不带工具调用的输出会改变历史的渲染）。取消时结束本会话的全部进程，并补齐缺失的工具结果。
+- **工具**：`exec_command` / `write_stdin`（管道，非 PTY；主进程退出时结束整个进程组）、`apply_patch`（function 工具，补丁全部匹配才写盘）、`view_image`（PNG / JPEG）、`update_plan`。未知工具和错误参数作为工具结果交给模型。工具输出按模型的 `truncation_policy` 截断后进入历史，会话记录保留截断前的内容。
+- **上下文**：F2 只做 baseline：请求前按上一次 usage 加新增内容估算，超出有效窗口就不发送；压缩与裁剪属于 F6。
+- **会话记录**：`~/Library/Application Support/Aporisa Code/sessions/` 下每个会话一个 JSONL（目录 0700、文件 0600），可恢复；恢复时按 codex 的规则补齐缺失的工具结果。
+- **事件**：harness 对外只输出事件（thread / turn / item / tool / approval / response.completed / warning），命令行是第一个消费者；F4 之前定稿为 L3 合同。
+- harness 只通过 host 接口接触文件系统和进程，不能使用 Node 内置模块；F2 没有沙箱，命令以用户身份运行，默认逐条询问（F3 取代）。SDK 只有 native、openrouter、stub 三种 driver；OpenRouter 的映射差异只在 [compat-openrouter.md](compat-openrouter.md) 定义。
 
 ## 3. 后端进程模型
 
