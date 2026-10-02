@@ -76,6 +76,12 @@ interface Loaded {
   client: AporisaClient;
   projector: LiveProjector;
   settings: ThreadSettings;
+  /**
+   * The running turn's abort controller; null when no turn runs. It is also what the UI is
+   * told about "running": set at turn/start and cleared on turn.completed, in step with the
+   * turn notifications. The harness's busy flag stays set a little longer (until the session
+   * record is written), so reading it at turn end reported a finished turn as running.
+   */
   controller: AbortController | null;
   /** The call an approval is about (approval.requested precedes the question). */
   pendingCall: { turnId: string; callId: string } | null;
@@ -241,7 +247,7 @@ export class AppServer {
       createdAt: loaded.projector.turns[0]?.startedAt ?? new Date().toISOString(),
       updatedAt: Date.now(),
       loaded: true,
-      running: loaded.thread.busy,
+      running: loaded.controller !== null,
     };
   }
 
@@ -423,7 +429,7 @@ export class AppServer {
           createdAt: summary.createdAt,
           updatedAt: summary.updatedAt,
           loaded: loaded !== undefined,
-          running: loaded?.thread.busy ?? false,
+          running: loaded ? loaded.controller !== null : false,
         });
       }
       return { threads };
@@ -546,20 +552,30 @@ export class AppServer {
 
     "turn/start": async (params: ParamsOf<"turn/start">): Promise<ResultOf<"turn/start">> => {
       const loaded = this.loaded(params.threadId);
-      if (loaded.thread.busy) throw new AppError("busy", "the thread is already running a turn");
+      if (loaded.thread.busy || loaded.controller) throw new AppError("busy", "the thread is already running a turn");
       const input: UserInput = [
         ...(params.text.trim() !== "" ? [{ type: "input_text" as const, text: params.text }] : []),
         ...params.images.map((image) => ({ type: "input_image" as const, image_url: image, detail: "auto" as const })),
       ];
       if (input.length === 0) throw new AppError("invalid_params", "the message is empty");
-      loaded.projector.expectTurn(params.text, params.images);
       const controller = new AbortController();
       loaded.controller = controller;
-      loaded.turn = loaded.thread.runTurn(input, { signal: controller.signal }).catch((error: unknown) => {
+      // Told before the turn starts, so it always precedes the turn's own notifications.
+      let running: ThreadInfo;
+      try {
+        running = await this.info(loaded);
+      } catch (error) {
         loaded.controller = null;
-        if (!loaded.deleted) this.options.notify({ method: "warning", params: { threadId: params.threadId, message: `the turn stopped unexpectedly: ${(error as Error).message}` } });
+        throw error;
+      }
+      loaded.projector.expectTurn(params.text, params.images);
+      this.options.notify({ method: "thread/updated", params: { thread: running } });
+      loaded.turn = loaded.thread.runTurn(input, { signal: controller.signal }).catch(async (error: unknown) => {
+        loaded.controller = null;
+        if (loaded.deleted) return;
+        this.options.notify({ method: "warning", params: { threadId: params.threadId, message: `the turn stopped unexpectedly: ${(error as Error).message}` } });
+        this.options.notify({ method: "thread/updated", params: { thread: await this.info(loaded) } });
       });
-      this.options.notify({ method: "thread/updated", params: { thread: { ...(await this.info(loaded)), running: true } } });
       return {};
     },
 

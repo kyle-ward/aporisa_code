@@ -172,6 +172,22 @@ describe("threads and turns", () => {
     expect(listed.threads).toMatchObject([{ id: thread.id, title: "check a.txt", loaded: true, running: false }]);
   });
 
+  it("reports a finished turn as not running, also in the thread updates that follow it", async () => {
+    // A thread/updated sent at turn end once read the harness's busy flag before it was
+    // cleared, and left the UI showing the stop button after the turn had ended.
+    const app = await server();
+    const { thread } = await startInWorkspace(app);
+    for (const text of ["one", "two"]) {
+      notifications = [];
+      await app.handle("turn/start", { threadId: thread.id, text, images: [] });
+      await completedTurn(thread.id);
+      const updates = () => notifications.filter((n): n is Extract<Notification, { method: "thread/updated" }> => n.method === "thread/updated");
+      await until(() => (updates().length >= 2 ? true : undefined));
+      expect(updates().map((n) => n.params.thread.running)).toEqual([true, false]);
+      expect((await app.handle("thread/list", {})).threads.find((entry) => entry.id === thread.id)?.running).toBe(false);
+    }
+  });
+
   it("asks the UI for approvals and shows refusals", async () => {
     plans = [[call("exec_command", { cmd: "touch made" })]];
     answers = ["denied"];
