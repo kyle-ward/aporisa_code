@@ -23,15 +23,42 @@ export function localDate(date: Date, timeZone: string): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
 }
 
-export function environmentContext(cwd: string, info: HostInfo, date: Date): InputItem {
+/** The opening tag of environment messages (the opening one and later updates). */
+export const ENVIRONMENT_CONTEXT_TAG = "<environment_context>";
+
+/**
+ * Reference directories (F4.5): other folders of the user's project, given to read. Not
+ * enforced beyond the sandbox: like any path outside the working directory, writing there
+ * needs the user's approval (FD-25).
+ */
+function referenceLines(references: readonly string[]): string[] {
+  if (references.length === 0) return [];
+  return [
+    '  <reference_directories note="Folders to read for reference. Do not modify them; change files only in cwd.">',
+    ...references.map((path) => `    <directory>${escapeXml(path)}</directory>`),
+    "  </reference_directories>",
+  ];
+}
+
+export function environmentContext(cwd: string, info: HostInfo, date: Date, references: readonly string[] = []): InputItem {
   const lines = [
-    "<environment_context>",
+    ENVIRONMENT_CONTEXT_TAG,
     `  <cwd>${escapeXml(cwd)}</cwd>`,
+    ...referenceLines(references),
     `  <shell>${escapeXml(basename(info.shell))}</shell>`,
     `  <current_date>${localDate(date, info.timeZone)}</current_date>`,
     `  <timezone>${escapeXml(info.timeZone)}</timezone>`,
     "</environment_context>",
   ];
+  return userMessage(lines.join("\n"));
+}
+
+/**
+ * Appended when the reference directories change mid-thread, like codex appends an
+ * environment context when the turn context changes; the opening items stay intact.
+ */
+export function environmentUpdate(cwd: string, references: readonly string[]): InputItem {
+  const lines = [ENVIRONMENT_CONTEXT_TAG, `  <cwd>${escapeXml(cwd)}</cwd>`, ...(references.length > 0 ? referenceLines(references) : ["  <reference_directories>none</reference_directories>"]), "</environment_context>"];
   return userMessage(lines.join("\n"));
 }
 
@@ -82,9 +109,9 @@ export function permissionsItem(text: string): InputItem {
   return { type: "message", role: "developer", content: [{ type: "input_text", text }] };
 }
 
-/** The thread's fixed opening items; they never change for the life of the thread. */
-export async function initialContext(cwd: string, fs: HostFileSystem, info: HostInfo, date: Date, permissions?: string): Promise<InputItem[]> {
-  const items = [environmentContext(cwd, info, date)];
+/** The thread's fixed opening items; they never change for the life of the thread. AGENTS.md comes from cwd only, never from reference directories. */
+export async function initialContext(cwd: string, fs: HostFileSystem, info: HostInfo, date: Date, permissions?: string, references: readonly string[] = []): Promise<InputItem[]> {
+  const items = [environmentContext(cwd, info, date, references)];
   if (permissions !== undefined) items.push(permissionsItem(permissions));
   const agents = await loadAgentsMd(cwd, fs);
   if (agents !== null) items.push(agentsMdMessage(cwd, agents));

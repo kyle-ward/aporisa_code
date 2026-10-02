@@ -4,6 +4,16 @@ import type { ResponseStream } from "./response-stream.ts";
 
 export type DriverName = "native" | "openrouter" | "stub";
 
+/**
+ * A bearer credential: fixed, or fetched before every request so it can be refreshed or
+ * rotated (F4: credential providers; later account tokens).
+ */
+export type ApiKey = string | (() => string | Promise<string>);
+
+export async function resolveApiKey(key: ApiKey): Promise<string> {
+  return typeof key === "string" ? key : key();
+}
+
 /** Wire capabilities are booleans; the SDK reports how each one is provided (§5). */
 export type CapabilityState = "supported" | "emulated" | "unsupported";
 export type Capabilities = Record<CapabilityName, CapabilityState>;

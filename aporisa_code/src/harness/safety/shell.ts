@@ -7,6 +7,8 @@
 export interface ParsedCommand {
   /** Simple commands (argv) separated by |, ||, &&, ;, & or newlines. */
   segments: string[][];
+  /** The operator after each segment but the last (`|`, `&&`, `||`, `;`, `&`, `|&` or newline). */
+  separators: string[];
   /**
    * True when the text uses nothing beyond words, quotes and control operators: no
    * expansions ($, backticks), redirections, subshells or groups, globs, comments,
@@ -21,6 +23,7 @@ const COMPLEX = new Set(["<", ">", "(", ")", "`", "{", "}"]);
 
 export function parseCommand(text: string): ParsedCommand {
   const segments: string[][] = [];
+  const separators: string[] = [];
   let current: string[] = [];
   let word = "";
   let inWord = false;
@@ -30,9 +33,14 @@ export function parseCommand(text: string): ParsedCommand {
     word = "";
     inWord = false;
   };
-  const endSegment = () => {
+  const endSegment = (separator?: string) => {
     endWord();
-    if (current.length > 0) segments.push(current);
+    if (current.length > 0) {
+      segments.push(current);
+      if (separator !== undefined) separators.push(separator);
+    } else if (separator !== undefined && separators.length > 0) {
+      separators[separators.length - 1] = separator;
+    }
     current = [];
   };
 
@@ -86,9 +94,13 @@ export function parseCommand(text: string): ParsedCommand {
     if (OPERATOR_START.has(char)) {
       // &&, ||, |, |&, ;, ;;, &, newline: all separate commands.
       const next = text[index + 1];
-      if ((char === "&" || char === "|") && (next === char || (char === "|" && next === "&"))) index += 1;
+      let operator = char;
+      if ((char === "&" || char === "|") && (next === char || (char === "|" && next === "&"))) {
+        operator = char + next;
+        index += 1;
+      }
       if (char === "&" && next === ">") simple = false; // &> redirection
-      endSegment();
+      endSegment(operator);
       continue;
     }
     if (char === "#" && !inWord) {
@@ -106,7 +118,8 @@ export function parseCommand(text: string): ParsedCommand {
     if (char === "=" && current.length === 0 && /^[A-Za-z_][A-Za-z0-9_]*=$/.test(word)) simple = false; // FOO=bar cmd
   }
   endSegment();
-  return { segments, simple };
+  separators.length = Math.max(0, segments.length - 1);
+  return { segments, separators, simple };
 }
 
 function basename(program: string): string {

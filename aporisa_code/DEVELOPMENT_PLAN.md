@@ -4,7 +4,7 @@
 >
 > - 协议合同是 [docs/protocol.md](../docs/protocol.md)。harness 只通过 SDK 使用合同；需要改合同时，按合同第 13 节的流程进行。
 > - 设计参考以 openai/codex 为主（只读克隆在 Studio 的 `~/Personal/references/codex`，本文引用的源码位置基于 HEAD `a933dd77`，路径相对于 `codex-rs/`）。刻意偏离 codex 的地方，在第 2 节和相关小节写明原因。
-> - 状态（2026-10-02）：**F2、F3 完成**。F3 的真实验收 11/11 通过（docs/validation.md）。交互模式的真人测试推迟到 F4 之后（用户决定）。下一阶段 F4 等用户明确开始。
+> - 状态（2026-10-02）：**F2、F3 完成**。F3 的真实验收 11/11 通过（docs/validation.md）。**F4（含 F4.5）完成**：用户简单验收，认为达到 MVP 预期。长期打磨的已知事项见第 11 节。
 
 ## 1. 目标与阶段
 
@@ -16,7 +16,7 @@ harness core 是项目的核心价值。F2 到 F4 的目标是：在本地后端
 | F1 | SDK、mock、stub driver、wire 层一致性测试 | 完成（`3f58fd8`）；W01–W30 对真实后端全部通过 |
 | **F2** | **无界面 agent loop，直接对接本地后端**：host 层、工具、回合循环、会话持久化、CLI | 本文第 3–8 节 |
 | F3 | 执行安全：沙箱（macOS Seatbelt）、权限策略、审批 | 完成：真实验收 11/11（第 9 节） |
-| F4 | Electron UI MVP；之前定 L3（harness ↔ UI）合同；`frontend.sh dev/build/install` | 未开始；从这里开始日常自用 |
+| F4 | Electron UI MVP；L3（harness ↔ UI）合同；`frontend.sh dev/build/install` | 完成（第 10 节），用户验收达到 MVP 预期；从这里开始日常自用 |
 | F5 | OpenRouter 兼容 driver（含图片映射） | 未开始 |
 | F6 | 上下文管理：token 账本、可插拔策略 | 未开始 |
 | F7 | 评估流水线 | 未开始 |
@@ -273,17 +273,129 @@ harness 对外的事件（F4 之前不冻结）：`thread.started`、`turn.start
 - 命令行交互模式（审批提问、`a` 记住、Ctrl-C）的真人测试：用户决定推迟到 F4 完成之后，通过界面一起验收；在此之前只运行无交互的测试。
 - 结果（2026-10-02）：11/11 通过；F2 的 8 个任务在沙箱里没有触发任何审批；F3 的 3 个任务各经过一次越权审批，其中两个先撞墙再按提示申请，`git-commit` 根据权限说明直接申请。
 
-## 10. 留给后续阶段的事
+## 10. F4：Electron UI MVP（2026-10-02 完成，用户验收达到 MVP 预期）
 
-- F4：L3 合同定稿；会话列表与恢复；是否先加最简单的压缩；图片粘贴与拖入；审批的界面交互；补上推迟的真人交互验收（审批、本会话允许、取消）。
+> 来源说明：界面风格以用户提供的 ChatGPT.app 截图和用户的决定为准。ChatGPT.app 是闭源的，**不等同于**开源的 openai/codex 仓库；本节界面部分不引用 codex 作为依据。codex 仓库只作为 harness 逻辑与协议（L3 合同的形状、上下文压缩）的参考。
+
+### 10.1 范围与边界
+
+- **做**：单用户、无登录；连接本地后端（固定 key，钥匙串加密）；会话列表与会话视图；设置界面；英文（默认）与简体中文；浅色 / 深色 / 跟随系统；基础的上下文压缩；`frontend.sh dev / build / install / uninstall`。
+- **不做，但留接口**：账号登录（以后的形态类似 ChatGPT、Claude 的桌面 app：登录后看到自己的本地会话和偏好，同时用个人凭证访问后端，需要一个独立的账号服务；推理后端保持无状态）；数据库（以后只作索引，JSONL 仍是会话的原始记录）；多个连接（F5 的 OpenRouter 会用到）。
+- **不做，也不留接口**：跨设备同步会话（用户明确不需要：会话只在本机，工作目录是本地文件夹）；回合中追加指令（steer）、完整的 diff 视图、多窗口、系统通知、MCP、代码语法高亮。
+- 推迟到 F4 结束时由用户一起验收的真人交互：F2 / F3 的审批提问、「本会话允许」、取消，改在界面上进行。
+
+### 10.2 决定（用户 2026-10-02 确认）
+
+| # | 决定 |
+| --- | --- |
+| FD-13 | agent 可以直接安装依赖（`npm install --save-exact`，更新 lockfile）：electron、react、react-dom、vite、@vitejs/plugin-react、esbuild、react-markdown、remark-gfm、@electron/packager、lucide-react（图标）、@types/react 等，版本精确锁定 |
+| FD-14 | 界面用 React；渲染进程由 Vite 构建，主进程和 preload 由 esbuild 打包 |
+| FD-15 | L3 合同放在新的顶层模块 `src/app-protocol/`，文档 `docs/app-protocol.md`；更新 AGENTS.md 的文档清单和 `check-boundaries.ts` 的规则；传输为 Electron IPC |
+| FD-16 | 后端 key 用 Electron `safeStorage`（系统钥匙串）加密后存进数据目录；开发模式下没有配置时退回读 `aporisa_code/.env`；渲染进程永远拿不到凭据（只能写入，读到的只有「已配置」和末四位） |
+| FD-17 | 基础的上下文压缩，能用即可（10.5）；以后单独优化，F6 再做成可插拔的策略 |
+| FD-18 | 打包用 `@electron/packager`，ad-hoc 签名用系统的 `codesign -s -` |
+| FD-19 | 界面多语言：默认英文，设置里可切换为简体中文；自写类型化的字典模块，不引入 i18n 库。L3 只传结构化数据，句子由界面按语言拼出；给模型看的文字（工具结果、权限说明）和日志保持英文 |
+| FD-20 | 设置界面（MVP 保持简洁）六项：语言、外观（跟随系统 / 浅色 / 深色）、连接（后端地址、API key、测试连接）、新会话的推理档位、新会话的权限（沙箱、审批、网络）、关于（版本、数据目录） |
+| FD-21 | 回车发送、Shift+回车换行，固定行为、不做设置项；输入法组字（IME composition）期间的回车不发送 |
+| FD-22 | 会话放在 `数据目录/profiles/local/sessions/`，为以后的多账号留位置；之前 F2 / F3 验收留在 `数据目录/sessions/` 的测试会话不迁移 |
+| FD-23 | 设置分两份并带版本号：设备级（语言、外观、连接）在 `数据目录/settings.json`，账号级（新会话默认值等偏好）在 `profiles/local/preferences.json`，经 `SettingsStore` 接口读写 |
+| FD-24 | 凭据经「凭据提供者」取得（MVP 只有钥匙串里的固定 key）；SDK 的 native driver 改为也能接受每次请求时取凭据的函数；设置里的连接写成列表（MVP 只有一项）；L3 的 `initialize` 返回合同版本，以后的 `account/*` 等只做加法 |
+
+### 10.3 架构
+
+- **主进程**：应用服务端，承载 harness（每个会话一个 Thread、一个 SDK 客户端、一个进程管理器）、设置与凭据、会话索引（MVP 扫描 JSONL）。
+- **preload**：只暴露 `request(method, params)`、`onNotification`、`onServerRequest` / `respond` 几个函数（contextBridge）。
+- **渲染进程**：只经桥通信；`contextIsolation`、`sandbox`、严格 CSP，不加载远程内容；Markdown 不经 innerHTML。
+- **L3 合同**（形状参照 codex app-server v2 的子集）：
+  - UI → 主进程的请求：`initialize`、`model/list`、`thread/start`（选工作目录）、`thread/resume`、`thread/list`、`thread/read`、`thread/settings/update`（推理档位、沙箱、审批、网络）、`thread/compact`、`turn/start`（文字 + 图片）、`turn/interrupt`、`settings/read`、`settings/update`、`connection/test`。
+  - 主进程 → UI 的通知：`thread/started`、`turn/started`、`item/started`、`item/*/delta`、`item/completed`、`turn/plan/updated`、`thread/tokenUsage/updated`、`thread/compacted`、`turn/completed`。
+  - 主进程 → UI 的请求：命令审批、补丁审批，回答为 accept / acceptForSession / decline（对应 F3 的三种决定）。
+  - item（结构化，供界面渲染）：用户消息；agent 消息（文本、过程说明还是最终回答）；思考（原文、耗时）；命令执行（命令、工作目录、**归类**、状态、退出码、耗时、是否在沙箱外、给界面的输出：去掉给模型的头部，超长截断并注明）；文件修改（文件列表、补丁原文）；计划；图片查看；上下文压缩。回合带开始和结束时间。
+- **实现时的调整**（定稿以 [docs/app-protocol.md](../docs/app-protocol.md) 为准）：名字按本项目简化：`thread/read` 合并进 `thread/resume`（返回回合）；用量通知为 `thread/contextUsage`；delta 统一为 `item/delta`（带 `kind`）；计划作为 `plan` item 而不是单独的通知；压缩作为 `compaction` item；审批的回答沿用 F3 的 `approved` / `approved_for_session` / `denied`。另加 `dialog/selectFolder`、`shell/reveal` 和菜单用的 `app/command` 通知。**L3 不导出 JSON Schema、不做漂移测试**：两端都在同一次构建里从同一份 TS 类型编译，不存在两份定义；跨进程边界的请求参数由 zod 在主进程校验（`schema.ts`）。这和 L1（后端是 Python，所以需要提交的 schema 和漂移测试）不同。
+- **命令归类**放在 harness（CLI 和评估也能用）：复用 F3 的切分器，跳过 `cd 路径 &&` 前缀；`cat`、`sed -n`、`head`、`tail`、`nl` 归为读文件（带文件名），`rg`、`grep`、`find` 归为搜索（带搜索词和路径），`ls` 归为列目录，其余归为运行命令。认不出时退回「运行命令」，只影响摘要的细致程度。codex 有同类的 `parse_command`（协议里的 `ParsedCommand`：Read / ListFiles / Search / Unknown），这里是简化版。
+
+### 10.4 界面规格
+
+- **布局**：左侧会话列表（标题取第一条用户消息，按最近更新排序，新建会话时用系统的文件夹选择框选工作目录）；右侧会话视图；顶栏显示工作目录、推理档位、权限（沙箱 / 审批 / 网络）、上下文用量（已用 token / 窗口）、手动压缩。
+- **回合的显示**（按用户提供的 ChatGPT.app 截图）：
+  - 回答上方一行「Worked for 7m 59s」加箭头，控制整个过程的展开和收起；收起时只看到这一行和最终回答。
+  - 过程里按顺序穿插：模型的过程说明（commentary 消息）；「Thought for 12s」思考行（默认收起，点开显示原文，**默认不展示思考**）；活动摘要行（相邻的工具调用合并成一行，如「Read files, ran commands」，配图标）。
+  - 点开活动摘要，逐条列出：「Ran …」（命令单行显示、过长时省略号截断）、「Read 文件名」、「Searched for … in …」、「Edited 文件名」。
+  - 点开某条命令，显示 Shell 面板：`$ 命令` 和输出，最大高度固定，超出时面板内部滚动，带复制按钮；补丁显示为按 `+` / `-` 着色的原文。
+  - 运行中过程保持展开、实时更新，结束后自动收起（这是 agent 的建议，不是从截图或 codex 得来的依据）；用户中途手动展开或收起过的，保留用户的选择。
+  - 待审批的卡片固定显示在过程下方，不受折叠影响：显示原因、模型给的理由、命令或文件，以及三个按钮。
+  - 没有最终回答的回合（失败、中断）：过程保持展开，末尾显示错误或「已中断」。
+- **输入框**：多行文本，回车发送、Shift+回车换行、组字期间不发送；粘贴或拖入图片（PNG / JPEG）；运行中显示中断按钮。
+- **最终回答**：Markdown（GFM），行内代码与代码块用等宽字体；文件路径以后再做成可点击。
+- **设置**：FD-20 的六项；外观即时生效；语言即时切换。
+
+### 10.5 基础的上下文压缩（FD-17）
+
+参照 codex 的 `core/src/compact.rs` 和 `prompts/templates/compact/`：
+
+- **触发**：请求前估算的输入 token 达到阈值时自动压缩；阈值 = min(模型的 `auto_compact_token_limit`（未给出时为窗口的 90%，codex 的规则），可发送上限的 90%)。本地后端的阈值约为 194K。另有手动压缩（顶栏按钮、`thread/compact`）。
+- **做法**：把当前历史加一条压缩指令（codex 的交接摘要提示词）发给模型，得到摘要；新历史 = 会话开头的固定内容（环境、权限说明、AGENTS.md）+ 最近的用户消息（从新往旧取，最多约 20K token，codex 的 `COMPACT_USER_MESSAGE_MAX_TOKENS`）+ 一条以 codex 的摘要开头语引出的摘要消息。推理档位的基线改为当前档位。
+- **代价**：压缩之后前缀缓存从头失效，下一次请求要重新预填充；这是 F6 要研究的取舍，F4 只求能用。
+- **记录**：会话记录写入 `compacted` 行（新历史的完整内容），恢复会话时从最后一次压缩开始重建；完整的旧轨迹仍然保留在文件里，供 F6 回放。
+- 回合进行中触发时，在两次请求之间压缩，压缩结束后继续当前回合。
+
+### 10.6 工程
+
+- 新增 `src/app-protocol/`（zod 合同，可导出 schema）、`src/main/`、`src/preload/`、`src/ui/`；构建产物在 `aporisa_code/dist/`（不进 Git）。
+- `frontend.sh`：`dev` 前台启动开发模式（Vite 热更新 + Electron）；`build` 离线打包出 `Aporisa Code.app` 并 ad-hoc 签名；`install` / `uninstall` 放进或移出 `~/Applications`；`doctor` 增加 Electron 二进制的检查。
+- 数据目录的路径集中在一处：数据目录由 host 的 `info().dataDir` 给出，`profiles/<id>` 和会话目录由 `src/harness/store.ts` 的 `profileDir` / `defaultSessionsDir` 推出，设置和凭据只接收数据目录。
+- Electron 的二进制和发布压缩包由 `prepare` 显式安装（npm 11 不运行依赖的安装脚本），压缩包缓存在项目的 `.cache/electron/`，`build` 离线使用并先核对 SHA256（`tools/electron-zip.ts`、`tools/package-app.ts`）。
+- 从访达启动的 app 只有 launchd 的精简环境：主进程启动时用登录 shell 取一次环境变量（`src/main/shell-env.ts`），供命令使用。这是实现中补充的。
+
+### 10.7 测试与验收
+
+- 确定性（`check.sh frontend`）：L3 合同的 schema 与漂移测试；主进程应用服务端用 stub driver 无界面测试（请求、通知、审批往返、设置、会话列表、恢复）；界面的状态逻辑（过程分组、折叠状态、流式更新）写成纯 TS 并单独测试；命令归类；字典两种语言的键完全一致；压缩的触发与新历史的构成；设置的版本迁移。
+- agent 的界面检查：用 Vite 把渲染进程单独开在内置浏览器里，背后接一个假的桥，用来截图、对照用户给的截图（只用于开发检查，不是产品模式）。
+- 用户的验收（F4 结束时）：`./frontend.sh build && ./frontend.sh install`，在 app 里按清单走一遍，包括 F2 / F3 推迟的真人交互（审批、本会话允许、中断）、语言和外观切换、图片、压缩；`npm run agent-tasks` 仍然 11/11。
+
+### 10.8 步骤
+
+1. F4.1 L3 合同、主进程的应用服务端、命令归类、设置与凭据、会话索引、`profiles/local` 路径；无界面测试。
+2. F4.2 Electron 外壳：窗口、preload 桥、安全设置、`frontend.sh dev / build / install / uninstall`。
+3. F4.3 界面：布局、回合显示、审批、输入框、设置、多语言、深浅色。
+4. F4.4 基础的上下文压缩。
+5. 收尾、文档，交给用户验收。
+
+和 F2、F3 一样连续完成，只在需要用户决策或运行权限外的命令时停下。
+
+### 10.9 F4.5：项目与对话（2026-10-02 用户提出，同日确认）
+
+用户试用后提出：左侧做成「项目 → 对话」两级，对话可以删除，项目可以移除；「项目」和「文件夹」分开，一个项目有一个主文件夹和若干参考文件夹；可以开不属于任何项目的对话；界面上放产品名。
+
+| # | 决定 |
+| --- | --- |
+| FD-25 | 参考文件夹是**软只读**：写在环境说明里并注明不要修改；除此之外和工作目录之外的任何路径一样（沙箱里不可写，越权写入要用户批准）。不做额外的强制拒绝 |
+| FD-26 | 删除对话 = 把会话记录移到系统废纸篓（不是归档）；不使用项目的对话，私有工作目录一并移走 |
+| FD-27 | 移除项目只删项目记录；它的对话移到「对话」分组（不属于任何项目，也不再有参考文件夹），磁盘上的文件夹不受影响 |
+| FD-28 | 不使用项目的对话各有一个私有工作目录，在 `~/Library/Caches/Aporisa Code/scratch/<id>/`（数据目录被沙箱禁读，所以不放在那里） |
+| FD-29 | 界面里 thread 改叫 Chat（中文「对话」）；L3 仍叫 thread。MVP 不做 app 图标 |
+
+agent 的建议、用户未反对的：对话在发出第一条消息时才创建；主文件夹创建后不可改；AGENTS.md 只读取主文件夹的；项目功能之前的会话（以及命令行的会话）按工作目录归到主文件夹相同的项目；CLI 增加 `--reference`。
+
+实现：harness 的 `references` / `setReferences` 和环境更新（`context` 行）；压缩后重新说明与开头不一致的权限和参考文件夹；`src/main/projects.ts`；L3 新增 `project/*`、`thread/delete`，`thread/start` 改为 `projectId`；侧边栏、新建对话视图（项目选择器）、项目设置对话框、确认对话框。
+
+## 11. 留给后续阶段的事
+
+- **长期打磨（F4 之后，与 F5 起的阶段并行）**：用户验收 MVP 时指出，界面流畅度、细节处理和生产稳定性还不够，需要进一步测试。方式：用户日常使用中发现问题并反馈，agent 分析原因、提出优化方案，确认后再改；每个问题修复时补上能复现它的测试（确定性测试，或打包 app 的检查）。已知事项：
+  - **回合结束后仍显示「运行中」**（用户验收截图中，回合已结束而输入框仍是停止按钮；agent 读代码确认了原因，尚未修复）：harness 先发出 `turn.completed`，等会话记录写完才把 `busy` 置回 false；主进程在 `turn.completed` 时补发的 `thread/updated` 读到的仍是 `running: true`，覆盖了 `turn/completed` 已经设好的状态。`turn/start` 在启动回合之后才发 `running: true`，极快的回合也可能出现同样的问题。修法：两处都显式给出运行状态，并加一个测试。
+  - 尚未在真实 app 里逐项回报的验收清单（docs/validation.md 的 F4「尚未验证」）照常在使用中覆盖。
+
 - F5：OpenRouter driver，录制回放。
 - F6：上下文管理策略（压缩、工具输出裁剪、推理保留多少），以及「省 token」与「保住前缀缓存」之间的取舍。
 - 待需要时：PTY、`apply_patch` 的 shell heredoc 形式、MCP、子 agent、持久化的命令规则（codex 的 execpolicy）、只开网络的细粒度越权（codex 的 `with_additional_permissions`）。
 
-## 11. 变更记录
+## 12. 变更记录
 
+- **2026-10-02**：用户安装后首轮试用发现两个问题并已修复：所有 IPC 请求被拒（`untrusted sender`，可信地址没有按 file URL 编码）、按钮悬停颜色（通用悬停规则的优先级高于各变体）。之后按用户要求加入 F4.5（10.9）。
+- **2026-10-02**：F4 代码完成（第 10 节）。实现中的调整见 10.3 的「实现时的调整」和 10.6；界面检查中修复了回合完成时内容被清空、单个文件的补丁显示了整个补丁两处问题；打包启动检查发现 preload 在沙箱里无法加载并修复（docs/validation.md）。真人验收等用户进行。
 - **2026-10-01**：初稿。阶段顺序、工具集、会话存放位置、本文位置由用户确定；FD-05 到 FD-08 待用户决定。
 - **2026-10-01**：用户采纳 FD-05 到 FD-08，开始 F2.1。
+- **2026-10-02**：F4 计划（第 10 节）：用户确认 MVP 边界与 FD-13 至 FD-24；界面风格以用户提供的 ChatGPT.app 截图为准（闭源，与 codex 仓库不等同）。F4 等用户明确开始。
 - **2026-10-02**：用户运行 F2 + F3 真实验收，11/11 通过。用户决定真人交互测试推迟到 UI 完成之后，此前只运行无交互的测试。
 - **2026-10-01**：F3 代码完成（第 9 节）。实现中的取舍：沿用 codex 在 `on-request` 下不自动重试、只提示申请的做法（`untrusted` 才询问是否在沙箱外重跑）；额外放行 `com.apple.bsd.dirhelper`；「本会话允许」的前缀只对 git、npm 这类工具取子命令；新增 `tmpWritable` 选项（codex 的 exclude 开关，测试中用于构造工作区外的位置）。
 - **2026-10-01**：用户运行真实验收，8/8 通过。按结果修订：FD-08 在没有完成的工具调用时丢弃失败响应的 item、原样重发（`rename` 任务中保留它们让前缀缓存漏掉 640 token）；验收指标的「首事件」（`response.created`，后端收到请求立即发出）改为首个输出 item 的时间；系统指令补充 macOS 的 BSD 命令行和「没有读文件工具」两句（模型用过 `cat -A`、调用过不存在的 `read_file`）。F3 的默认值按用户采纳的建议（见第 9 节），F3 等用户明确开始。

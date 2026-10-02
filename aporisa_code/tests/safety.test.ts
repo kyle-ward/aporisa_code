@@ -48,6 +48,7 @@ describe("command splitting", () => {
   it("splits at control operators and keeps quoted words intact", () => {
     expect(parseCommand("git status && npm test | tee out; echo 'a b' \"c d\" & ls\nwc -l")).toEqual({
       segments: [["git", "status"], ["npm", "test"], ["tee", "out"], ["echo", "a b", "c d"], ["ls"], ["wc", "-l"]],
+      separators: ["&&", "|", ";", "&", "\n"],
       simple: true,
     });
     expect(parseCommand("echo a\\ b || true").segments).toEqual([["echo", "a b"], ["true"]]);

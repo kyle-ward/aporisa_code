@@ -73,6 +73,6 @@ export const applyPatchTool: ToolHandler = {
       }
     }
     await commitPatch(plan, context.host.fs);
-    return { output: summarize(plan.changes), success: true, details: { kind: "patch", changes: plan.changes } };
+    return { output: summarize(plan.changes), success: true, details: { kind: "patch", changes: plan.changes, patch: args.input as string } };
   },
 };

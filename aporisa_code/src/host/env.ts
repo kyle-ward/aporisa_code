@@ -1,12 +1,16 @@
 // aporisa_code/.env: deployment differences only (AGENTS.md; DEVELOPMENT_PLAN.md FD-12).
-// Variables already set in the environment win over the file.
+// Variables already set in the environment win over the file. The packaged app does not
+// read it; the CLI, the user-run tools and the app's development mode do.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 export const ENV_KEYS = ["APORISA_BASE_URL", "APORISA_API_KEY", "APORISA_MODEL", "OPENROUTER_API_KEY"] as const;
 export type EnvKey = (typeof ENV_KEYS)[number];
 
-export const ENV_FILE = fileURLToPath(new URL("../../.env", import.meta.url));
+/** aporisa_code/.env, resolved from this module (computed on use: bundles have no import.meta.url). */
+export function defaultEnvFile(): string {
+  return fileURLToPath(new URL("../../.env", import.meta.url));
+}
 
 /** Parses KEY=VALUE lines; `#` comments and blank lines are skipped, quotes stripped. */
 export function parseEnv(text: string): Record<string, string> {
@@ -25,7 +29,7 @@ export function parseEnv(text: string): Record<string, string> {
 }
 
 /** Known keys from the process environment, falling back to the .env file. Unknown keys are rejected. */
-export function loadEnv(path = ENV_FILE, environment: NodeJS.ProcessEnv = process.env): Partial<Record<EnvKey, string>> {
+export function loadEnv(path = defaultEnvFile(), environment: NodeJS.ProcessEnv = process.env): Partial<Record<EnvKey, string>> {
   let file: Record<string, string> = {};
   try {
     file = parseEnv(readFileSync(path, "utf8"));

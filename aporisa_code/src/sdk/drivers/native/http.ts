@@ -14,16 +14,17 @@ import {
   AporisaTransportError,
 } from "../../errors.ts";
 import { decodeSse, sseToJson } from "../../sse.ts";
+import { resolveApiKey, type ApiKey } from "../../types.ts";
 
 export interface HttpTransportOptions {
   baseUrl: string;
-  apiKey: string;
+  apiKey: ApiKey;
   fetch?: typeof fetch;
 }
 
 export class HttpTransport {
   private readonly baseUrl: string;
-  private readonly apiKey: string;
+  private readonly apiKey: ApiKey;
   private readonly fetchImpl: typeof fetch;
 
   constructor(options: HttpTransportOptions) {
@@ -101,7 +102,7 @@ export class HttpTransport {
       response = await this.fetchImpl(`${this.baseUrl}${path}`, {
         method,
         headers: {
-          authorization: `Bearer ${this.apiKey}`,
+          authorization: `Bearer ${await resolveApiKey(this.apiKey)}`,
           accept,
           ...(payload === undefined ? {} : { "content-type": "application/json" }),
         },

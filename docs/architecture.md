@@ -2,7 +2,7 @@
 
 本文描述 Aporisa Code 各部分的职责划分、进程模型和内部接口。公共协议只在 [protocol.md](protocol.md) 定义，这里只引用；已验证的事实见 [validation.md](validation.md)。
 
-> 状态（2026-10-01）：后端 v0（B0–B2）完成；本文描述的是 B1 的实现加上 B2 的投机解码、结构化输出、SSD 会话缓存、图片输入和调优，均已在真实模型上验收（validation.md）。前端 F2 已完成（harness core、host 层、命令行，真实任务验收通过）；F3（执行安全）已完成，真实任务验收通过；UI（F4）尚未开始。计划见 `aporisa_code/DEVELOPMENT_PLAN.md`。
+> 状态（2026-10-02）：后端 v0（B0–B2）完成；本文描述的是 B1 的实现加上 B2 的投机解码、结构化输出、SSD 会话缓存、图片输入和调优，均已在真实模型上验收（validation.md）。前端 F2 已完成（harness core、host 层、命令行，真实任务验收通过）；F3（执行安全）已完成，真实任务验收通过；F4（Electron app MVP，含项目与对话）已完成，用户验收达到 MVP 预期。计划见 `aporisa_code/DEVELOPMENT_PLAN.md`。
 
 ## 1. 三块与边界
 
@@ -23,10 +23,20 @@ harness（F2）以 codex 为蓝本，决策记录见前端开发计划（FD-01 �
 - **Thread**：一个会话对应一个 SDK 客户端（WebSocket 续接按连接保持）。请求的 `instructions`、`tools`、`prompt_cache_key`（会话 id）、`reasoning` 基线，以及开头的环境上下文和 AGENTS.md，在整个会话中不变；历史只在尾部追加，换档追加 `configuration_update`。会话开始时预热固定部分。这些规则是为了保住后端的前缀缓存：真实验收中，每次请求都命中上一次请求的全部输入和输出（只差回合结尾的 1 个换行 token）。
 - **回合**：工具调用在各自的 item 完成时开始执行（并行工具同时执行，其余独占），结果按调用顺序写回；输出里没有工具调用时回合结束；每回合最多 200 次请求。`tool_call_invalid` 再请求一次：没有完成的工具调用时丢弃失败响应的 item 原样重发，否则保留 item 和工具结果（后端会把连续的 assistant item 合并渲染，保留不带工具调用的输出会改变历史的渲染）。取消时结束本会话的全部进程，并补齐缺失的工具结果。
 - **工具**：`exec_command` / `write_stdin`（管道，非 PTY；主进程退出时结束整个进程组）、`apply_patch`（function 工具，补丁全部匹配才写盘）、`view_image`（PNG / JPEG）、`update_plan`。未知工具和错误参数作为工具结果交给模型。工具输出按模型的 `truncation_policy` 截断后进入历史，会话记录保留截断前的内容。
-- **上下文**：F2 只做 baseline：请求前按上一次 usage 加新增内容估算，超出有效窗口就不发送；压缩与裁剪属于 F6。
-- **会话记录**：`~/Library/Application Support/Aporisa Code/sessions/` 下每个会话一个 JSONL（目录 0700、文件 0600），可恢复；恢复时按 codex 的规则补齐缺失的工具结果。
-- **事件**：harness 对外只输出事件（thread / turn / item / tool / approval / response.completed / warning），命令行是第一个消费者；F4 之前定稿为 L3 合同。
+- **上下文**：请求前按上一次 usage 加新增内容估算，超出有效窗口就不发送。F4 加了基础的压缩（codex 的做法）：估算达到阈值（min(模型的 `auto_compact_token_limit`，未给出时为窗口的 90%；可发送上限的 90%)）时，在两次请求之间让模型写一份交接摘要，新历史 = 会话开头的固定内容 + 最近约 20K token 的用户消息 + 摘要；也可以手动压缩。压缩会丢掉开头之后追加的说明，所以压缩后，与开头不一致的权限设置和参考文件夹会重新说明一次。压缩后前缀缓存从头失效，更好的策略属于 F6。
+- **参考文件夹**（F4.5）：Thread 可以带一组参考文件夹，它们和工作目录一起写在开头的环境说明里，注明「只读参考，不要修改」。除此之外它们和工作目录之外的任何路径一样：沙箱里可读、不可写，越权写入要用户批准（FD-25，软只读）。会话中途改变时，在下一轮开头追加一条环境说明（codex 在回合上下文变化时也是追加环境说明），会话记录写一条 `context` 行。AGENTS.md 只读取工作目录的，不读参考文件夹的。
+- **会话记录**：`~/Library/Application Support/Aporisa Code/profiles/local/sessions/` 下每个会话一个 JSONL（目录 0700、文件 0600），可恢复；恢复时按 codex 的规则补齐缺失的工具结果，有 `compacted` 行时从最后一次压缩重建。`profiles/local` 为以后的多账号留位置（FD-22）；F2 / F3 时期写在 `数据目录/sessions/` 的测试会话不迁移。
+- **事件**：harness 对外只输出事件（thread / turn / item / tool / approval / response.completed / warning），消费者是命令行和桌面 app 的主进程（F4 加了 safety.changed、compaction.started / completed）。harness 事件是内部接口；app 的界面看到的是投影之后的 L3（[app-protocol.md](app-protocol.md)）。
 - harness 只通过 host 接口接触文件系统和进程，不能使用 Node 内置模块。
+
+桌面 app（F4，前端开发计划第 10 节）：
+
+- **进程**：主进程是 app 的服务端，承载 harness（每个打开的会话一个 Thread 和一个 SDK 客户端）、设置、凭据和会话列表（MVP 扫描 JSONL）；渲染进程是 React 界面，`contextIsolation`、`sandbox`、严格 CSP，不加载远程内容，Markdown 不经 innerHTML；preload 只暴露 `window.aporisa` 的四个函数。两者之间的合同是 [app-protocol.md](app-protocol.md)（L3），由 Electron IPC 传输，主进程用 zod 校验每个请求。
+- **投影**：harness 事件在主进程里投影成 L3 的 item 和回合（`src/main/projection.ts`）；恢复会话时，从会话记录的行重建同样的回合。界面只做显示：回合的过程（commentary、思考、合并后的活动行）放在「Worked for …」之后，运行中展开、完成后收起，失败或中断时保持展开（`src/ui/state/turn-layout.ts`）。
+- **项目与对话**（F4.5）：项目是 app 层的分组，harness 只看到工作目录和参考文件夹。项目 = 名称 + 一个主文件夹（对话的工作目录，创建后不变）+ 若干参考文件夹，存在账号级的 `profiles/local/projects.json`。每个对话在会话记录开头记下所属项目的 id；移除项目只删项目记录，它的对话变为不属于任何项目（FD-27），文件夹不受影响。不使用项目的对话各有一个私有工作目录，放在 `~/Library/Caches/Aporisa Code/scratch/<id>/`：它不能放进数据目录，因为沙箱禁止命令读取数据目录（FD-28）。删除对话是把会话记录（和私有工作目录）移到废纸篓（FD-26）。对话在发出第一条消息时才创建，所以列表里不会出现空对话。
+- **数据目录**：`~/Library/Application Support/Aporisa Code/`：设备级设置 `settings.json`（语言、外观、连接），账号级偏好 `profiles/local/preferences.json`（新对话默认值）和项目 `profiles/local/projects.json`，都带版本号；加密后的 key 在 `credentials.json`（0600，`safeStorage`）；Chromium 自己的数据在 `Electron/`。
+- **凭据**：key 只在主进程里，SDK 每次请求时向凭据提供者取；开发模式没有存储的 key 时读 `aporisa_code/.env`。
+- **环境**：从访达启动的 app 只有 launchd 的精简 PATH，主进程启动时用登录 shell（`$SHELL -ilc`）取一次环境变量，交给 harness 运行命令时使用；开发模式直接继承终端的环境。
 
 执行安全（F3，前端开发计划第 9 节）以 codex 为蓝本：
 

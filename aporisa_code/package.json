@@ -1,6 +1,6 @@
 {
   "name": "aporisa-code",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "description": "Aporisa Code: local agent app (harness core, Aporisa SDK and Electron shell).",
   "type": "module",
@@ -8,22 +8,38 @@
     "node": "24.21.0"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.ui.json",
     "boundaries": "node tools/check-boundaries.ts",
     "test": "vitest run",
     "schema:export": "node tools/export-schema.ts",
     "conformance": "node tools/conformance.ts",
     "aporisa": "node src/cli/main.ts",
-    "agent-tasks": "node tools/agent-tasks.ts"
+    "agent-tasks": "node tools/agent-tasks.ts",
+    "build:main": "node tools/build-electron.ts",
+    "build:ui": "vite build --config vite.ui.config.ts",
+    "dev:ui": "vite --config vite.ui.config.ts"
   },
   "dependencies": {
+    "lucide-react": "1.49.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
     "ws": "8.22.0",
     "zod": "4.6.5"
   },
   "devDependencies": {
+    "@electron/get": "5.1.0",
+    "@electron/packager": "20.3.0",
     "@types/node": "24.19.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
     "@types/ws": "8.18.1",
+    "@vitejs/plugin-react": "6.1.1",
+    "electron": "44.5.1",
+    "esbuild": "0.28.2",
     "typescript": "7.0.2",
+    "vite": "8.3.2",
     "vitest": "5.0.2"
   }
 }

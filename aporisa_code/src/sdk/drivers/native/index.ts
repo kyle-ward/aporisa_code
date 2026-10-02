@@ -11,6 +11,7 @@ import { AporisaRequestError } from "../../errors.ts";
 import { ResponseStream, type ResponseStreamSource } from "../../response-stream.ts";
 import { defaultSleep, withPreStreamRetry, type RetryPolicy } from "../../retry.ts";
 import type {
+  ApiKey,
   AporisaClient,
   CallOptions,
   Capabilities,
@@ -24,7 +25,8 @@ import { WebSocketTransport, WebSocketUnavailable } from "./websocket.ts";
 
 export interface NativeDriverOptions {
   baseUrl: string;
-  apiKey: string;
+  /** A fixed key, or a function asked before every request (F4). */
+  apiKey: ApiKey;
   /** Preferred transport; WebSocket unless explicitly set to "http". */
   transport?: Transport;
   maxRetries?: number;

@@ -23,16 +23,18 @@ import {
   type Capabilities,
   type ResponseStream,
 } from "../sdk/index.ts";
-import { initialContext, permissionsItem } from "./context.ts";
+import { environmentUpdate, ENVIRONMENT_CONTEXT_TAG, initialContext, permissionsItem } from "./context.ts";
 import type { ThreadEvent, ThreadListener, TurnFailureCode, TurnOutcome } from "./events.ts";
 import { estimatePromptTokens, estimateTokens, inputTokenLimit, normalizeHistory } from "./history.ts";
-import { BASE_INSTRUCTIONS } from "./instructions.ts";
+import { BASE_INSTRUCTIONS, COMPACT_PROMPT, SUMMARY_PREFIX } from "./instructions.ts";
 import { isAbsolute } from "./paths.ts";
 import { permissionsMessage, resolveSafety, SessionRules, type SafetyOptions, type SafetyPolicy } from "./safety/index.ts";
-import { HARNESS_VERSION, SessionStore, type SessionMeta } from "./store.ts";
+import { defaultSessionsDir, HARNESS_VERSION, SessionStore, type ItemMeta, type SafetySummary, type SessionMeta } from "./store.ts";
 import {
+  approxTokenCount,
   defaultTools,
   ToolRegistry,
+  truncateText,
   truncateToolOutput,
   withAllowance,
   type ApprovalDecision,
@@ -46,6 +48,18 @@ export const DEFAULT_MAX_REQUESTS_PER_TURN = 200;
 export const INTERRUPT_GRACE_MS = 5_000;
 /** Consecutive `tool_call_invalid` failures that are re-sampled before the turn fails (FD-08). */
 export const TOOL_CALL_INVALID_RETRIES = 1;
+/** Recent user messages kept by compaction (codex COMPACT_USER_MESSAGE_MAX_TOKENS). */
+export const COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000;
+
+/**
+ * Input tokens at which a request first compacts the history (DEVELOPMENT_PLAN.md 10.5):
+ * the model's auto_compact_token_limit (90% of the window when absent, codex's rule),
+ * capped at 90% of what a request may carry so the compaction request itself still fits.
+ */
+export function autoCompactThreshold(model: Model, maxOutputTokens: number | undefined): number {
+  const modelLimit = model.auto_compact_token_limit ?? Math.floor(model.context_window * 0.9);
+  return Math.min(modelLimit, Math.floor(inputTokenLimit(model, maxOutputTokens) * 0.9));
+}
 
 export type UserInput = string | readonly (InputTextPart | InputImagePart)[];
 
@@ -53,8 +67,17 @@ export interface ThreadOptions {
   /** One client per thread: a native client holds one WebSocket session (codex). */
   client: AporisaClient;
   host: Host;
-  /** Absolute working directory. */
+  /** Absolute working directory: the only folder the thread writes to without asking. */
   cwd: string;
+  /**
+   * Reference directories (F4.5): absolute folders the model may read for reference. They are
+   * listed in the environment context as read-only; beyond that they are like any path outside
+   * cwd (writing needs approval, FD-25). On resume: the directories wanted now; a difference
+   * from the record is told to the model at the next turn.
+   */
+  references?: string[];
+  /** Stored in the session record for the owning app (F4.5); the harness never reads it. */
+  projectId?: string | null;
   /** Public model alias; default the first model the server lists. */
   model?: string;
   /** Reasoning effort; default the model's default. On resume it acts like setEffort(). */
@@ -74,6 +97,10 @@ export interface ThreadOptions {
   processes?: ProcessManagerOptions;
   /** Subscribed before `thread.started` is emitted. */
   listener?: ThreadListener;
+  /** Where session files go; default <dataDir>/profiles/local/sessions (FD-22). */
+  sessionsDir?: string;
+  /** Compact the history automatically near the context limit (default true; F4 baseline). */
+  autoCompact?: boolean;
   now?: () => Date;
 }
 
@@ -94,6 +121,14 @@ interface SampleResult {
   lastMessage: string | null;
 }
 
+export interface CompactionResult {
+  compacted: boolean;
+  /** Estimated input tokens before and after. */
+  before: number;
+  after: number;
+  error?: string;
+}
+
 interface Resolved {
   client: AporisaClient;
   host: Host;
@@ -107,6 +142,36 @@ interface Resolved {
   safety: SafetyPolicy;
   /** A permissions message to append before the next user message (resume with new settings). */
   pendingPermissions: string | null;
+  initialItemCount: number;
+  references: string[];
+  /** What the opening items say: compaction keeps them, so later changes are told again. */
+  openingReferences: string[];
+  openingSafety: SafetySummary | null;
+}
+
+function sameList(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/**
+ * Real paths of existing directories, without cwd and duplicates. `strict` throws on a
+ * missing or invalid one (thread start); otherwise it is dropped (a folder removed later).
+ */
+async function resolveReferences(fs: Host["fs"], cwd: string, paths: readonly string[], strict: boolean): Promise<{ references: string[]; dropped: string[] }> {
+  const references: string[] = [];
+  const dropped: string[] = [];
+  for (const path of paths) {
+    try {
+      if (!isAbsolute(path)) throw new Error(`reference directory must be absolute: ${path}`);
+      const real = await fs.realpath(path);
+      if ((await fs.stat(real))?.kind !== "directory") throw new Error(`reference directory is not a directory: ${path}`);
+      if (real !== cwd && !references.includes(real)) references.push(real);
+    } catch (error) {
+      if (strict) throw error instanceof Error && error.message.startsWith("reference directory") ? error : new Error(`reference directory not found: ${path}`);
+      dropped.push(path);
+    }
+  }
+  return { references, dropped };
 }
 
 /** Read-write lock in arrival order: parallel tools share it, the others run alone (codex parallel.rs). */
@@ -165,10 +230,16 @@ export class Thread {
   private readonly client: AporisaClient;
   private readonly host: Host;
   private readonly capabilities: Capabilities;
-  private readonly registry: ToolRegistry;
-  readonly safety: SafetyPolicy;
+  private registry: ToolRegistry;
+  private policy: SafetyPolicy;
+  private pendingSafety: SafetyOptions | null = null;
+  private pendingReferences: string[] | null = null;
+  private currentReferences: string[];
+  private readonly openingReferences: string[];
+  private readonly openingSafety: SafetySummary | null;
   private readonly rules = new SessionRules();
   private pendingPermissions: string | null;
+  private readonly initialItemCount: number;
   private readonly processes: ProcessManager;
   private readonly store: SessionStore | null;
   private readonly instructions: string;
@@ -198,10 +269,13 @@ export class Thread {
     this.sessionPath = resolved.store?.path ?? null;
     this.options = options;
     this.instructions = options.instructions ?? BASE_INSTRUCTIONS;
-    this.safety = resolved.safety;
+    this.policy = resolved.safety;
     this.pendingPermissions = resolved.pendingPermissions;
-    const escalation = resolved.safety.sandbox !== "danger-full-access" && resolved.safety.approval !== "never";
-    this.registry = new ToolRegistry(defaultTools(resolved.model, { escalation }));
+    this.initialItemCount = resolved.initialItemCount;
+    this.currentReferences = resolved.references;
+    this.openingReferences = resolved.openingReferences;
+    this.openingSafety = resolved.openingSafety;
+    this.registry = Thread.registryFor(resolved.model, resolved.safety);
     this.processes = resolved.host.openProcessManager(options.processes);
     if (options.listener) this.listeners.add(options.listener);
   }
@@ -218,8 +292,10 @@ export class Thread {
     const id = crypto.randomUUID();
     const info = options.host.info();
     const safety = await resolveSafety(options.safety ?? {}, cwd, options.host.fs, info);
-    const items = await initialContext(cwd, options.host.fs, info, now, permissionsMessage(safety));
+    const { references } = await resolveReferences(options.host.fs, cwd, options.references ?? [], true);
+    const items = await initialContext(cwd, options.host.fs, info, now, permissionsMessage(safety), references);
     const meta: SessionMeta = {
+      initialItemCount: items.length,
       id,
       createdAt: now.toISOString(),
       cwd,
@@ -228,11 +304,33 @@ export class Thread {
       effort,
       harnessVersion: HARNESS_VERSION,
       safety: safetySummary(safety),
+      ...(references.length > 0 ? { references } : {}),
+      ...(options.projectId !== undefined ? { projectId: options.projectId } : {}),
     };
-    const store = options.persist === false ? null : await SessionStore.create(options.host.fs, info.dataDir, meta, now);
+    const sessionsDir = options.sessionsDir ?? defaultSessionsDir(info.dataDir);
+    const store = options.persist === false ? null : await SessionStore.create(options.host.fs, sessionsDir, meta, now);
     for (const item of items) store?.append({ type: "item", payload: { item } });
     const capabilities = await options.client.capabilities(model.id);
-    const thread = new Thread({ client: options.client, host: options.host, model, capabilities, cwd, items, baseline: effort, store, id, safety, pendingPermissions: null }, options);
+    const thread = new Thread(
+      {
+        client: options.client,
+        host: options.host,
+        model,
+        capabilities,
+        cwd,
+        items,
+        baseline: effort,
+        store,
+        id,
+        safety,
+        pendingPermissions: null,
+        initialItemCount: items.length,
+        references,
+        openingReferences: references,
+        openingSafety: safetySummary(safety),
+      },
+      options,
+    );
     thread.emit({ type: "thread.started", threadId: id, model: model.id, cwd, effort, resumed: false, sessionPath: thread.sessionPath, safety: safetySummary(safety) });
     thread.startPrewarm();
     return thread;
@@ -240,7 +338,8 @@ export class Thread {
 
   static async resume(options: ResumeOptions): Promise<Thread> {
     const info = options.host.info();
-    const path = options.session.includes("/") ? options.session : await SessionStore.find(options.host.fs, info.dataDir, options.session);
+    const sessionsDir = options.sessionsDir ?? defaultSessionsDir(info.dataDir);
+    const path = options.session.includes("/") ? options.session : await SessionStore.find(options.host.fs, sessionsDir, options.session);
     if (!path) throw new Error(`no session found for ${options.session}`);
     const loaded = await SessionStore.load(options.host.fs, path);
     const model = await options.client.getModel(loaded.meta.model);
@@ -250,7 +349,7 @@ export class Thread {
     const safety = await resolveSafety(options.safety ?? {}, loaded.meta.cwd, options.host.fs, info);
     // The opening permissions message describes the settings the thread started with; when
     // they differ now, the model is told at the end of the history (the prefix stays intact).
-    const changed = JSON.stringify(loaded.meta.safety ?? null) !== JSON.stringify(safetySummary(safety));
+    const changed = JSON.stringify(loaded.safety) !== JSON.stringify(safetySummary(safety));
     const thread = new Thread(
       {
         client: options.client,
@@ -264,13 +363,69 @@ export class Thread {
         id: loaded.meta.id,
         safety,
         pendingPermissions: changed ? permissionsMessage(safety) : null,
+        initialItemCount: Math.min(loaded.initialItemCount, items.length),
+        references: loaded.references,
+        openingReferences: loaded.meta.references ?? [],
+        openingSafety: loaded.meta.safety ?? null,
       },
       options,
     );
     if (options.effort) thread.setEffort(options.effort);
+    if (options.references !== undefined) thread.setReferences(options.references);
     thread.emit({ type: "thread.started", threadId: thread.id, model: model.id, cwd: thread.cwd, effort: thread.effort, resumed: true, sessionPath: thread.sessionPath, safety: safetySummary(safety) });
     thread.startPrewarm();
     return thread;
+  }
+
+  /** The safety policy in force (a pending change applies at the next turn). */
+  get safety(): SafetyPolicy {
+    return this.policy;
+  }
+
+  /** True while a turn (or a manual compaction) runs. */
+  get busy(): boolean {
+    return this.running;
+  }
+
+  /**
+   * Changes sandbox, approval or network settings from the next turn on. The model is told
+   * with a permissions message at the end of the history; changing whether escalation is
+   * offered changes the tool specs, which costs the prefix cache once.
+   */
+  setSafety(options: SafetyOptions): void {
+    this.pendingSafety = { ...this.pendingSafety, ...options };
+  }
+
+  /** The reference directories in force (a pending change applies at the next turn). */
+  get references(): readonly string[] {
+    return this.currentReferences;
+  }
+
+  /**
+   * Changes the reference directories from the next turn on (F4.5). The model is told with an
+   * environment update at the end of the history; nothing changes when the set is the same.
+   */
+  setReferences(paths: readonly string[]): void {
+    this.pendingReferences = [...paths];
+  }
+
+  /** Compacts the history now (between turns). */
+  async compact(): Promise<CompactionResult> {
+    if (this.closed) throw new Error("the thread is closed");
+    if (this.running) throw new Error("a turn is already running in this thread");
+    this.running = true;
+    try {
+      await this.prewarming;
+      return await this.compactHistory("manual", null, new AbortController().signal);
+    } finally {
+      await this.flushStore();
+      this.running = false;
+    }
+  }
+
+  /** Estimated input tokens of the next request (for a context meter). */
+  async contextTokens(): Promise<number> {
+    return this.estimateInputTokens(this.params());
   }
 
   /** The history the next request will send. */
@@ -308,10 +463,12 @@ export class Thread {
       this.emit({ type: "turn.started", turnId });
       this.store?.append({ type: "turn", payload: { turnId, event: "started" } });
       this.applyPendingEffort(turnId);
+      await this.applyPendingSafety(turnId);
       if (this.pendingPermissions !== null) {
         this.append(permissionsItem(this.pendingPermissions));
         this.pendingPermissions = null;
       }
+      await this.applyPendingReferences(turnId);
       this.append(userMessage(input));
       const outcome = await this.loop(turnId, controller.signal);
       if (outcome.status === "interrupted") await this.processes.terminateAll();
@@ -361,9 +518,46 @@ export class Thread {
     }
   }
 
-  private append(item: InputItem, fullOutput?: string): void {
+  private append(item: InputItem, meta: ItemMeta = {}): void {
     this.history.push(item);
-    this.store?.append({ type: "item", payload: { item, ...(fullOutput !== undefined ? { fullOutput } : {}) } });
+    this.store?.append({ type: "item", payload: { item, ...meta } });
+  }
+
+  private static registryFor(model: Model, policy: SafetyPolicy): ToolRegistry {
+    const escalation = policy.sandbox !== "danger-full-access" && policy.approval !== "never";
+    return new ToolRegistry(defaultTools(model, { escalation }));
+  }
+
+  private async applyPendingSafety(turnId: string): Promise<void> {
+    const pending = this.pendingSafety;
+    this.pendingSafety = null;
+    if (pending === null) return;
+    const current: SafetyOptions = {
+      sandbox: this.policy.sandbox,
+      approval: this.policy.approval,
+      network: this.policy.network,
+      stripSecrets: this.policy.stripSecrets,
+    };
+    const next = await resolveSafety({ ...current, ...pending }, this.cwd, this.host.fs, this.host.info());
+    if (JSON.stringify(safetySummary(next)) === JSON.stringify(safetySummary(this.policy))) return;
+    this.policy = next;
+    this.registry = Thread.registryFor(this.model, next);
+    this.pendingPermissions = permissionsMessage(next);
+    this.store?.append({ type: "safety", payload: safetySummary(next) });
+    this.emit({ type: "safety.changed", turnId, safety: safetySummary(next) });
+  }
+
+  private async applyPendingReferences(turnId: string): Promise<void> {
+    const pending = this.pendingReferences;
+    this.pendingReferences = null;
+    if (pending === null) return;
+    const { references, dropped } = await resolveReferences(this.host.fs, this.cwd, pending, false);
+    for (const path of dropped) this.emit({ type: "warning", turnId, message: `reference directory not found, left out: ${path}` });
+    if (sameList(references, this.currentReferences)) return;
+    this.currentReferences = references;
+    this.append(environmentUpdate(this.cwd, references));
+    this.store?.append({ type: "context", payload: { references } });
+    this.emit({ type: "context.changed", turnId, references });
   }
 
   private params(): ResponseParams {
@@ -431,8 +625,16 @@ export class Thread {
     for (;;) {
       if (signal.aborted) return { ...outcome, status: "interrupted" };
       if (outcome.requests >= maxRequests) return fail("max_requests", `the turn reached ${maxRequests} model requests`);
-      const params = this.params();
-      const estimate = await this.estimateInputTokens(params);
+      let params = this.params();
+      let estimate = await this.estimateInputTokens(params);
+      if (this.options.autoCompact !== false && estimate >= autoCompactThreshold(this.model, this.options.maxOutputTokens) && this.history.length > this.initialItemCount + 1) {
+        const result = await this.compactHistory("auto", turnId, signal);
+        if (signal.aborted) return { ...outcome, status: "interrupted" };
+        if (result.compacted) {
+          params = this.params();
+          estimate = await this.estimateInputTokens(params);
+        }
+      }
       if (estimate > limit) {
         return fail("context_window_exceeded", `the conversation needs about ${estimate} input tokens; the model accepts ${limit} with the reserved output`);
       }
@@ -477,7 +679,8 @@ export class Thread {
     const scheduler = new ToolScheduler();
     const toolOutputs: Promise<{ item: InputItem; fullOutput?: string }>[] = [];
     // Output items are committed when the response ends (FD-08 may discard them).
-    const produced: InputItem[] = [];
+    const produced: { item: InputItem; durationMs: number | undefined }[] = [];
+    const itemStarted = new Map<string, number>();
     let unexpected: { error: unknown } | null = null;
     const result: SampleResult = { response: null, error: null, interrupted: false, calls: 0, lastMessage: null };
     try {
@@ -488,6 +691,7 @@ export class Thread {
           case "response.output_item.added":
             // Close to time to first token: the server opens the first item with its first token.
             firstOutput ??= performance.now() - started;
+            itemStarted.set(event.item.id, performance.now());
             this.emit({
               type: "item.started",
               turnId,
@@ -509,13 +713,15 @@ export class Thread {
             break;
           case "response.output_item.done": {
             const item = event.item;
-            this.emit({ type: "item.completed", turnId, item });
+            const opened = itemStarted.get(item.id);
+            const durationMs = opened === undefined ? undefined : Math.round(performance.now() - opened);
+            this.emit({ type: "item.completed", turnId, item, ...(durationMs !== undefined ? { durationMs } : {}) });
             if (item.type === "message") {
               result.lastMessage = messageText(item);
               // An empty message cannot be sent back (content needs a part); nothing to keep.
-              if (item.content.length > 0) produced.push(item);
+              if (item.content.length > 0) produced.push({ item, durationMs });
             } else {
-              produced.push(item);
+              produced.push({ item, durationMs });
             }
             if (item.type === "function_call") {
               result.calls += 1;
@@ -556,10 +762,10 @@ export class Thread {
     if (result.error?.code === "tool_call_invalid" && result.calls === 0) {
       result.lastMessage = null;
     } else {
-      for (const item of produced) this.append(item);
+      for (const { item, durationMs } of produced) this.append(item, { turnId, ...(durationMs !== undefined ? { durationMs } : {}) });
     }
     // Every started call gets its output into history, whatever happened to the response.
-    for (const output of outputs) this.append(output.item, output.fullOutput);
+    for (const output of outputs) this.append(output.item, { turnId, ...(output.fullOutput !== undefined ? { fullOutput: output.fullOutput } : {}) });
     if (response?.usage) this.usageMark = { tokens: response.usage.input_tokens + response.usage.output_tokens, itemCount: this.history.length - outputs.length };
     const status = response?.status === "completed" || response?.status === "incomplete" ? response.status : "failed";
     const durationMs = performance.now() - started;
@@ -615,9 +821,70 @@ export class Thread {
         output,
         ...(result.details ? { details: result.details } : {}),
       });
+      this.store?.append({
+        type: "tool",
+        payload: { turnId, callId: call.call_id, name: call.name, arguments: call.arguments, success: result.success, ...(result.details ? { details: result.details } : {}) },
+      });
       const fullOutput = result.fullOutput ?? (typeof result.output === "string" && output !== result.output ? result.output : undefined);
       return { item: { type: "function_call_output", call_id: call.call_id, output }, ...(fullOutput !== undefined ? { fullOutput } : {}) };
     });
+  }
+
+  /**
+   * The F4 baseline compaction (DEVELOPMENT_PLAN.md 10.5, after codex core/src/compact.rs):
+   * ask the model for a handoff summary of the history, then start the history over with
+   * the opening items, the most recent user messages (up to 20K tokens) and the summary.
+   * The prefix cache is lost from the start: the next request prefills everything again.
+   */
+  private async compactHistory(reason: "auto" | "manual", turnId: string | null, signal: AbortSignal): Promise<CompactionResult> {
+    const before = await this.estimateInputTokens(this.params());
+    this.emit({ type: "compaction.started", turnId, reason, tokens: before });
+    const request: ResponseParams = {
+      ...this.params(),
+      input: [...this.history, { type: "message", role: "user", content: [{ type: "input_text", text: COMPACT_PROMPT }] }],
+      tool_choice: "none",
+    };
+    let summary = "";
+    try {
+      const response = await this.client.createResponse(request, { signal }).final();
+      if (response.status !== "completed") throw new Error(response.error?.message ?? `the summary ended as ${response.status}`);
+      for (const item of response.output) if (item.type === "message") summary = messageText(item);
+      if (summary.trim() === "") throw new Error("the model returned no summary");
+    } catch (error) {
+      const message = signal.aborted ? "interrupted" : (error as Error).message;
+      this.emit({ type: "compaction.completed", turnId, reason, compacted: false, tokensBefore: before, tokensAfter: before, error: message });
+      if (!signal.aborted) this.emit({ type: "warning", ...(turnId ? { turnId } : {}), message: `context compaction failed: ${message}` });
+      return { compacted: false, before, after: before, error: message };
+    }
+
+    const opening = this.history.slice(0, this.initialItemCount);
+    const recent: InputItem[] = [];
+    let remaining = COMPACT_USER_MESSAGE_MAX_TOKENS;
+    for (let index = this.history.length - 1; index >= this.initialItemCount && remaining > 0; index -= 1) {
+      const item = this.history[index];
+      if (item?.type !== "message" || item.role !== "user") continue;
+      const text = item.content.map((part) => (part.type === "input_image" ? "[image]" : part.text)).join("\n");
+      if (text.startsWith(SUMMARY_PREFIX)) continue; // an earlier summary is superseded by the new one
+      if (text.startsWith(ENVIRONMENT_CONTEXT_TAG)) continue; // restated below when still different
+      const tokens = approxTokenCount(text);
+      const kept = tokens <= remaining ? text : truncateText(text, { mode: "tokens", limit: remaining });
+      recent.unshift({ type: "message", role: "user", content: [{ type: "input_text", text: kept }] });
+      remaining -= Math.min(tokens, remaining);
+    }
+    // Mid-thread changes were told after the opening items, which compaction drops: restate
+    // the settings that differ from what the opening items say.
+    const restated: InputItem[] = [];
+    if (JSON.stringify(this.openingSafety) !== JSON.stringify(safetySummary(this.policy))) restated.push(permissionsItem(permissionsMessage(this.policy)));
+    if (!sameList(this.openingReferences, this.currentReferences)) restated.push(environmentUpdate(this.cwd, this.currentReferences));
+    const next: InputItem[] = [...opening, ...restated, ...recent, { type: "message", role: "user", content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${summary}` }] }];
+    this.history.splice(0, this.history.length, ...next);
+    // A new context window: the effort in force becomes the baseline (protocol 6.1).
+    this.baseline = this.effective;
+    this.usageMark = null;
+    this.store?.append({ type: "compacted", payload: { items: next, reason, baseline: this.baseline, ...(turnId ? { turnId } : {}) } });
+    const after = estimatePromptTokens(this.instructions, this.registry.specs(), this.history);
+    this.emit({ type: "compaction.completed", turnId, reason, compacted: true, tokensBefore: before, tokensAfter: after });
+    return { compacted: true, before, after };
   }
 
   /** One question at a time, in call order, even when tools run in parallel. */

@@ -19,7 +19,7 @@ import {
   AporisaTransportError,
 } from "../../errors.ts";
 import type { ResponseStreamSource } from "../../response-stream.ts";
-import type { Diagnostic } from "../../types.ts";
+import { resolveApiKey, type ApiKey, type Diagnostic } from "../../types.ts";
 
 /** Thrown when no connection could be established; the driver falls back to HTTP. */
 export class WebSocketUnavailable extends Error {
@@ -28,7 +28,7 @@ export class WebSocketUnavailable extends Error {
 
 export interface WebSocketTransportOptions {
   baseUrl: string;
-  apiKey: string;
+  apiKey: ApiKey;
   connectTimeoutMs?: number;
   onDiagnostic?: (diagnostic: Diagnostic) => void;
   /** Called when the connection misbehaved; the driver stops using WebSocket. */
@@ -93,7 +93,7 @@ export class WebSocketTransport {
     if (this.socket && this.socket.readyState === WebSocket.OPEN && this.frames) return;
     this.dropConnection();
     const socket = new WebSocket(this.url, {
-      headers: { authorization: `Bearer ${this.options.apiKey}` },
+      headers: { authorization: `Bearer ${await resolveApiKey(this.options.apiKey)}` },
       handshakeTimeout: this.options.connectTimeoutMs ?? 5_000,
       perMessageDeflate: false,
     });

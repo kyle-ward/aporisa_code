@@ -1,6 +1,6 @@
 // The host on Node: real file system and processes, no sandbox yet (F3 adds one).
 import { randomUUID } from "node:crypto";
-import { appendFile, chmod, lstat, mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, open, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { fromNodeError, HostError } from "./errors.ts";
@@ -49,6 +49,22 @@ class NodeFileSystem implements HostFileSystem {
 
   async readText(path: string, options: ReadOptions = {}): Promise<string> {
     return new TextDecoder("utf-8").decode(await this.readFile(path, options));
+  }
+
+  async readPrefix(path: string, bytes: number): Promise<string> {
+    requireAbsolute(path);
+    try {
+      const handle = await open(path, "r");
+      try {
+        const buffer = Buffer.alloc(Math.max(0, bytes));
+        const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, 0);
+        return new TextDecoder("utf-8").decode(buffer.subarray(0, bytesRead));
+      } finally {
+        await handle.close();
+      }
+    } catch (error) {
+      throw fromNodeError(error, "read", path);
+    }
   }
 
   async writeFile(path: string, data: string | Uint8Array, options: WriteOptions = {}): Promise<void> {

@@ -6,3 +6,4 @@ export { HeadTailBuffer, type HeadTailSnapshot } from "./head-tail-buffer.ts";
 export { commandEnvironment, EXEC_ENV, NodeProcessManager, omissionMarker, PROCESS_DEFAULTS } from "./process.ts";
 export { regexLiteral, SANDBOX_EXEC, seatbeltArgs, seatbeltPolicy, type SeatbeltInvocation } from "./sandbox/seatbelt.ts";
 export { NodeHost, type NodeHostOptions } from "./node-host.ts";
+export { defaultEnvFile, ENV_KEYS, loadEnv, parseEnv, type EnvKey } from "./env.ts";

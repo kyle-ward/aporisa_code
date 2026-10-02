@@ -40,7 +40,7 @@ export type ThreadEvent =
   | { type: "turn.started"; turnId: string }
   | { type: "item.started"; turnId: string; itemId: string; kind: OutputItem["type"]; name?: string }
   | { type: "item.delta"; turnId: string; itemId: string; kind: "text" | "reasoning" | "arguments"; delta: string }
-  | { type: "item.completed"; turnId: string; item: OutputItem }
+  | { type: "item.completed"; turnId: string; item: OutputItem; durationMs?: number }
   | { type: "tool.started"; turnId: string; callId: string; name: string; arguments: string }
   | { type: "tool.completed"; turnId: string; callId: string; name: string; success: boolean; output: ToolOutput; details?: ToolDetails }
   | { type: "approval.requested"; turnId: string; callId: string; request: ApprovalRequest }
@@ -55,6 +55,19 @@ export type ThreadEvent =
       /** Until the first output item opened: close to time to first token. */
       timeToFirstOutputMs: number | null;
       durationMs: number;
+    }
+  | { type: "safety.changed"; turnId: string; safety: { sandbox: string; approval: string; network: boolean } }
+  /** The reference directories changed (F4.5); the model was told with an environment update. */
+  | { type: "context.changed"; turnId: string; references: string[] }
+  | { type: "compaction.started"; turnId: string | null; reason: "auto" | "manual"; tokens: number }
+  | {
+      type: "compaction.completed";
+      turnId: string | null;
+      reason: "auto" | "manual";
+      compacted: boolean;
+      tokensBefore: number;
+      tokensAfter: number;
+      error?: string;
     }
   | { type: "warning"; turnId?: string; message: string }
   | { type: "turn.completed"; turnId: string; outcome: TurnOutcome };

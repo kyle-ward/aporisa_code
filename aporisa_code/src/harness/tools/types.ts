@@ -1,6 +1,7 @@
 // Tool handler contract (DEVELOPMENT_PLAN.md section 5).
 import type { Host, ProcessManager } from "../../host/index.ts";
 import type { FunctionTool, ToolOutput, TruncationPolicy } from "../../protocol/index.ts";
+import type { CommandAction } from "../activity.ts";
 import type { CommandReason, SafetyPolicy, SessionRules } from "../safety/index.ts";
 
 export type PlanStatus = "pending" | "in_progress" | "completed";
@@ -54,9 +55,22 @@ export interface SafetyContext {
 
 /** Structured facts about a call, for events and the session record (never sent to the model). */
 export type ToolDetails =
-  | { kind: "command"; command: string; cwd: string; exitCode: number | null; sessionId: number | null; wallTimeMs: number; sandboxed: boolean; escalated: boolean }
-  | { kind: "stdin"; sessionId: number; exitCode: number | null; wallTimeMs: number }
-  | { kind: "patch"; changes: FileChange[] }
+  | {
+      kind: "command";
+      command: string;
+      cwd: string;
+      exitCode: number | null;
+      sessionId: number | null;
+      wallTimeMs: number;
+      sandboxed: boolean;
+      escalated: boolean;
+      /** What the command did, for activity summaries (activity.ts). */
+      actions: CommandAction[];
+      /** The command's output for display (no model header), capped at UI_OUTPUT_LIMIT. */
+      output: string;
+    }
+  | { kind: "stdin"; sessionId: number; chars: string; exitCode: number | null; wallTimeMs: number; output: string }
+  | { kind: "patch"; changes: FileChange[]; patch: string }
   | { kind: "plan"; explanation?: string; plan: PlanItem[] }
   | { kind: "image"; path: string };
 

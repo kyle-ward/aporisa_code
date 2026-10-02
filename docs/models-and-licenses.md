@@ -1,6 +1,6 @@
 # 模型、上游来源与许可证
 
-> 前端从 openai/codex（Apache-2.0，Copyright 2025 OpenAI）移植或改写了部分代码和文字：`aporisa_code/src/harness/tools/apply-patch/`（补丁解析与匹配）、`tools/truncate.ts`（输出截断）和 `instructions.ts`（系统指令的结构与部分内容），各文件开头注明了来源。F3 另外原文移植了 codex 的 Seatbelt 策略片段（`aporisa_code/src/host/sandbox/codex-policies.ts`，来自 `codex-rs/sandboxing/src/*.sbpl`），并参照其危险命令判定（`src/harness/safety/shell.ts`）。
+> 前端从 openai/codex（Apache-2.0，Copyright 2025 OpenAI）移植或改写了部分代码和文字：`aporisa_code/src/harness/tools/apply-patch/`（补丁解析与匹配）、`tools/truncate.ts`（输出截断）和 `instructions.ts`（系统指令的结构与部分内容），各文件开头注明了来源。F3 另外原文移植了 codex 的 Seatbelt 策略片段（`aporisa_code/src/host/sandbox/codex-policies.ts`，来自 `codex-rs/sandboxing/src/*.sbpl`），并参照其危险命令判定（`src/harness/safety/shell.ts`）。F4 原文移植了 codex 的上下文压缩提示词和摘要开头语（`instructions.ts` 的 `COMPACT_PROMPT`、`SUMMARY_PREFIX`，来自 `codex-rs/prompts/templates/compact/`）。
 
 本文记录后端使用的模型、上游来源、本地派生产物和许可证要点。模型配置指针（`MODEL_LIST` / `POINTERS` / `PROFILES`）和权重维护入口见 [model-management.md](model-management.md)；本地权重的唯一记录是 `.runtime/model-assets/` 下的身份记录。
 

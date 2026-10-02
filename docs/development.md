@@ -17,9 +17,9 @@
 ./frontend.sh prepare
 ```
 
-- `doctor` 只读，检查 Node、npm、lockfile 和依赖是否齐全。
-- `prepare` 是前端唯一联网的模式：下载并校验 Node，然后执行 `npm ci`。
-- `dev`、`build`、`install`、`uninstall` 在 F4 之前尚未实现，调用时会明确报错。
+- `doctor` 只读，检查 Node、npm、lockfile、依赖、Electron 二进制和打包用的 Electron 压缩包是否齐全。
+- `prepare` 是前端唯一联网的模式：下载并校验 Node，执行 `npm ci`，然后安装 Electron 二进制并把它的发布压缩包缓存到 `aporisa_code/.cache/electron/`（npm 11 默认不运行依赖的安装脚本，所以显式执行；两者都按 electron 包自带的 `checksums.json` 校验）。
+- `dev`、`build`、`install`、`uninstall` 见下面的「桌面 app」。
 
 新增或升级依赖属于开发行为，用项目内的 npm 执行，并提交更新后的 lockfile：
 
@@ -108,9 +108,13 @@ backend/.venv/bin/python scripts/soak.py --hours 4 --long-tokens 131072 --restar
 | `src/conformance/` | wire 层一致性测试用例，直接使用 HTTP 和 WebSocket，不依赖 SDK 的 driver | protocol、sdk 的 SSE 解码、`ws` |
 | `src/host/` | harness 接触系统的唯一入口：文件读写（原子写）、进程会话（每条命令一个进程组、头尾截断的输出、有上限）、macOS Seatbelt 沙箱（`sandbox/`）、环境信息 | host、protocol、Node 内置模块 |
 | `src/harness/` | harness core：Thread（会话、回合循环、预热、换档、取消）、工具（`exec_command`、`write_stdin`、`apply_patch`、`view_image`、`update_plan`）、执行安全（`safety/`：沙箱档位、审批策略、命令切分）、初始上下文（环境、权限说明与 AGENTS.md）、会话记录。**不能使用 Node 内置模块** | harness、host、sdk、protocol |
-| `src/cli/` | `aporisa` 命令行：`exec` 与交互模式、`.env` 读取、终端渲染 | cli、harness、host、sdk、mock、protocol、Node 内置模块 |
+| `src/cli/` | `aporisa` 命令行：`exec` 与交互模式、终端渲染 | cli、harness、host、sdk、mock、protocol、Node 内置模块 |
+| `src/app-protocol/` | L3 合同（[app-protocol.md](app-protocol.md)）：类型、请求参数的 zod 校验、IPC 通道名 | app-protocol、protocol、`zod` |
+| `src/main/` | Electron 主进程：app 服务端（`app-server.ts`，不依赖 Electron，可无界面测试）、事件到 item 的投影、设置、凭据、登录 shell 环境、窗口与菜单（`electron.ts`） | main、app-protocol、harness、host、sdk、protocol、`electron`、`zod`、Node 内置模块 |
+| `src/preload/` | contextBridge，暴露 `window.aporisa` | preload、app-protocol（只用类型和通道名）、`electron` |
+| `src/ui/` | React 界面：状态（`state/`，纯 TS，单独测试）、组件、字典（`i18n.ts`）、样式；`dev/mock-bridge.ts` 只在 Vite 开发服务器里使用 | ui、app-protocol、protocol、`react`、`react-dom`、`react-markdown`、`remark-gfm`、`lucide-react` |
 
-依赖方向由 `tools/check-boundaries.ts` 强制检查。以后新增的 `main/`、`preload/`、`ui/` 已经预置了规则；在 `src/` 下新增任何没有规则的顶层目录，检查都会失败。设计与进度见 [前端开发计划](../aporisa_code/DEVELOPMENT_PLAN.md)。
+依赖方向由 `tools/check-boundaries.ts` 强制检查；在 `src/` 下新增任何没有规则的顶层目录，检查都会失败。`.env` 的读取在 `src/host/env.ts`，命令行和开发模式的 app 共用。设计与进度见 [前端开发计划](../aporisa_code/DEVELOPMENT_PLAN.md)。
 
 ## 命令行（F2、F3）
 
@@ -124,10 +128,26 @@ PATH="$PWD/.tools/node/bin:$PATH" npm run aporisa -- --help
 ```
 
 - 命令默认在 macOS Seatbelt 沙箱里运行（`workspace-write`、不联网，见 [architecture.md](architecture.md) 第 2 节）。需要越权时模型会申请，终端里回答 `y`（这一次）、`a`（本会话内同类命令都允许）或直接回车拒绝。
+- `--reference <目录>`（可重复）：给 agent 读的参考文件夹，写进开头的环境说明并注明不要修改；和桌面 app 项目里的参考文件夹相同（见 [architecture.md](architecture.md) 第 2 节）。`--resume` 时给出的参考文件夹会替换会话原有的，并在下一轮开头告知模型。
 - 安全参数：`--sandbox read-only|workspace-write|danger-full-access`、`--approval untrusted|on-request|never`、`--network`；`--auto` 等于 `--approval never`（不询问，沙箱照开，越权一律拒绝）；`--dangerously-bypass-sandbox` 不设沙箱、不询问，命令以你的全部权限运行。
 - stdin 不是终端时没人能回答，需要审批的一律拒绝。
-- 会话记录写在 `~/Library/Application Support/Aporisa Code/sessions/`（目录 0700、文件 0600），包含完整内容；`--resume <id>` 继续，`--no-persist` 不写。
+- 会话记录写在 `~/Library/Application Support/Aporisa Code/profiles/local/sessions/`（目录 0700、文件 0600），包含完整内容，和桌面 app 共用；`--resume <id>` 继续，`--no-persist` 不写。
 - `--driver stub` 不需要后端，模型只会回声，用来检查命令行本身。
+
+## 桌面 app（F4）
+
+```bash
+./frontend.sh build       # 离线：esbuild 打包主进程和 preload，Vite 构建界面，@electron/packager 打包，codesign -s - 签名
+./frontend.sh install     # 复制到 ~/Applications/Aporisa Code.app（app 在运行时拒绝）
+./frontend.sh uninstall   # 移除 app，保留数据目录（会话、设置、加密的 key）
+./frontend.sh dev         # 从源码运行：Vite 开发服务器（界面热更新）+ 主进程和 preload 的 watch + Electron
+```
+
+- 产物在 `aporisa_code/dist/app/`（主进程、preload、界面）和 `aporisa_code/release/`（`.app`），都不进 Git；打包时不带 source map。
+- 数据目录是 `~/Library/Application Support/Aporisa Code/`，开发模式与安装的 app 共用；项目在其中的 `profiles/local/projects.json`。不使用项目的对话的私有工作目录在 `~/Library/Caches/Aporisa Code/scratch/`，删除对话时随会话记录一起移到废纸篓。
+- 连接：默认连本机后端 `http://127.0.0.1:18080/v1`；地址和 key 在 app 的设置里填写，key 加密后保存。`dev` 模式下设置里没有 key 时读 `aporisa_code/.env` 的 `APORISA_API_KEY`（`APORISA_BASE_URL`、`APORISA_MODEL` 同理），安装的 app 不读 `.env`。
+- `dev` 中主进程或 preload 的改动需要重新运行 `dev`；界面的改动热更新。
+- 只看界面、不需要 Electron 和后端时：`cd aporisa_code && PATH="$PWD/.tools/node/bin:$PATH" npm run dev:ui`，在浏览器里打开 `http://localhost:5199`，背后是一个按脚本回放的假桥（`src/ui/dev/mock-bridge.ts`），包括一次审批。它只用于开发检查，不进生产构建。
 
 ## 合同变更
 
@@ -145,7 +165,7 @@ cd aporisa_code && PATH="$PWD/.tools/node/bin:$PATH" npm run schema:export
 ./scripts/check.sh frontend
 ```
 
-前端检查依次执行：TypeScript 类型检查、import 边界检查、Vitest 全部测试（包括对 mock server 的 wire 层一致性测试）。之后还有 Shell 语法检查和 `git diff --check`。整个过程不联网，也不启动真实服务。
+前端检查依次执行：TypeScript 类型检查（Node 部分和界面部分各一份配置）、import 边界检查、Vitest 全部测试（包括对 mock server 的 wire 层一致性测试、app 服务端的无界面测试和界面状态逻辑的测试）。之后还有 Shell 语法检查和 `git diff --check`。整个过程不联网，也不启动真实服务。
 
 agent 只允许运行 `frontend` 范围。后端检查和不带参数的全量检查由用户运行，见 AGENTS.md。
 

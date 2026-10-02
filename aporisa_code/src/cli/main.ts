@@ -6,11 +6,10 @@ import { isAbsolute, resolve } from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { imageMediaType, MAX_IMAGE_BYTES, Thread, type ApprovalDecision, type ApprovalPolicy, type ApprovalRequest, type SafetyOptions, type SandboxMode, type UserInput } from "../harness/index.ts";
-import { NodeHost } from "../host/index.ts";
+import { defaultEnvFile, loadEnv, NodeHost } from "../host/index.ts";
 import { StubDriver } from "../mock/index.ts";
 import type { InputImagePart, InputTextPart, ReasoningEffort } from "../protocol/index.ts";
 import { NativeDriver, type AporisaClient } from "../sdk/index.ts";
-import { ENV_FILE, loadEnv } from "./env.ts";
 import { approvalQuestion, parseApproval, processOutput, renderer, type Output } from "./render.ts";
 
 export const USAGE = `Usage:
@@ -19,6 +18,8 @@ export const USAGE = `Usage:
 
 Options:
   --cwd <dir>            Working directory (default: where npm was run)
+  --reference <dir>      A folder the agent may read for reference but should not change
+                         (repeatable; on --resume it replaces the thread's references)
   --model <alias>        Model alias (default: APORISA_MODEL, else the first listed model)
   --effort <level>       Reasoning effort (none, low, medium, high)
   --resume <id|path>     Continue a saved thread
@@ -37,7 +38,7 @@ Options:
   --transport websocket|http
   -h, --help
 
-Connection: APORISA_BASE_URL, APORISA_API_KEY and APORISA_MODEL from the environment or ${ENV_FILE}.`;
+Connection: APORISA_BASE_URL, APORISA_API_KEY and APORISA_MODEL from the environment or ${defaultEnvFile()}.`;
 
 const EFFORTS: readonly ReasoningEffort[] = ["none", "low", "medium", "high"];
 const SANDBOX_MODES: readonly SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
@@ -59,6 +60,7 @@ function parse(argv: string[]) {
     allowPositionals: true,
     options: {
       cwd: { type: "string" },
+      reference: { type: "string", multiple: true },
       model: { type: "string" },
       effort: { type: "string" },
       resume: { type: "string" },
@@ -121,7 +123,7 @@ function connect(driver: string, transport: string | undefined): { client: Apori
   if (driver === "stub") return { client: new StubDriver(), model: undefined };
   const env = loadEnv();
   if (!env.APORISA_BASE_URL || !env.APORISA_API_KEY) {
-    throw new UsageError(`set APORISA_BASE_URL and APORISA_API_KEY (environment or ${ENV_FILE}; see .env.example)`);
+    throw new UsageError(`set APORISA_BASE_URL and APORISA_API_KEY (environment or ${defaultEnvFile()}; see .env.example)`);
   }
   const client = new NativeDriver({
     baseUrl: env.APORISA_BASE_URL,
@@ -224,9 +226,10 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
   let thread: Thread;
   try {
     if (!isAbsolute(cwd)) throw new Error(`cannot resolve ${cwd}`);
+    const references = values.reference?.map((path) => resolve(io.invocationDir, path));
     thread = values.resume
-      ? await Thread.resume({ ...common, session: values.resume })
-      : await Thread.start({ ...common, cwd, ...(model ? { model } : {}) });
+      ? await Thread.resume({ ...common, session: values.resume, ...(references ? { references } : {}) })
+      : await Thread.start({ ...common, cwd, ...(model ? { model } : {}), ...(references ? { references } : {}) });
   } catch (error) {
     io.output.err(`ERROR: ${(error as Error).message}\n`);
     await client.close();

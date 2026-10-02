@@ -4,6 +4,7 @@
 import type { ProcessChunk } from "../../host/index.ts";
 import { resolve } from "../paths.ts";
 import { approxTokensFromBytes, byteBudget, byteLength, truncateText, withAllowance } from "./truncate.ts";
+import { classifyCommand } from "../activity.ts";
 import { assessCommand, likelySandboxDenied, sandboxSpec } from "../safety/index.ts";
 import { askUser, declined, ToolError, unavailable, type ToolContext, type ToolHandler, type ToolResult } from "./types.ts";
 
@@ -14,6 +15,12 @@ export const MAX_YIELD_MS = 30_000;
 export const MIN_POLL_YIELD_MS = 5_000;
 export const MAX_POLL_YIELD_MS = 300_000;
 export const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
+/** Output kept for display (events, session record, UI); the model's copy is truncated separately. */
+export const UI_OUTPUT_LIMIT = 128 * 1024;
+
+function displayOutput(output: string): string {
+  return byteLength(output) <= UI_OUTPUT_LIMIT ? output : truncateText(output, { mode: "bytes", limit: UI_OUTPUT_LIMIT });
+}
 
 function clamp(value: unknown, fallback: number, min: number, max: number): number {
   const number = typeof value === "number" && Number.isFinite(value) ? Math.round(value) : fallback;
@@ -171,6 +178,8 @@ async function runCommand(command: string, cwd: string, sandboxed: boolean, esca
       wallTimeMs: chunk.wallTimeMs,
       sandboxed: sandbox !== null,
       escalated,
+      actions: classifyCommand(command),
+      output: displayOutput(chunk.output),
     },
   };
 }
@@ -215,7 +224,7 @@ export const writeStdinTool: ToolHandler = {
       output,
       success: chunk.exitCode === null || chunk.exitCode === 0,
       ...(full !== undefined ? { fullOutput: full } : {}),
-      details: { kind: "stdin", sessionId, exitCode: chunk.exitCode, wallTimeMs: chunk.wallTimeMs },
+      details: { kind: "stdin", sessionId, chars, exitCode: chunk.exitCode, wallTimeMs: chunk.wallTimeMs, output: displayOutput(chunk.output) },
     };
   },
 };

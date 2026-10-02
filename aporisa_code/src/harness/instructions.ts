@@ -42,3 +42,20 @@ Use \`update_plan\` for non-trivial work with several steps: short steps (5-7 wo
 # Final message
 
 The user works on the same computer and can open your files, so do not paste large files you wrote; reference paths instead (\`src/app.ts:42\`). Lead with the outcome, then what changed and anything the user should do next. Keep it brief, use short bullet lists only when they help, and wrap commands, paths and identifiers in backticks.`;
+
+// Context compaction (F4 baseline, DEVELOPMENT_PLAN.md 10.5): the prompt and the summary
+// prefix are taken from openai/codex (Apache-2.0, Copyright 2025 OpenAI):
+// codex-rs/prompts/templates/compact/prompt.md and summary_prefix.md.
+
+export const COMPACT_PROMPT = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, examples, or references needed to continue
+
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work.`;
+
+export const SUMMARY_PREFIX =
+  "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";

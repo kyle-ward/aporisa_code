@@ -263,7 +263,10 @@ describe("session record", () => {
     expect(new TextEncoder().encode(String(output?.type === "function_call_output" && output.output)).byteLength).toBeLessThanOrEqual(360);
     const path = thread.sessionPath ?? "";
     expect((await stat(path)).mode & 0o777).toBe(0o600);
-    expect((await stat(join(dataDir, "sessions"))).mode & 0o777).toBe(0o700);
+    expect(path.startsWith(join(dataDir, "profiles", "local", "sessions"))).toBe(true);
+    for (const directory of [dataDir, join(dataDir, "profiles"), join(dataDir, "profiles", "local", "sessions")]) {
+      expect((await stat(directory)).mode & 0o777).toBe(0o700);
+    }
     const lines = (await readFile(path, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     expect(lines[0]).toMatchObject({ type: "session_meta", payload: { id: thread.id, model: model.id, driver: "stub", effort: "medium" } });
     expect(lines.find((line) => line.payload?.fullOutput)?.payload.fullOutput).toBe("0".repeat(1000));

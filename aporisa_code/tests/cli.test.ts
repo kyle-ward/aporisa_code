@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { loadEnv, parseEnv } from "../src/cli/env.ts";
+import { loadEnv, parseEnv } from "../src/host/index.ts";
 import { runCli, type CliIo } from "../src/cli/main.ts";
 import { approvalQuestion, parseApproval, renderer } from "../src/cli/render.ts";
 
@@ -126,7 +126,7 @@ describe("rendering", () => {
       name: "exec_command",
       success: true,
       output: "x",
-      details: { kind: "command", command: "ls -la", cwd: "/", exitCode: 0, sessionId: null, wallTimeMs: 1200, sandboxed: true, escalated: false },
+      details: { kind: "command", command: "ls -la", cwd: "/", exitCode: 0, sessionId: null, wallTimeMs: 1200, sandboxed: true, escalated: false, actions: [{ kind: "list", path: null }], output: "" },
     });
     expect(out.join("")).toBe("Hi\n");
     expect(err.join("")).toBe("▶ $ ls -la\n  ✓ exit 0 (1.2s)\n");

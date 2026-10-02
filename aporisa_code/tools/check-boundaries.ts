@@ -19,9 +19,14 @@ const RULES: Record<string, Rule> = {
   host: { modules: ["host", "protocol"], packages: [], nodeBuiltins: true },
   harness: { modules: ["harness", "host", "sdk", "protocol"], packages: [], nodeBuiltins: false },
   cli: { modules: ["cli", "harness", "host", "sdk", "mock", "protocol"], packages: [], nodeBuiltins: true },
-  main: { modules: ["main", "harness", "host", "sdk", "protocol"], packages: ["electron"], nodeBuiltins: true },
-  preload: { modules: ["preload", "protocol"], packages: ["electron"], nodeBuiltins: false },
-  ui: { modules: ["ui", "protocol"], packages: [], nodeBuiltins: false },
+  "app-protocol": { modules: ["app-protocol", "protocol"], packages: ["zod"], nodeBuiltins: false },
+  main: { modules: ["main", "app-protocol", "harness", "host", "sdk", "protocol"], packages: ["electron", "zod"], nodeBuiltins: true },
+  preload: { modules: ["preload", "app-protocol"], packages: ["electron"], nodeBuiltins: false },
+  ui: {
+    modules: ["ui", "app-protocol", "protocol"],
+    packages: ["react", "react-dom", "react-markdown", "remark-gfm", "lucide-react"],
+    nodeBuiltins: false,
+  },
 };
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");

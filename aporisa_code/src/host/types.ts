@@ -25,6 +25,8 @@ export interface WriteOptions {
 export interface HostFileSystem {
   readFile(path: string, options?: ReadOptions): Promise<Uint8Array>;
   readText(path: string, options?: ReadOptions): Promise<string>;
+  /** At most the first `bytes` bytes as UTF-8 (a character cut at the end becomes U+FFFD). */
+  readPrefix(path: string, bytes: number): Promise<string>;
   /** Atomic: writes a temporary file in the same directory, then renames it into place. */
   writeFile(path: string, data: string | Uint8Array, options?: WriteOptions): Promise<void>;
   /** Appends, creating the file with `mode` when it does not exist. */
